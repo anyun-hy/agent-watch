@@ -230,3 +230,15 @@ fn streamed_chunked_payload_is_stopped_at_the_actual_four_mib_body_limit() {
     assert_eq!(client.get("/connections").unwrap_err(), Error::TooLarge);
     server.join().unwrap();
 }
+
+#[test]
+fn unix_socket_chunked_snapshot_resolves_available_state() {
+    let sock = std::path::PathBuf::from(format!("/var/run/tag-service/users/{}/tag-mihomo.sock", claude_watch_system::effective_uid()));
+    if sock.exists() {
+        let creds = Credentials::from_parts("127.0.0.1:9097", "set-your-secret".into()).unwrap().with_unix_socket(sock);
+        let client = Client::new(creds);
+        let (api, _) = client.snapshot("GLOBAL");
+        assert_eq!(api["state"], "available");
+        assert_eq!(api["covers_7890"], true);
+    }
+}

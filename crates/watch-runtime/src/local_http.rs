@@ -74,6 +74,37 @@ fn map_io(error: &io::Error) -> Error {
     Error::Transport
 }
 #[cfg(unix)]
+fn decode_chunked_body(raw: &[u8]) -> Result<Vec<u8>, Error> {
+    let mut decoded = Vec::new();
+    let mut cursor = 0;
+    while cursor < raw.len() {
+        let remaining = &raw[cursor..];
+        let Some(newline_pos) = remaining.windows(2).position(|w| w == b"\r\n") else {
+            return Err(Error::Protocol);
+        };
+        let size_line = std::str::from_utf8(&remaining[..newline_pos]).map_err(|_| Error::Protocol)?;
+        let size_hex = size_line.split(';').next().unwrap_or("").trim();
+        let chunk_size = usize::from_str_radix(size_hex, 16).map_err(|_| Error::Protocol)?;
+        cursor += newline_pos + 2;
+
+        if chunk_size == 0 {
+            break;
+        }
+
+        if cursor + chunk_size > raw.len() {
+            return Err(Error::Protocol);
+        }
+
+        decoded.extend_from_slice(&raw[cursor..cursor + chunk_size]);
+        cursor += chunk_size;
+
+        if cursor + 2 <= raw.len() && &raw[cursor..cursor + 2] == b"\r\n" {
+            cursor += 2;
+        }
+    }
+    Ok(decoded)
+}
+
 fn get_unix(
     socket_path: &std::path::Path,
     path: &str,
@@ -133,8 +164,24 @@ fn get_unix(
         return Err(Error::Status(status_code));
     }
 
-    let body = &response_bytes[header_end + 4..];
-    serde_json::from_slice(body).map_err(|_| Error::Json)
+    let is_chunked = header_str.lines().any(|line| {
+        let mut parts = line.splitn(2, ':');
+        if let (Some(name), Some(val)) = (parts.next(), parts.next()) {
+            name.trim().eq_ignore_ascii_case("transfer-encoding")
+                && val.trim().eq_ignore_ascii_case("chunked")
+        } else {
+            false
+        }
+    });
+
+    let raw_body = &response_bytes[header_end + 4..];
+    let body_bytes = if is_chunked {
+        decode_chunked_body(raw_body)?
+    } else {
+        raw_body.to_vec()
+    };
+
+    serde_json::from_slice(&body_bytes).map_err(|_| Error::Json)
 }
 
 pub struct Client {

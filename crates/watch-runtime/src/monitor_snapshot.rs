@@ -159,7 +159,7 @@ pub fn proxy(raw: &Value) -> Option<Value> {
         json!({"backendVersion":raw.get("monitor_version").unwrap_or(&json!(VERSION)),"monitoredApps":raw.get("monitored_apps").unwrap_or(&json!(MONITORED)),"observedAt":observed,
         "entryState":entry["state"].as_str().unwrap_or("unconfirmed"),"entryReason":entry["reason"].as_str().unwrap_or(""),"entrySource":entry["source"].as_str().unwrap_or(""),"endpoint":entry["endpoint"].as_str().unwrap_or("http://127.0.0.1:7890"),
         "listenerPID":owner["pid"],"listenerPath":owner["executable"].as_str().unwrap_or(""),"listenerStarted":if entry["state"]=="verified"{owner.get("stamp").cloned().unwrap_or(Value::Null)}else{Value::Null},
-        "apiState":api["state"].as_str().unwrap_or("unavailable"),"apiReason":api["reason"].as_str().unwrap_or(""),"mode":api["mode"].as_str().unwrap_or(""),"coversProxy":api["covers_7890"]==true,
+        "apiState":api["state"].as_str().unwrap_or("unavailable"),"apiReason":api["reason"].as_str().unwrap_or(""),"mode":api["mode"].as_str().unwrap_or(""),"coversProxy":(api["covers_7890"]==true || api["covers_7897"]==true),
         "expectedGroup":raw["expected_group"].as_str().unwrap_or(""),"expectedNode":raw["expected_node"].as_str().unwrap_or(""),"selectedNode":api["selected_node"].as_str().unwrap_or(""),"globalNode":api["global_node"].as_str().unwrap_or(""),
         "pinned":raw["pinned"]==true,"selectionChanged":raw["selection_changed"]==true,"flows":flows,"connectionObservation":connection_observation(&raw["connection_observation"],observed)}),
     )
