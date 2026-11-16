@@ -718,10 +718,13 @@ pub fn resolve_vpn_controller_credentials(
         if let Ok(Some(bytes)) = storage.read_bytes(&path, claude_watch_core::tag_config::CONFIG_LIMIT) {
             if let Ok(text) = String::from_utf8(bytes) {
                 if let Ok(mut creds) = claude_watch_core::tag_config::controller_credentials(&text) {
-                    if creds.unix_socket().map_or(true, |p| !p.exists()) {
-                        let uid = claude_watch_system::effective_uid();
-                        let default_sock = std::path::PathBuf::from(format!("/var/run/tag-service/users/{uid}/tag-mihomo.sock"));
-                        if default_sock.exists() {
+                    let uid = claude_watch_system::effective_uid();
+                    let default_sock = std::path::PathBuf::from(format!("/var/run/tag-service/users/{uid}/tag-mihomo.sock"));
+                    if default_sock.exists() {
+                        let configured_dead = creds.unix_socket().map_or(true, |p| {
+                            !p.exists() || std::os::unix::net::UnixStream::connect(p).is_err()
+                        });
+                        if configured_dead && std::os::unix::net::UnixStream::connect(&default_sock).is_ok() {
                             creds = creds.with_unix_socket(default_sock);
                         }
                     }

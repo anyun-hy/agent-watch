@@ -242,3 +242,16 @@ fn unix_socket_chunked_snapshot_resolves_available_state() {
         assert_eq!(api["covers_7890"], true);
     }
 }
+
+#[test]
+fn unix_socket_dead_socket_falls_back_to_service_socket() {
+    let dead_sock = std::path::PathBuf::from("/var/folders/pn/61vtb_713d5c7xns_cv4m2hc0000gn/T/tagv2-mihomo.sock");
+    let service_sock = std::path::PathBuf::from(format!("/var/run/tag-service/users/{}/tag-mihomo.sock", claude_watch_system::effective_uid()));
+    if service_sock.exists() {
+        let creds = Credentials::from_parts("127.0.0.1:9097", "set-your-secret".into()).unwrap().with_unix_socket(dead_sock);
+        let client = Client::new(creds);
+        let (api, _) = client.snapshot("GLOBAL");
+        assert_eq!(api["state"], "available");
+        assert_eq!(api["covers_7890"], true);
+    }
+}

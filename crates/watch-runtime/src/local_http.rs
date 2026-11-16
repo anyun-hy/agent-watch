@@ -216,15 +216,31 @@ impl Client {
         }
         #[cfg(unix)]
         if let Some(sock_path) = self.credentials.unix_socket() {
-            if sock_path.exists() {
-                match get_unix(sock_path, path, self.credentials.authorization().as_deref(), timeout) {
-                    Ok(val) => return Ok(val),
-                    Err(Error::Status(s)) => return Err(Error::Status(s)),
-                    Err(Error::Path) => return Err(Error::Path),
-                    Err(Error::TooLarge) => return Err(Error::TooLarge),
-                    Err(Error::Json) => return Err(Error::Json),
-                    Err(Error::Timeout) => return Err(Error::Timeout),
-                    Err(_) => {}
+            let mut candidates: Vec<std::path::PathBuf> = vec![sock_path.to_path_buf()];
+            let uid = claude_watch_system::effective_uid();
+            let default_sock = std::path::PathBuf::from(format!("/var/run/tag-service/users/{uid}/tag-mihomo.sock"));
+            if !candidates.contains(&default_sock) && default_sock.exists() {
+                candidates.push(default_sock);
+            }
+
+            for sock in &candidates {
+                if sock.exists() {
+                    match get_unix(sock, path, self.credentials.authorization().as_deref(), timeout) {
+                        Ok(val) => return Ok(val),
+                        Err(Error::Status(s)) => {
+                            if candidates.len() <= 1 || sock == candidates.last().unwrap() {
+                                return Err(Error::Status(s));
+                            }
+                        }
+                        Err(Error::Path) => return Err(Error::Path),
+                        Err(Error::TooLarge) => return Err(Error::TooLarge),
+                        Err(Error::Json) => return Err(Error::Json),
+                        Err(Error::Timeout) => return Err(Error::Timeout),
+                        Err(_) => {
+                            // Transport/connect error: fall through to next candidate socket
+                            continue;
+                        }
+                    }
                 }
             }
         }
