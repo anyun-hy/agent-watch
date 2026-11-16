@@ -263,7 +263,17 @@ final class FirstRunChecks: InitializationChecking {
             setupWasApproved = true
             approvedContext = boundContext
             acceptedSettings = settingsData
-            return .passed(request.action == .protection ? "守护设置已应用；实际运行心跳将在最后复核。" : "实测环境已保存并回读，继续核对权限及网络。")
+            if request.action == .protection {
+                let deadline = Date().addingTimeInterval(15)
+                repeat {
+                    await store.switcher.refreshBackground(maximumAge: 5)
+                    if backgroundIsCurrent { break }
+                    try? await Task.sleep(nanoseconds: 500_000_000)
+                } while Date() < deadline && !Task.isCancelled
+                guard backgroundIsCurrent else { return backgroundFailure }
+                return .passed("Watch 守护已开启并确认运行心跳，继续联合复核。")
+            }
+            return .passed("实测环境已保存并回读，继续核对权限及网络。")
         }
     }
     private var hasCurrentProtectionReadback: Bool {
@@ -304,7 +314,11 @@ final class FirstRunChecks: InitializationChecking {
         if setupWasApproved && approvedContext == boundContext && plan.actions.isEmpty
             && (plan.confirmation_lines ?? []).isEmpty && (!enableProtection || protectionSettingsEnabled) {
             acceptedSettings = settingsData
-            return .passed(enableProtection ? "已保存的两项守护开启设置保持一致，继续复核实际心跳。" : "已确认的环境设置保持一致。")
+            if enableProtection {
+                guard backgroundIsCurrent else { return backgroundFailure }
+                return .passed("Watch 守护已开启并确认运行心跳，继续联合复核。")
+            }
+            return .passed("已确认的环境设置保持一致。")
         }
         let needsAdministrator = plan.actions.contains { ["timezone", "ipv6", "watchdog"].contains($0.id) }
         let description = needsAdministrator

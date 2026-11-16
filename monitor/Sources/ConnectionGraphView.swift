@@ -195,7 +195,11 @@ struct ConnectionGraphView: View {
             let disposition = channelState.managedMemberCount > 0 || channelState.process_disposition_action == "force"
                 ? "（\(channelState.processDispositionLabel(now: now))）" : ""
             let previous = channelState.previousProcessDispositionLabel(now: now).map { "\n\($0)" } ?? ""
-            text = "\(channelState.protectionScopeLabel)\(disposition) · \(channelState.scopeSummary)\n\(channelState.gatewayCountsLabel)\(previous)"
+            if channelState.managedMemberCount == 0 && !channelState.unmanagedPids.isEmpty {
+                text = "检测到外部运行实例（未接入受控网关）\(disposition)\n\(channelState.gatewayCountsLabel)\(previous)"
+            } else {
+                text = "\(channelState.protectionScopeLabel)\(disposition) · \(channelState.scopeSummary)\n\(channelState.gatewayCountsLabel)\(previous)"
+            }
             switch channelState.scopedDisplayState {
             case .forwarding:
                 symbol = "checkmark.shield.fill"; tint = p.mint
@@ -258,9 +262,6 @@ struct ConnectionGraphView: View {
             if !reasons.isEmpty {
                 parts.append("未知/过期：\(reasons.joined(separator: ", "))")
             }
-        }
-        if !store.unmanagedPids(for: selectedProduct).isEmpty {
-            parts.append("点击“\(gatewayNodeTitle)”查看详情")
         }
         return parts.isEmpty ? nil : parts.joined(separator: " · ")
     }
@@ -663,13 +664,10 @@ struct ConnectionGraphView: View {
                 text = evidenceDetail + sourceDetail + (hasOtherPath ? "存在平台连接，但未归入当前显示的路径；可在连接列表中选择查看。" : "尚无与此进程关联的连接样本。出现连接后，图中才会显示对应路径。")
             }
         case .gateway:
-            let unmanaged = store.unmanagedPids(for: selectedProduct)
-            let unmanagedNotice = unmanaged.isEmpty ? ""
-                : "\n网关未覆盖进程（\(unmanaged.count) 个）：PID \(unmanaged.map(String.init).joined(separator: ", "))。这些进程未经过受控网关，网关状态不代表它们的连接状态。"
             let scope = store.channelState(for: selectedProduct).map { "\n当前监督范围：\($0.scopeSummary)\n\($0.gatewayCountsLabel) · \($0.policy_sync_label_zh)\n累计计数来自当前网关记录，不代表本轮连接，也不包含未覆盖进程的流量。" } ?? ""
             let path = graph.gatewayDetail + (gatewayIsProxy ? "\n" + (proxy?.listenerPath ?? "监听者路径未取得") : "")
             let pathDetail = display.isHistorical ? "上次路径证据，不代表当前连接：\n" + path + "\n原始说明：" + (graph.flow?.reason ?? "") : path
-            return pathDetail + scope + unmanagedNotice
+            return pathDetail + scope
         case .tag:
             text = graph.flow?.chains.isEmpty == false
                 ? (graph.flow?.chains.joined(separator: " → ") ?? "") + "\n" + graph.summary
