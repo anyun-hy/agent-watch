@@ -22,7 +22,7 @@ use std::{collections::BTreeMap, fs, io::Read, os::unix::fs::{MetadataExt, OpenO
 /// Match complete executable prefixes, never a display name or command argument.
 pub(crate) fn proxy_mode(executable: &str) -> Option<&'static str> {
     for (mode, prefixes) in [
-        ("tag", &["/Applications/TAG.app/Contents/"][..]),
+        ("tag", &["/Applications/TAG.app/Contents/", "/Applications/TAGv2.app/Contents/"][..]),
         (
             "clash-verge",
             &[
@@ -626,12 +626,13 @@ impl<R: ReadRunner, T: Transport, M: Mutator> Macos<R, T, M> {
             };
             let pin = pinned_node(&sampler.paths, &c.proxy_group);
             tag = sampler.tag_report(&round, &sockets, &c.proxy_group, &pin);
+            let covers = tag["api"]["covers_7890"] == true || tag["api"]["covers_7897"] == true;
             if tag["entry"]["state"] != "verified"
                 || tag["api"]["state"] != "available"
-                || tag["api"]["covers_7890"] != true
+                || !covers
             {
                 proxy = "unknown";
-                detail = "TAG 7890 监听者、控制接口或该入口覆盖范围未确认".into();
+                detail = "TAG 代理监听者、控制接口或该入口覆盖范围未确认".into();
                 unavailable.push("tag_snapshot");
             }
             // 节点漂移仅提醒：selectionChanged 经 monitor_snapshot 进入公开快照，
@@ -665,9 +666,10 @@ impl<R: ReadRunner, T: Transport, M: Mutator> Macos<R, T, M> {
         out["verified_proxy_url"] = if selected == "tag"
             && proxy == "ok"
             && tag["entry"]["state"] == "verified"
-            && tag["api"]["covers_7890"] == true
+            && (tag["api"]["covers_7890"] == true || tag["api"]["covers_7897"] == true)
         {
-            json!(crate::network_client::DEFAULT_PROXY)
+            let endpoint = tag["entry"]["endpoint"].as_str().unwrap_or(crate::network_client::DEFAULT_PROXY);
+            json!(endpoint)
         } else {
             Value::Null
         };

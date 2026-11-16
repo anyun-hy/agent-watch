@@ -16,6 +16,12 @@ use std::{
 };
 
 pub const TAG_BINARY_DIR: &str = "/Applications/TAG.app/Contents/Resources/bin/";
+pub const TAG_BINARY_DIRS: &[&str] = &[
+    "/Applications/TAG.app/Contents/Resources/bin/",
+    "/Applications/TAG.app/Contents/MacOS/",
+    "/Applications/TAGv2.app/Contents/Resources/bin/",
+    "/Applications/TAGv2.app/Contents/MacOS/",
+];
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Flow {
@@ -77,7 +83,8 @@ pub fn is_tag_process(record: &Value, uid: u32) -> bool {
     let Some(executable) = record.get("executable").and_then(Value::as_str) else {
         return false;
     };
-    let Some(name) = executable.strip_prefix(TAG_BINARY_DIR) else {
+    let matched_name = TAG_BINARY_DIRS.iter().find_map(|dir| executable.strip_prefix(dir));
+    let Some(name) = matched_name else {
         return false;
     };
     name.starts_with("mihomo")
@@ -147,7 +154,11 @@ pub fn listener_fallback(
     lsof: CommandEvidence,
     kernel: Option<&CommandEvidence>,
 ) -> CommandEvidence {
-    listener_fallback_for_port(lsof, kernel, 7890)
+    if kernel.as_ref().is_some_and(|k| k.stdout.contains(".7897 ") || k.stdout.contains(":7897 ")) {
+        listener_fallback_for_port(lsof, kernel, 7897)
+    } else {
+        listener_fallback_for_port(lsof, kernel, 7890)
+    }
 }
 pub fn listener_fallback_for_port(
     lsof: CommandEvidence,
@@ -226,6 +237,7 @@ pub fn inspect_entry(
     let mut pids = BTreeSet::new();
     let mut pid = None;
     let mut public = false;
+    let mut detected_port = 0;
     for line in listener.stdout.lines() {
         if let Some(raw) = line
             .strip_prefix('p')
@@ -234,17 +246,23 @@ pub fn inspect_entry(
             pid = raw.parse::<u32>().ok();
         } else if let Some(endpoint) = line.strip_prefix('n') {
             if let Some(pid) = pid {
-                if ["127.0.0.1:7890", "*:7890", "0.0.0.0:7890", "[::]:7890"].contains(&endpoint) {
+                let is_7890 = ["127.0.0.1:7890", "*:7890", "0.0.0.0:7890", "[::]:7890"].contains(&endpoint);
+                let is_7897 = ["127.0.0.1:7897", "*:7897", "0.0.0.0:7897", "[::]:7897"].contains(&endpoint);
+                if is_7890 || is_7897 {
                     pids.insert(pid);
-                    public |= endpoint != "127.0.0.1:7890";
+                    public |= !["127.0.0.1:7890", "127.0.0.1:7897"].contains(&endpoint);
+                    if detected_port == 0 {
+                        detected_port = if is_7897 { 7897 } else { 7890 };
+                    }
                 }
             }
         }
     }
-    let mut report = json!({"endpoint":"http://127.0.0.1:7890","state":"unconfirmed","owners":[],"public_listener":public,"source":listener.source});
+    let port = if detected_port != 0 { detected_port } else { 7890 };
+    let mut report = json!({"endpoint":format!("http://127.0.0.1:{port}"),"state":"unconfirmed","owners":[],"public_listener":public,"source":listener.source});
     if !reachable {
         report["state"] = json!("unavailable");
-        report["reason"] = json!("7890 不可连接");
+        report["reason"] = json!(format!("{port} 不可连接"));
         return report;
     }
     if pids.is_empty() || listener.status != 0 || !listener.stderr.trim().is_empty() {
@@ -267,7 +285,7 @@ pub fn inspect_entry(
         if !is_tag_process(second, uid) {
             report["owners"] = json!(owners);
             report["state"] = json!("mismatch");
-            report["reason"] = json!("7890 监听者不匹配 TAG 安装目录中的 Mihomo");
+            report["reason"] = json!(format!("{port} 监听者不匹配 TAG 安装目录中的 Mihomo"));
             return report;
         }
     }
@@ -490,16 +508,16 @@ pub fn correlate(input: CorrelationInput<'_>) -> Value {
     result["association"] = json!("unconfirmed");
     result["policy"] = json!("unconfirmed");
     result["chains"] = json!([]);
-    let via_proxy = flow.peer.0 == "127.0.0.1" && flow.peer.1 == 7890 && flow.protocol == "tcp";
+    let via_proxy = flow.peer.0 == "127.0.0.1" && (flow.peer.1 == 7890 || flow.peer.1 == 7897) && flow.protocol == "tcp";
     if flow.peer.0.parse::<IpAddr>().is_ok_and(|v| v.is_loopback()) && !via_proxy {
         result["association"] = json!("local_service");
         result["policy"] = json!("not_applicable");
         result["reason"] = json!("其他本机服务连接，不视为代理绕过");
         return result;
     }
-    if via_proxy && (api["state"] != "available" || !truthy(&api["covers_7890"])) {
+    if via_proxy && (api["state"] != "available" || !(truthy(&api["covers_7890"]) || truthy(&api["covers_7897"]))) {
         result["reason"] =
-            json!("控制接口不可用或属于另一内核，不能把 7890 连接与外层 TUN 链强行对应");
+            json!(format!("控制接口不可用或属于另一内核，不能把 {} 连接与外层 TUN 链强行对应", flow.peer.1));
         return result;
     }
     if !via_proxy {
@@ -518,7 +536,7 @@ pub fn correlate(input: CorrelationInput<'_>) -> Value {
             {
                 continue;
             }
-            if truthy(&metadata["inboundPort"]) && integer(&metadata["inboundPort"]) != Some(7890) {
+            if truthy(&metadata["inboundPort"]) && ![Some(7890), Some(7897)].contains(&integer(&metadata["inboundPort"])) {
                 continue;
             }
             if truthy(&metadata["inboundIP"])

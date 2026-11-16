@@ -262,7 +262,12 @@ fn options_ok(v: &Value) -> bool {
 }
 pub fn current_values(network: &Value, local: &Value) -> Value {
     let verified = require_transport(local).is_ok();
-    json!({"proxy_mode":local.get("mode"),"proxy_url":if verified {Some("http://127.0.0.1:7890")}else{None},"proxy_group":if verified {local.pointer("/tag/expected_group")}else{None},"node":if verified {local.pointer("/tag/api/selected_node")}else{None},"runtime_mode":if verified {local.pointer("/tag/api/mode")}else{None},"network_service":network.get("service"),"timezone":local.get("timezone"),"locale":local.get("locale"),"language":local.get("language")})
+    let proxy_url = if verified {
+        local.pointer("/tag/entry/endpoint").and_then(Value::as_str).or(Some("http://127.0.0.1:7890"))
+    } else {
+        None
+    };
+    json!({"proxy_mode":local.get("mode"),"proxy_url":proxy_url,"proxy_group":if verified {local.pointer("/tag/expected_group")}else{None},"node":if verified {local.pointer("/tag/api/selected_node")}else{None},"runtime_mode":if verified {local.pointer("/tag/api/mode")}else{None},"network_service":network.get("service"),"timezone":local.get("timezone"),"locale":local.get("locale"),"language":local.get("language")})
 }
 
 /// Fail closed before any online candidate creation.  TAG evidence must bind
@@ -277,10 +282,11 @@ pub fn require_transport(local: &Value) -> Result<()> {
     if text(local, "mode") == "tag" {
         let entry = &local["tag"]["entry"];
         let api = &local["tag"]["api"];
+        let covers = api["covers_7890"] == true || api["covers_7897"] == true;
         if text(entry, "state") != "verified"
             || entry["public_listener"] == true
             || text(api, "state") != "available"
-            || api["covers_7890"] != true
+            || !covers
             || !matches!(text(api, "mode"), "rule" | "global")
         {
             return Err(err(

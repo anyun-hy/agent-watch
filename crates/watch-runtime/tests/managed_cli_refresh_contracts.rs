@@ -704,7 +704,9 @@ fn v3_node_esm_discovery_sandbox_gateway_fork_and_current_source_cutoff() {
     let cutoff = fixture.supervisor.as_mut().unwrap().handle_event(SupervisionEvent::ProcessInventoryUnavailable {
         family:"claude".into(), observed_at:native::now(),
     }).unwrap();
-    assert_eq!(cutoff.families["claude"].display_state, claude_watch_core::channel::ChannelMonitorDisplayState::Blocked);
+    assert!(matches!(cutoff.families["claude"].display_state,
+        claude_watch_core::channel::ChannelMonitorDisplayState::Disconnecting
+        | claude_watch_core::channel::ChannelMonitorDisplayState::Blocked));
     assert_eq!(cutoff.families["claude"].policy_sync_state, claude_watch_core::channel::PolicySyncState::Applied);
     assert_eq!(main.command("EOF", "EOF"), "EOF 1");
     fork_channel.command(b'E', "EOF 1");

@@ -117,6 +117,33 @@ fn response_timeout_is_distinct_from_daemon_absence() {
 }
 
 #[test]
+fn response_generation_and_endpoint_permissions_still_reject() {
+    use std::{io::{BufRead, BufReader, Write}, os::unix::{net::UnixListener, fs::PermissionsExt}};
+    let root = std::path::PathBuf::from("/tmp").join(format!("cwg-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]));
+    fs::create_dir(&root).unwrap();
+    let store = StateStore::new(Paths::new(&root).unwrap());
+    store.initialize().unwrap();
+    let path = claude_watch_runtime::evidence_client::evidence_socket_path(&store.paths);
+    store.private_dir(path.parent().unwrap()).unwrap();
+    let listener = UnixListener::bind(&path).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o666)).unwrap();
+    assert_eq!(request_daemon_evidence(&store.paths, &request(), Duration::from_secs(1)).unwrap_err().code, "daemon_unavailable");
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    let worker = thread::spawn(move || {
+        let (mut peer, _) = listener.accept().unwrap();
+        let mut line = String::new();
+        BufReader::new(&mut peer).read_line(&mut line).unwrap();
+        let response = serde_json::json!({"schema":1,"id":"previous-request","status":"ok",
+            "result":{"schema":1,"id":"previous-request","items":{},"detail":"x".repeat(6000)}});
+        writeln!(peer, "{response}").unwrap();
+    });
+    let result = request_daemon_evidence(&store.paths, &request(), Duration::from_secs(2));
+    worker.join().unwrap();
+    assert_eq!(result.unwrap_err().code, "evidence_response_invalid");
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn request_frame_can_arrive_in_separate_socket_reads() {
     use std::{io::{Read, Write}, os::unix::net::UnixStream, sync::mpsc};
     let root = std::path::PathBuf::from("/tmp").join(format!("cwf-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]));

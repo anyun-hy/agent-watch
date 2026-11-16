@@ -363,11 +363,11 @@ fn run() -> Result<EngineOutput> {
         return Ok(EngineOutput::json(daemon_run::run(&request, paths)?, 0));
     }
     if request.command == "dns-probe" {
-        use claude_watch_runtime::network_client::{NetworkClient, UreqTransport, DEFAULT_PROXY};
+        use claude_watch_runtime::network_client::{NetworkClient, UreqTransport, default_proxy_url};
         let runner = runtime::runner()?;
         let network = NetworkClient::new(
             std::sync::Arc::new(UreqTransport),
-            Some(DEFAULT_PROXY.into()),
+            Some(default_proxy_url().into()),
         )
         .map_err(|e| CoreError::new(&e.code, &e.detail))?;
         return Ok(EngineOutput::json(

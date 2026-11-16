@@ -20,6 +20,17 @@ use std::{
 pub const CACHE_TTL: Duration = Duration::from_secs(300);
 pub const MAX_BODY: usize = 512 * 1024;
 pub const DEFAULT_PROXY: &str = "http://127.0.0.1:7890";
+pub const DEFAULT_PROXY_7897: &str = "http://127.0.0.1:7897";
+
+pub fn default_proxy_url() -> &'static str {
+    use std::net::{SocketAddr, TcpStream};
+    if let Ok(addr) = "127.0.0.1:7897".parse::<SocketAddr>() {
+        if TcpStream::connect_timeout(&addr, Duration::from_millis(50)).is_ok() {
+            return DEFAULT_PROXY_7897;
+        }
+    }
+    DEFAULT_PROXY
+}
 pub const FAST_EGRESS_URL: &str = "https://www.cloudflare.com/cdn-cgi/trace";
 pub const CONTEXT_MAX_AGE: Duration = Duration::from_secs(30);
 const NETCOFFEE: &str = "https://ip.net.coffee";

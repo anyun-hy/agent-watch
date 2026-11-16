@@ -23,7 +23,10 @@ pub fn dispatch(request: &Request) -> Result<Option<Value>> {
     if !matches!(service, "claude" | "gpt") {
         return Err(CoreError::new("invalid_arguments", "AI 诊断服务无效"));
     }
-    let client = NetworkClient::new(Arc::new(UreqTransport), Some(ai_probe::PROXY.into()))
+    let client = NetworkClient::new(
+        Arc::new(UreqTransport),
+        Some(claude_watch_runtime::network_client::default_proxy_url().into()),
+    )
         .map_err(|error| CoreError::new(&error.code, &error.detail))?
         .with_timeout(Duration::from_secs(6));
     Ok(Some(ai_probe::production(client, service)))

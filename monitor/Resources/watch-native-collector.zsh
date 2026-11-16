@@ -69,7 +69,7 @@ collect() {
     local start_epoch=$EPOCHREALTIME
     /bin/ps -ww -axo 'pid=,ppid=,uid=,lstart=,comm=' > "$before" 2>/dev/null
     local before_rc=$?
-    /usr/sbin/netstat -anv -p tcp 2> "$err" | /usr/bin/awk '$6 == "LISTEN" { print }' > "$net"
+    /usr/sbin/netstat -anv -f inet 2> "$err" | /usr/bin/awk '$6 == "LISTEN" { print }' > "$net"
     local net_rc=$?
     /bin/ps -ww -axo 'pid=,ppid=,uid=,lstart=,comm=' > "$after" 2>/dev/null
     local after_rc=$?

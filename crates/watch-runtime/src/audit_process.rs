@@ -126,10 +126,23 @@ pub fn run_json(
             "审计进程未在回收期限内退出",
         ));
     }
-    if !child.try_wait().ok().flatten().is_some_and(|s| s.success()) && result.is_ok() {
+    let status = child.try_wait().ok().flatten();
+    if !status.is_some_and(|s| s.success()) && result.is_ok() {
+        let exit = status.map(|s| s.to_string()).unwrap_or_else(|| "exit status unavailable".into());
+        if let Ok(value) = &result {
+            if value["schema"] == 1 && value["status"] == "error" {
+                if let Ok(error) = serde_json::from_value::<CoreError>(value.clone()) {
+                    if !error.code.is_empty() && error.code.len() <= 128
+                        && error.code.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+                    {
+                        return Err(CoreError::new(&error.code, &format!("{} ({exit})", error.message)));
+                    }
+                }
+            }
+        }
         return Err(CoreError::new(
             "audit_worker_failed",
-            "审计子进程未成功完成",
+            &format!("审计子进程未成功完成 ({exit})"),
         ));
     }
     result
@@ -138,6 +151,24 @@ pub fn run_json(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn worker_error_retains_original_code_and_exit_status() {
+        for (script, code, detail) in [
+            (r#"cat >/dev/null; printf '%s' '{"schema":1,"status":"error","code":"evidence_response_failed","message":"probe failed"}'; exit 4"#,
+                "evidence_response_failed", "exit status: 4"),
+            (r#"cat >/dev/null; printf '%s' '{"schema":1,"status":"ok"}'; exit 7"#,
+                "audit_worker_failed", "exit status: 7"),
+            (r#"cat >/dev/null; printf '{}'; kill -KILL $$"#,
+                "audit_worker_failed", "signal: 9"),
+        ] {
+            let result = run_json(Command::new("/bin/sh").args(["-c", script]),
+                &serde_json::json!({}), Instant::now() + Duration::from_secs(2), &AtomicBool::new(false));
+            let error = result.unwrap_err();
+            assert_eq!(error.code, code);
+            assert!(error.message.contains(detail), "{}", error.message);
+        }
+    }
+
     #[test]
     fn audit_deadline_reaps_owned_work_and_next_audit_can_execute() {
         let cancel = AtomicBool::new(false);

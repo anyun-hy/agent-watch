@@ -191,9 +191,18 @@ impl ReadCommand {
             }
             Self::Listeners => (
                 "/usr/sbin/netstat".into(),
-                ["-anv", "-p", "tcp"].into_iter().map(Into::into).collect(),
+                ["-anv", "-f", "inet"].into_iter().map(Into::into).collect(),
             ),
-            Self::LsofListener => return Self::LsofTcpListener { port: 7890 }.spec(observer),
+            Self::LsofListener => (
+                "/usr/sbin/lsof".into(),
+                vec![
+                    "-nP".into(),
+                    "-a".into(),
+                    "-iTCP:7897".into(),
+                    "-sTCP:LISTEN".into(),
+                    "-Fpn".into(),
+                ],
+            ),
             Self::LsofTcpListener { port } => {
                 if *port == 0 {
                     return Err(CoreError::new("invalid_listener_port", "监听端口必须非零"));

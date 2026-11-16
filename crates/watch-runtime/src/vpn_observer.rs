@@ -695,7 +695,11 @@ pub fn resolve_vpn_controller_credentials(
 ) -> claude_watch_core::error::Result<claude_watch_core::tag_config::Credentials> {
     let home = &storage.paths.home;
     let candidates = match proxy_mode {
-        "tag" => vec![home.join("Library/Application Support/com.tag.lab/mihomo/runtime.yaml")],
+        "tag" => vec![
+            home.join("Library/Application Support/com.tag.lab.v2/config.yaml"),
+            home.join("Library/Application Support/com.tag.lab.v2/verge.yaml"),
+            home.join("Library/Application Support/com.tag.lab/mihomo/runtime.yaml"),
+        ],
         "clash-verge" | "clash" => vec![
             home.join("Library/Application Support/io.github.clash-verge-rev.clash-verge-rev/clash-verge.yaml"),
             home.join("Library/Application Support/io.github.clash-verge-rev.clash-verge-rev/config.yaml"),
@@ -703,6 +707,8 @@ pub fn resolve_vpn_controller_credentials(
             home.join(".config/clash/config.yaml"),
         ],
         _ => vec![
+            home.join("Library/Application Support/com.tag.lab.v2/config.yaml"),
+            home.join("Library/Application Support/com.tag.lab.v2/verge.yaml"),
             home.join("Library/Application Support/com.tag.lab/mihomo/runtime.yaml"),
             home.join("Library/Application Support/io.github.clash-verge-rev.clash-verge-rev/clash-verge.yaml"),
             home.join("Library/Application Support/io.github.clash-verge-rev.clash-verge-rev/config.yaml"),
@@ -711,7 +717,14 @@ pub fn resolve_vpn_controller_credentials(
     for path in candidates {
         if let Ok(Some(bytes)) = storage.read_bytes(&path, claude_watch_core::tag_config::CONFIG_LIMIT) {
             if let Ok(text) = String::from_utf8(bytes) {
-                if let Ok(creds) = claude_watch_core::tag_config::controller_credentials(&text) {
+                if let Ok(mut creds) = claude_watch_core::tag_config::controller_credentials(&text) {
+                    if creds.unix_socket().map_or(true, |p| !p.exists()) {
+                        let uid = claude_watch_system::effective_uid();
+                        let default_sock = std::path::PathBuf::from(format!("/var/run/tag-service/users/{uid}/tag-mihomo.sock"));
+                        if default_sock.exists() {
+                            creds = creds.with_unix_socket(default_sock);
+                        }
+                    }
                     return Ok(creds);
                 }
             }

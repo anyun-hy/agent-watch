@@ -59,6 +59,27 @@ pub fn set_nonblocking(io: &impl AsRawFd) -> std::io::Result<()> {
     }
     Ok(())
 }
+/// Read buffered data even after peer close, without resetting SO_RCVTIMEO
+/// (macOS rejects that option on a closed Unix peer). Keep one absolute deadline.
+pub fn read_unix_before(stream: &UnixStream, buffer: &mut [u8], deadline: std::time::Instant) -> std::io::Result<usize> {
+    use std::{io, time::Instant};
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() { return Err(io::ErrorKind::TimedOut.into()); }
+        let count = unsafe { libc::recv(stream.as_raw_fd(), buffer.as_mut_ptr().cast(), buffer.len(), libc::MSG_DONTWAIT) };
+        if count >= 0 { return Ok(count as usize); }
+        let error = io::Error::last_os_error();
+        if error.kind() == io::ErrorKind::Interrupted { continue; }
+        if error.kind() != io::ErrorKind::WouldBlock { return Err(error); }
+        let mut fd = libc::pollfd { fd: stream.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+        let ready = unsafe { libc::poll(&mut fd, 1, remaining.as_millis().saturating_add(1).min(i32::MAX as u128) as i32) };
+        if ready < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted { return Err(error); }
+        }
+        // POLLHUP can accompany unread bytes. recv decides data, EOF or error.
+    }
+}
 /// Caller must have spawned this live child with CommandExt::process_group(0).
 /// Holding the unreaped child keeps its PID reserved while signalling its group.
 pub fn terminate_owned_group(child: &std::process::Child) {

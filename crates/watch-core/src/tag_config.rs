@@ -51,6 +51,7 @@ pub fn yaml_scalar(raw: &str) -> Result<String> {
 }
 pub struct Credentials {
     endpoint: SocketAddr,
+    unix_socket: Option<std::path::PathBuf>,
     secret: String,
 }
 impl Credentials {
@@ -59,6 +60,13 @@ impl Credentials {
     }
     pub fn base(&self) -> String {
         format!("http://{}", self.endpoint)
+    }
+    pub fn unix_socket(&self) -> Option<&std::path::Path> {
+        self.unix_socket.as_deref()
+    }
+    pub fn with_unix_socket(mut self, path: std::path::PathBuf) -> Self {
+        self.unix_socket = Some(path);
+        self
     }
     pub fn authorization(&self) -> Option<String> {
         if self.secret.is_empty() {
@@ -99,13 +107,14 @@ impl Credentials {
                 "控制接口鉴权字段无效",
             ));
         }
-        Ok(Self { endpoint, secret })
+        Ok(Self { endpoint, unix_socket: None, secret })
     }
 }
 impl fmt::Debug for Credentials {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Credentials")
             .field("endpoint", &self.endpoint)
+            .field("unix_socket", &self.unix_socket)
             .field("secret", &"[redacted]")
             .finish()
     }
@@ -116,7 +125,7 @@ pub fn controller_credentials(source: &str) -> Result<Credentials> {
     }
     let mut values = BTreeMap::new();
     for line in source.lines() {
-        for key in ["external-controller", "secret"] {
+        for key in ["external-controller", "external-controller-unix", "secret"] {
             if let Some(raw) = line.strip_prefix(&format!("{key}:")) {
                 if values.insert(key, yaml_scalar(raw)?).is_some() {
                     return Err(CoreError::new(
@@ -127,13 +136,21 @@ pub fn controller_credentials(source: &str) -> Result<Credentials> {
             }
         }
     }
-    Credentials::from_parts(
-        values
-            .get("external-controller")
-            .map(String::as_str)
-            .unwrap_or(""),
+    let unix_socket = values.get("external-controller-unix").map(std::path::PathBuf::from);
+    let authority = values.get("external-controller").map(String::as_str);
+    let authority = match (authority, unix_socket.is_some()) {
+        (Some(a), _) => a,
+        (None, true) => "127.0.0.1:9097",
+        (None, false) => "",
+    };
+    let mut creds = Credentials::from_parts(
+        authority,
         values.get("secret").cloned().unwrap_or_default(),
-    )
+    )?;
+    if let Some(path) = unix_socket {
+        creds = creds.with_unix_socket(path);
+    }
+    Ok(creds)
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FakeRange {
@@ -497,7 +514,7 @@ pub fn api_snapshot(
     direct_groups.sort();
     let covers = ["port", "mixed-port", "socks-port"]
         .iter()
-        .any(|key| configs[*key] == 7890);
+        .any(|key| configs[*key] == 7890 || configs[*key] == 7897);
     Ok((
         json!({"state":"available","controller":base,"mode":mode,"covers_7890":covers,
         "selected_node":selected,"route_chains":routes,"global_node":global,"direct_groups":direct_groups,"reason":"","rules":rules}),

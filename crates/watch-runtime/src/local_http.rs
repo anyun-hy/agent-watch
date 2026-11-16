@@ -73,6 +73,70 @@ fn map_io(error: &io::Error) -> Error {
     }
     Error::Transport
 }
+#[cfg(unix)]
+fn get_unix(
+    socket_path: &std::path::Path,
+    path: &str,
+    auth: Option<&str>,
+    timeout: Duration,
+) -> Result<Value, Error> {
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixStream;
+
+    let mut stream = UnixStream::connect(socket_path).map_err(|_| Error::Transport)?;
+    stream.set_read_timeout(Some(timeout)).ok();
+    stream.set_write_timeout(Some(timeout)).ok();
+
+    let mut request = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nAccept: application/json\r\nConnection: close\r\n");
+    if let Some(token) = auth {
+        request.push_str(&format!("Authorization: {token}\r\n"));
+    }
+    request.push_str("\r\n");
+
+    stream.write_all(request.as_bytes()).map_err(|_| Error::Transport)?;
+
+    let mut response_bytes = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                response_bytes.extend_from_slice(&chunk[..n]);
+                if response_bytes.len() > MAX_BODY + MAX_HEADERS {
+                    return Err(Error::TooLarge);
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::TimedOut || e.kind() == std::io::ErrorKind::WouldBlock => {
+                return Err(Error::Timeout);
+            }
+            Err(_) => return Err(Error::Transport),
+        }
+    }
+
+    let double_crlf = b"\r\n\r\n";
+    let header_end = response_bytes
+        .windows(4)
+        .position(|w| w == double_crlf)
+        .ok_or(Error::Protocol)?;
+
+    let header_str = std::str::from_utf8(&response_bytes[..header_end]).map_err(|_| Error::Protocol)?;
+    let mut lines = header_str.lines();
+    let status_line = lines.next().ok_or(Error::Protocol)?;
+    let mut parts = status_line.split_whitespace();
+    let _proto = parts.next().ok_or(Error::Protocol)?;
+    let status_code: u16 = parts
+        .next()
+        .and_then(|s| s.parse().ok())
+        .ok_or(Error::Protocol)?;
+
+    if !(200..300).contains(&status_code) {
+        return Err(Error::Status(status_code));
+    }
+
+    let body = &response_bytes[header_end + 4..];
+    serde_json::from_slice(body).map_err(|_| Error::Json)
+}
+
 pub struct Client {
     credentials: Credentials,
     timeout: Duration,
@@ -102,6 +166,20 @@ impl Client {
         let timeout = self.timeout.min(deadline.saturating_duration_since(started));
         if timeout.is_zero() {
             return Err(Error::Timeout);
+        }
+        #[cfg(unix)]
+        if let Some(sock_path) = self.credentials.unix_socket() {
+            if sock_path.exists() {
+                match get_unix(sock_path, path, self.credentials.authorization().as_deref(), timeout) {
+                    Ok(val) => return Ok(val),
+                    Err(Error::Status(s)) => return Err(Error::Status(s)),
+                    Err(Error::Path) => return Err(Error::Path),
+                    Err(Error::TooLarge) => return Err(Error::TooLarge),
+                    Err(Error::Json) => return Err(Error::Json),
+                    Err(Error::Timeout) => return Err(Error::Timeout),
+                    Err(_) => {}
+                }
+            }
         }
         let agent: ureq::Agent = ureq::Agent::config_builder()
             .proxy(None)

@@ -221,6 +221,81 @@ mod logging_tests {
     }
 
     #[test]
+    fn completed_audit_runners_never_block_the_next_request() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let (events, results) = mpsc::channel();
+        let (requests, worker) = ChannelSupervisor::spawn_async_audit_worker(stop.clone(), events, |req| {
+            if req.request_id % 2 == 0 { return Err(CoreError::new("probe_failed", "fixture")); }
+            Ok((json!({}), json!({}), req.requested_at))
+        }).unwrap();
+        for id in 1..=200 {
+            requests.send(AsyncAuditRequest {
+                request_id: id, family: "openai".into(), target: LaunchTarget::CodexCli,
+                session_id: None, context_id: None,
+                policy_version: PolicyVersion { policy_digest: "fixture".into(), guard_policy_digest: "fixture".into() },
+                vpn_epoch: None, upstream_endpoint: String::new(), requested_at: crate::native::now(),
+                timeout_seconds: 5.0, cancellation: None,
+            }).unwrap();
+            match results.recv_timeout(Duration::from_secs(2)).unwrap() {
+                SupervisionEvent::AsyncAuditCompleted { request_id, outcome, .. } => {
+                    assert_eq!(request_id, id);
+                    match outcome {
+                        AsyncAuditOutcome::Succeeded { .. } => assert_eq!(id % 2, 1),
+                        AsyncAuditOutcome::Failed { code, .. } => assert_eq!(code, "probe_failed"),
+                        outcome => panic!("unexpected outcome: {outcome:?}"),
+                    }
+                }
+                event => panic!("unexpected event: {event:?}"),
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+        stop.store(true, Ordering::Release);
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn cancelled_audit_blocks_only_until_its_runner_exits() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let (events, results) = mpsc::channel();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let release_rx = std::sync::Mutex::new(release_rx);
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let (requests, worker) = ChannelSupervisor::spawn_async_audit_worker(stop.clone(), events, move |req| {
+            if req.request_id == 1 {
+                started_tx.send(()).unwrap();
+                release_rx.lock().unwrap().recv_timeout(Duration::from_secs(2)).unwrap();
+                finished_tx.send(()).unwrap();
+            }
+            Ok((json!({}), json!({}), req.requested_at))
+        }).unwrap();
+        let request = |id| AsyncAuditRequest {
+            request_id: id, family: "openai".into(), target: LaunchTarget::CodexCli,
+            session_id: None, context_id: None,
+            policy_version: PolicyVersion { policy_digest: "fixture".into(), guard_policy_digest: "fixture".into() },
+            vpn_epoch: None, upstream_endpoint: String::new(), requested_at: crate::native::now(),
+            timeout_seconds: 5.0, cancellation: Some(Arc::new(AtomicBool::new(false))),
+        };
+        let first = request(1);
+        requests.send(first.clone()).unwrap();
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        first.cancellation.unwrap().store(true, Ordering::Release);
+        requests.send(request(2)).unwrap();
+        assert!(matches!(results.recv_timeout(Duration::from_secs(1)).unwrap(),
+            SupervisionEvent::AsyncAuditCompleted { request_id: 2, outcome: AsyncAuditOutcome::Failed { code, .. }, .. }
+                if code == "audit_cleanup_pending"));
+        release_tx.send(()).unwrap();
+        finished_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        thread::sleep(Duration::from_millis(10));
+        requests.send(request(3)).unwrap();
+        let result = results.recv_timeout(Duration::from_secs(1)).unwrap();
+        stop.store(true, Ordering::Release);
+        worker.join().unwrap();
+        assert!(matches!(result, SupervisionEvent::AsyncAuditCompleted {
+            request_id: 3, outcome: AsyncAuditOutcome::Succeeded { .. }, .. }));
+    }
+
+    #[test]
     fn repeated_audit_failures_back_off_without_permanently_stopping_recovery() {
         let now = 1_800_000_000.0;
         let (mut supervisor, _enforcer) = blocked_supervisor(now);
@@ -1208,13 +1283,15 @@ impl ChannelSupervisor {
             .spawn(move || {
                 let mut retiring: Option<(Arc<AtomicBool>, thread::JoinHandle<()>)> = None;
                 while !stop.load(Ordering::Acquire) {
+                    let Ok(req) = req_rx.recv_timeout(std::time::Duration::from_millis(50)) else { continue; };
+                    if stop.load(Ordering::Acquire) { break; }
+                    if req.is_cancelled() { continue; }
+                    // The previous runner may have finished while waiting for
+                    // this request. Recheck now before rejecting new work.
                     if retiring.as_ref().is_some_and(|(_, h)| h.is_finished()) {
                         let (_, handle) = retiring.take().unwrap();
                         let _ = handle.join();
                     }
-                    let Ok(req) = req_rx.recv_timeout(std::time::Duration::from_millis(50)) else { continue; };
-                    if stop.load(Ordering::Acquire) { break; }
-                    if req.is_cancelled() { continue; }
                     let send = |outcome, completed_at| {
                         let _ = event_tx.send(SupervisionEvent::AsyncAuditCompleted {
                             request_id: req.request_id, family: req.family.clone(), session_id: req.session_id.clone(),
@@ -1243,6 +1320,7 @@ impl ChannelSupervisor {
                         Err(_) => { send(AsyncAuditOutcome::Failed { code: "audit_runner_start_failed".into(),
                             detail: "审计工作线程启动失败".into() }, crate::native::now()); continue; }
                     };
+                    let mut completed = false;
                     loop {
                         if stop.load(Ordering::Acquire) || cancellation.load(Ordering::Acquire) || started.elapsed() >= timeout {
                             let was_cancelled = cancellation.load(Ordering::Acquire);
@@ -1254,12 +1332,14 @@ impl ChannelSupervisor {
                         }
                         match result_rx.recv_timeout(std::time::Duration::from_millis(20).min(timeout.saturating_sub(started.elapsed()))) {
                             Ok(Ok((audit, egress, completed_at))) => {
+                                completed = true;
                                 if completed_at - req.requested_at >= req.timeout_seconds {
                                     send(AsyncAuditOutcome::TimedOut { elapsed_seconds: (completed_at - req.requested_at).max(0.0) }, completed_at);
                                 } else { send(AsyncAuditOutcome::Succeeded { audit, egress }, completed_at); }
                                 break;
                             }
                             Ok(Err(err)) => {
+                                completed = true;
                                 let outcome = if err.code == "audit_cancelled" {
                                     AsyncAuditOutcome::TimedOut { elapsed_seconds: started.elapsed().as_secs_f64() }
                                 } else { AsyncAuditOutcome::Failed { code: err.code, detail: err.message } };
@@ -1273,7 +1353,7 @@ impl ChannelSupervisor {
                             }
                         }
                     }
-                    if runner_thread.is_finished() { let _ = runner_thread.join(); }
+                    if completed || runner_thread.is_finished() { let _ = runner_thread.join(); }
                     else { retiring = Some((cancellation, runner_thread)); }
                 }
                 if let Some((cancel, handle)) = retiring {
@@ -1942,7 +2022,14 @@ impl ChannelSupervisor {
                 }
                 (ChannelPermitState::Revoked, code)
             }
-        } else if self.tracks.get(family).is_none_or(|t| t.processes.is_empty()) {
+        } else if self.tracks.get(family).is_none_or(|t| {
+            t.processes.is_empty()
+                || t.processes.iter().all(|p| {
+                    self.unmanaged_member_pids
+                        .get(family)
+                        .is_some_and(|unmanaged| unmanaged.contains(&p.pid))
+                })
+        }) {
             let observed_only = !desktops.is_empty()
                 || self.unmanaged_member_pids.get(family).is_some_and(|pids| !pids.is_empty());
             (ChannelPermitState::PendingVerification,

@@ -556,7 +556,8 @@ impl<R: ReadRunner> Sampler<R> {
         let listener = listener.map(|v| tag_flow::listener_fallback(v, kernel.as_ref().ok()));
         report["listener_observed_at"] = listener.as_ref().ok().and_then(|listener|
             if listener.source == "netstat" { kernel_at } else { Some(listener_at) }).map_or(Value::Null, |at| json!(at));
-        let reachable = self.runner.loopback_tcp_reachable(7890, Duration::from_millis(500));
+        let reachable = self.runner.loopback_tcp_reachable(7897, Duration::from_millis(500))
+            || self.runner.loopback_tcp_reachable(7890, Duration::from_millis(500));
         let after = before.as_ref().map_err(Clone::clone).and_then(|table| {
             let pids = table.iter().filter_map(|(pid, row)|
                 (tag_flow::is_tag_process(row, processes.uid) || processes.targets.iter().any(|p| p.identity.pid == *pid))
@@ -586,23 +587,38 @@ impl<R: ReadRunner> Sampler<R> {
             entry["collection"] = json!({"kernel":summary(&kernel),"listener":summary(&listener)});
         }
         report["entry"] = entry.clone();
-        let config_path = self
-            .paths
-            .home
-            .join("Library/Application Support/com.tag.lab/mihomo/runtime.yaml");
-        let config = if entry["state"] == "verified" {
-            StateStore::new(self.paths.clone())
-                .read_bytes(&config_path, tag_config::CONFIG_LIMIT)
-                .ok()
-                .flatten()
-                .and_then(|b| String::from_utf8(b).ok())
-        } else {
-            None
-        };
+        let candidate_paths = [
+            self.paths.home.join("Library/Application Support/com.tag.lab.v2/config.yaml"),
+            self.paths.home.join("Library/Application Support/com.tag.lab.v2/verge.yaml"),
+            self.paths.home.join("Library/Application Support/com.tag.lab/mihomo/runtime.yaml"),
+        ];
+        let mut config = None;
+        let mut config_path = candidate_paths[0].clone();
+        if entry["state"] == "verified" {
+            let store = StateStore::new(self.paths.clone());
+            for path in &candidate_paths {
+                if let Ok(Some(bytes)) = store.read_bytes(path, tag_config::CONFIG_LIMIT) {
+                    if let Ok(text) = String::from_utf8(bytes) {
+                        config = Some(text);
+                        config_path = path.clone();
+                        break;
+                    }
+                }
+            }
+        }
         let client = config
             .as_deref()
             .and_then(|s| tag_config::controller_credentials(s).ok())
-            .map(Client::new);
+            .map(|mut creds| {
+                if creds.unix_socket().map_or(true, |p| !p.exists()) {
+                    let uid = claude_watch_system::effective_uid();
+                    let default_sock = std::path::PathBuf::from(format!("/var/run/tag-service/users/{uid}/tag-mihomo.sock"));
+                    if default_sock.exists() {
+                        creds = creds.with_unix_socket(default_sock);
+                    }
+                }
+                Client::new(creds)
+            });
         // /configs does not expose every DNS/profile setting. Bind the existing
         // runtime configuration too, without publishing its credential-bearing text.
         report["runtime_config_revision"] = config.as_ref().map(|s| crate::storage::sha256(s.as_bytes())).into();

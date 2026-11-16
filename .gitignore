@@ -12,6 +12,7 @@
 /reports/
 /monitor/reports/
 /local/
+/.build/
 *.har
 *.log
 

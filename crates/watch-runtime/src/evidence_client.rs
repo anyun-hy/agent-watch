@@ -9,7 +9,7 @@ use claude_watch_core::{
 };
 use serde_json::{json, Value};
 use std::{
-    io::{Read, Write},
+    io::Write,
     os::unix::{
         fs::{FileTypeExt, MetadataExt, PermissionsExt},
         net::{UnixListener, UnixStream},
@@ -38,14 +38,7 @@ fn read_frame(stream: &mut UnixStream, limit: usize, timeout: Duration) -> Resul
     let mut data = Vec::new();
     let mut chunk = [0u8; 4096];
     loop {
-        let remaining = deadline
-            .checked_duration_since(Instant::now())
-            .filter(|v| !v.is_zero())
-            .ok_or_else(|| failure("evidence_timeout"))?;
-        stream
-            .set_read_timeout(Some(remaining))
-            .map_err(|_| failure("evidence_response_failed"))?;
-        let n = stream.read(&mut chunk).map_err(|e| {
+        let n = claude_watch_system::read_unix_before(stream, &mut chunk, deadline).map_err(|e| {
             failure(
                 if matches!(
                     e.kind(),
@@ -194,5 +187,50 @@ impl Drop for EvidenceServer {
         {
             let _ = std::fs::remove_file(&self.path);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn complete_frame_survives_peer_close_across_read_chunks() {
+        let (mut reader, mut writer) = UnixStream::pair().unwrap();
+        let bytes = format!("{{\"detail\":\"{}\"}}\n", "x".repeat(6000)).into_bytes();
+        writer.write_all(&bytes).unwrap();
+        drop(writer); // macOS used to reject SO_RCVTIMEO despite buffered data.
+        assert_eq!(read_frame(&mut reader, RESPONSE_LIMIT, Duration::from_secs(1)).unwrap(), bytes);
+    }
+
+    #[test]
+    fn framing_rejects_truncation_extra_frames_and_oversize() {
+        for (bytes, limit, code) in [
+            (b"{\"partial\":true}".to_vec(), 100, "evidence_response_failed"),
+            (b"{}\n{}\n".to_vec(), 100, "evidence_response_invalid"),
+            (format!("{}\n", "x".repeat(6000)).into_bytes(), 4096, "evidence_payload_oversize"),
+        ] {
+            let (mut reader, mut writer) = UnixStream::pair().unwrap();
+            writer.write_all(&bytes).unwrap();
+            drop(writer);
+            assert_eq!(read_frame(&mut reader, limit, Duration::from_secs(1)).unwrap_err().code, code);
+        }
+    }
+
+    #[test]
+    fn partial_data_does_not_extend_the_original_deadline() {
+        let (mut reader, mut writer) = UnixStream::pair().unwrap();
+        let worker = std::thread::spawn(move || {
+            writer.write_all(b"{").unwrap();
+            std::thread::sleep(Duration::from_millis(70));
+            let _ = writer.write_all(b" ");
+            std::thread::sleep(Duration::from_millis(150));
+        });
+        let start = Instant::now();
+        let result = read_frame(&mut reader, 100, Duration::from_millis(100));
+        let elapsed = start.elapsed();
+        worker.join().unwrap();
+        assert_eq!(result.unwrap_err().code, "evidence_timeout");
+        assert!(elapsed < Duration::from_millis(160), "deadline extended: {elapsed:?}");
     }
 }
