@@ -13,6 +13,19 @@ use std::{
 
 const MAX_BODY: usize = 4 * 1024 * 1024;
 const MAX_HEADERS: usize = 32 * 1024;
+/// Effective network configuration only; counters and sample times are excluded.
+pub fn diagnostic_network_config(configs: &Value, proxies: &Value, rules: &Value) -> Value {
+    if !configs["tun"].is_object() || rules["state"] != "available" { return Value::Null; }
+    let selections: std::collections::BTreeMap<_, _> = proxies["proxies"].as_object()
+        .into_iter().flatten().filter_map(|(name, value)|
+            value["now"].as_str().map(|selected| (name, selected))).collect();
+    let mut config = serde_json::Map::new();
+    for key in ["mode", "tun", "dns", "ipv6", "interface-name", "routing-mark", "port", "mixed-port", "socks-port"] {
+        config.insert(key.into(), configs[key].clone());
+    }
+    crate::config_store::policy_digest(&json!({"config":config,"selections":selections,"rules":rules["entries"]}))
+        .map(Value::String).unwrap_or(Value::Null)
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
     Path,
@@ -181,6 +194,10 @@ impl Client {
             Err(_)=>json!({"state":"unavailable","reason":"控制接口规则表不可用或格式不完整","entries":[]})
         };
         tag_config::api_snapshot(&self.base(), group, &configs, &proxies, &connections, rules)
+            .map(|(mut api, rows)| {
+                api["network_config"] = diagnostic_network_config(&configs, &proxies, &api["rules"]);
+                (api, rows)
+            })
             .unwrap_or_else(|_| unavailable())
     }
 

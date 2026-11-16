@@ -66,7 +66,14 @@ impl EvidenceSystem for NativeEvidence {
         native::now()
     }
     fn local(&mut self, config: &Config) -> Result<Value> {
-        AuditSystem::local(&self.host, config)
+        let mut local = AuditSystem::local(&self.host, config)?;
+        if local["evidence_network_bound"] == true {
+            let egress = self.host.network.fast_egress();
+            let ip = egress.data.as_ref().and_then(|v| v["ip"].as_str())
+                .ok_or_else(|| CoreError::new("evidence_egress_unavailable", "出口采样未完成；已通过检测记录保留"))?;
+            local["evidence_egress_ip"] = Value::String(ip.into());
+        }
+        Ok(local)
     }
     fn desktop_matches(&mut self, expected: &Desktop) -> Result<bool> {
         Ok(self
@@ -131,7 +138,8 @@ impl EvidenceSystem for NativeEvidence {
 }
 pub fn spawn(paths: Paths, stop: Arc<AtomicBool>) -> Result<thread::JoinHandle<()>> {
     let store = StateStore::new(paths.clone());
-    let host = super::runtime::host(paths, Authority::ReadOnly)?;
+    let mut host = super::runtime::host(paths, Authority::ReadOnly)?;
+    host.request_evidence = false;
     let desktop = NativeDesktop::new(
         host.runner.clone(),
         super::runtime::process_component()?,
@@ -149,10 +157,21 @@ pub fn spawn(paths: Paths, stop: Arc<AtomicBool>) -> Result<thread::JoinHandle<(
                 executor,
             };
             let events = EventStore::new(store.clone());
+            let server = match claude_watch_runtime::evidence_client::EvidenceServer::bind(&store) {
+                Ok(server) => server,
+                Err(error) => {
+                    let _ = events.append("background-evidence", EventFields {
+                        status: Some("error".into()), code: Some(error.code), ..Default::default()
+                    }, native::now());
+                    return;
+                }
+            };
+
             let mut last_report = String::new();
             let mut last_report_at = Instant::now();
             let mut failures = 0;
             while !stop.load(Ordering::Acquire) {
+                let _ = server.poll(&store, &mut system);
                 let started = Instant::now();
                 let outcome = background_evidence::refresh_supervised_sessions(&store, &mut system);
                 let (status, code, count) = match &outcome {
@@ -204,9 +223,11 @@ pub fn spawn(paths: Paths, stop: Arc<AtomicBool>) -> Result<thread::JoinHandle<(
                 last_report = signature;
                 let interval = next_interval(&mut failures, status == "incomplete");
                 while !stop.load(Ordering::Acquire) && started.elapsed() < interval {
-                    thread::sleep(Duration::from_millis(100));
+                    let _ = server.poll(&store, &mut system);
+                    thread::sleep(Duration::from_millis(50));
                 }
             }
+
         })
         .map_err(|_| CoreError::new("evidence_worker_failed", "保护证据更新线程无法启动"))
 }

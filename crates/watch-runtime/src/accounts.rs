@@ -81,6 +81,31 @@ impl SwitchResult {
     }
 }
 
+/// Called only after uninstall's explicit data-removal check, with operation held.
+pub(crate) fn purge_saved_accounts(store: &StateStore, _operation: &crate::storage::OperationLock) -> Result<()> {
+    for path in [
+        store.paths.accounts(),
+        store.paths.base().join("ip-history.json"),
+        store.paths.base().join("accounts.json"),
+    ] {
+        store.guarded(&path)?;
+        match fs::symlink_metadata(&path) {
+            Ok(meta) if meta.is_dir() => fs::remove_dir_all(&path),
+            Ok(meta) if meta.is_file() => fs::remove_file(&path),
+            Ok(_) => return Err(CoreError::new("unsafe_path", "账号库路径类型无效，未清理")),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => Err(e),
+        }
+        .map_err(|_| {
+            CoreError::new(
+                "account_cleanup_failed",
+                "工具账号库清理未完成；当前 Claude 登录目录保留",
+            )
+        })?;
+    }
+    Ok(())
+}
+
 pub struct AccountStore<O> {
     pub storage: StateStore,
     pub os: O,

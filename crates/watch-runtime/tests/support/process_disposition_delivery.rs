@@ -64,14 +64,21 @@ impl Fixture {
     fn start() -> Self { Self::with_actions("force", None) }
 
     fn with_actions(ip: &str, dns: Option<&str>) -> Self {
+        Self::with_family_actions("claude", ip, dns)
+    }
+
+    fn with_family_actions(family: &str, ip: &str, dns: Option<&str>) -> Self {
         let root = PathBuf::from("/private/tmp").join(format!("cw-x-{}", &uuid::Uuid::new_v4().simple().to_string()[..12]));
         fs::create_dir(&root).unwrap();
         let storage = StateStore::new(Paths::new(&root).unwrap());
         let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
         let mut config = fixture::config(&storage, &upstream.local_addr().unwrap().to_string());
-        config.policy_actions.insert("claude_close_ip".into(), ip.into());
-        if let Some(dns)=dns { config.policy_actions.insert("claude_close_dns".into(),dns.into()); }
-        let config = (ConfigStore { storage: storage.clone() }).save(config.value().unwrap()).unwrap();
+        let prefix = if family == "claude" { "claude" } else { "gpt" };
+        config.policy_actions.insert(format!("{prefix}_close_ip"), ip.into());
+        if let Some(dns)=dns { config.policy_actions.insert(format!("{prefix}_close_dns"),dns.into()); }
+        let confirmation = (family == "openai" && ip == "force").then_some("gpt_close_ip");
+        let config = (ConfigStore { storage: storage.clone() })
+            .save_with_force_confirmation(config.value().unwrap(), confirmation).unwrap();
         let policy = ChannelSupervisor::compute_policy_version(&config).unwrap();
         let helper = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/debug/watch-sandbox-launcher").canonicalize().unwrap();
         let helper = hardened_helper::copy_signed(&helper, &root.join("watch-sandbox-launcher"));
@@ -205,6 +212,188 @@ fn wait_until_exited(identity: &ProcessKernelIdentity) {
 }
 
 #[test]
+fn phase2_live_gateway_distinguishes_vpn_gate_and_warn_close_force() {
+    use std::{io::{Read, Write}, net::TcpStream, os::unix::process::ExitStatusExt};
+    use crate::channel_enforcer::ChannelEnforcer;
+    use claude_watch_core::channel::ChannelEnforcementState;
+
+    fn header(stream: &mut TcpStream) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        while !bytes.ends_with(b"\r\n\r\n") {
+            let mut byte = [0];
+            stream.read_exact(&mut byte).expect("complete HTTP header, not EOF or timeout");
+            bytes.push(byte[0]);
+            assert!(bytes.len() < 4096);
+        }
+        bytes
+    }
+    fn accept(listener: &TcpListener) -> TcpStream {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    stream.set_nonblocking(false).unwrap();
+                    stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+                    stream.set_write_timeout(Some(Duration::from_secs(2))).unwrap();
+                    return stream;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(Instant::now() < deadline, "fixture connection was not established");
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("accept: {error}"),
+            }
+        }
+    }
+    fn ordinary_pair(listener: &TcpListener) -> (TcpStream, TcpStream) {
+        (TcpStream::connect(listener.local_addr().unwrap()).unwrap(), accept(listener))
+    }
+    fn exchange(pair: &mut (TcpStream, TcpStream)) {
+        pair.0.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        pair.0.write_all(b"o").unwrap();
+        let mut byte = [0];
+        pair.1.read_exact(&mut byte).unwrap();
+        assert_eq!(&byte, b"o");
+        pair.1.write_all(b"k").unwrap();
+        pair.0.read_exact(&mut byte).unwrap();
+        assert_eq!(&byte, b"k");
+    }
+
+    for family in ["claude", "openai"] {
+        for (vpn_mismatch, action) in [(true, "warn"), (true, "force"), (false, "warn"), (false, "close"), (false, "force")] {
+            let mut fixture = Fixture::with_family_actions(family, action, None);
+            fixture._upstream.set_nonblocking(true).unwrap();
+            let image = fixture.root.join("owned-network-client");
+            // The actual Seatbelt child owns the gateway socket. Marker files
+            // report facts; all decisions and effects run in production Rust.
+            fixture.compile(r#"
+#include <arpa/inet.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <unistd.h>
+static void mark(const char *name) {
+    FILE *out = fopen(name, "w");
+    if (!out || fclose(out)) exit(91);
+}
+static int tunnel(int port, int expected) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in addr = { .sin_family = AF_INET, .sin_port = htons(port) };
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    struct timeval timeout = { .tv_sec = 3 };
+    if (fd < 0 || setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) ||
+        connect(fd, (struct sockaddr *)&addr, sizeof(addr))) exit(92);
+    const char *request = "CONNECT fixture.invalid:443 HTTP/1.1\r\nHost: fixture.invalid:443\r\n\r\n";
+    if (write(fd, request, strlen(request)) != (ssize_t)strlen(request)) exit(93);
+    char header[1024] = {0}; size_t n = 0;
+    while (n < sizeof(header)-1 && !strstr(header, "\r\n\r\n")) {
+        if (read(fd, &header[n], 1) != 1) exit(94);
+        n++;
+    }
+    int status = 0;
+    if (sscanf(header, "HTTP/1.1 %d", &status) != 1 || status != expected) exit(95);
+    return fd;
+}
+int main(int argc, char **argv) {
+    if (argc != 2) return 90;
+    signal(SIGPIPE, SIG_IGN);
+    for (int i = 0; access("permit-ready", F_OK); i++) {
+        if (i == 500) return 96;
+        usleep(10000);
+    }
+    int fd = tunnel(atoi(argv[1]), 200);
+    char byte; ssize_t n;
+    while ((n = read(fd, &byte, 1)) == 1) {
+        if (write(fd, &byte, 1) != 1) return 97;
+    }
+    if (n != 0) return 98;
+    mark("client-eof"); close(fd);
+    close(tunnel(atoi(argv[1]), 502));
+    mark("reconnect-rejected");
+    for (;;) pause();
+}
+"#, &image);
+            let target_kind = if family == "claude" { LaunchTarget::ClaudeCli } else { LaunchTarget::CodexCli };
+            let mut target = fixture.launch(target_kind, &image, vec![fixture.gateway.port().to_string()]);
+            let identity = inspect_process_identity(target.0.id()).unwrap();
+            let mut supervisor = fixture.supervisor(&[family]);
+            let (events, receipts) = mpsc::channel();
+            let (dispatcher, worker) = ProcessDispositionDispatcher::start(
+                fixture.storage.clone(), fixture.stop.clone(), events).unwrap();
+            fixture.workers.push(worker);
+            supervisor.install_process_disposition_dispatcher(dispatcher);
+            supervisor.set_process_disposition_registry(fixture.registry.clone());
+            fs::write(fixture.root.join("permit-ready"), b"ready").unwrap();
+            let mut upstream = accept(&fixture._upstream);
+            assert!(header(&mut upstream).starts_with(b"CONNECT fixture.invalid:443 "));
+            upstream.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n").unwrap();
+            let mut byte = [0];
+            upstream.write_all(b"a").unwrap(); upstream.read_exact(&mut byte).unwrap();
+            assert_eq!(&byte, b"a");
+            let mut ordinary = ordinary_pair(&fixture._upstream);
+            exchange(&mut ordinary);
+
+            let now = native::now();
+            if vpn_mismatch {
+                let mut observation = fixture::sample_vpn_observation(now, 2);
+                observation.upstream_endpoint = Some(fixture.config.proxy_url.clone());
+                observation.selected_node = claude_watch_core::vpn::ObservedField::Known("unexpected".into());
+                supervisor.handle_event(SupervisionEvent::VpnObservationUpdated { observation, observed_at: now }).unwrap();
+            } else {
+                fixture.environment(&mut supervisor, family, "9.9.9.9", now);
+            }
+            let cutoff = vpn_mismatch || action != "warn";
+            assert_eq!(supervisor.snapshot(now).families[family].permit_state,
+                if cutoff { ChannelPermitState::Revoked } else { ChannelPermitState::Permitted });
+            if cutoff {
+                assert_eq!(upstream.read(&mut byte).expect("upstream must receive EOF, not timeout/reset"), 0);
+                if !vpn_mismatch && matches!(action, "close" | "force") {
+                    let event = receipts.recv_timeout(Duration::from_secs(3)).expect("actual exit result");
+                    let SupervisionEvent::ProcessReceiptArrived { receipt, .. } = &event else { panic!("{event:?}"); };
+                    assert!(receipt.target_results.iter().any(|r| r.pid == identity.pid && r.terminated && r.signal_sent_at.is_some()));
+                    supervisor.handle_event(event).unwrap();
+                    wait_until_exited(&identity);
+                    assert_eq!(target.0.wait().unwrap().signal(), Some(if action == "force" { 9 } else { 15 }));
+                } else {
+                    let deadline = Instant::now() + Duration::from_secs(2);
+                    while !fixture.root.join("reconnect-rejected").exists() {
+                        assert!(target.0.try_wait().unwrap().is_none(), "client must stay alive after cutoff");
+                        assert!(Instant::now() < deadline, "client EOF and actual reconnect rejection missing");
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    assert!(fixture.root.join("client-eof").exists());
+                }
+                let deadline = Instant::now() + Duration::from_secs(2);
+                loop {
+                    let receipt = fixture.enforcer.receipt_for(family, native::now()).unwrap().unwrap();
+                    if receipt.enforcement_state == ChannelEnforcementState::Blocked && receipt.active_flows_count == 0 { break; }
+                    assert!(Instant::now() < deadline, "relay must publish actual completion");
+                    thread::sleep(Duration::from_millis(5));
+                }
+            } else {
+                upstream.write_all(b"b").unwrap(); upstream.read_exact(&mut byte).unwrap();
+                assert_eq!(&byte, b"b", "warn keeps the established flow working");
+                assert!(supervisor.drain_emitted_events().iter().any(|event|
+                    event.family_state.family == family && event.family_state.reason_code == "egress_ip_changed"));
+            }
+            if vpn_mismatch || action == "warn" {
+                assert!(receipts.try_recv().is_err(), "network-only policy cannot dispatch process force");
+                assert_eq!(inspect_process_identity(identity.pid), Some(identity));
+            }
+            exchange(&mut ordinary);
+            exchange(&mut ordinary_pair(&fixture._upstream));
+            export(&format!("phase2-{family}-{vpn_mismatch}-{action}.json"), &json!({
+                "family":family, "vpn_mismatch":vpn_mismatch, "action":action,
+                "physical_cutoff":cutoff, "process_forced":!vpn_mismatch && action=="force",
+                "ordinary_existing_and_new_connections":"passed", "result":"passed"
+            }));
+        }
+    }
+}
+
+#[test]
 fn v1_worker_delivery_preserves_partial_result_in_both_policy_orders() {
     let mut cases = Vec::new();
     for policy_first in [true, false] {
@@ -219,8 +408,17 @@ fn v1_worker_delivery_preserves_partial_result_in_both_policy_orders() {
         let [first, second] = identities;
         let other_identity = inspect_process_identity(other.0.id()).unwrap();
         let ordinary_identity = inspect_process_identity(ordinary.0.id()).unwrap();
-        let mut supervisor = fixture.supervisor(&["claude", "openai"]);
+        // Match production's receipt receiver clock before the first command.
+        // This fixture executes real work; event time is not receipt arrival time.
+        let mut supervisor = ChannelSupervisor::new(fixture.storage.clone(), Some(fixture.enforcer.clone()), None).unwrap();
+        supervisor.set_inline_receipt_clock(native::now);
+        let now = native::now();
+        fixture::seed_probe_receipts(&fixture.storage, now, "US");
+        fixture.observation(&mut supervisor, 1, now);
+        fixture.environment(&mut supervisor, "*", "1.1.1.1", now);
+        for family in ["claude", "openai"] { fixture.bind(&mut supervisor, family, now); }
         let before = supervisor.snapshot(native::now());
+        assert_eq!(before.families["openai"].policy_sync_state, claude_watch_core::channel::PolicySyncState::Applied);
         let (events, receipts) = mpsc::channel();
         let (entered, waiting) = mpsc::sync_channel(1);
         let (resume, barrier) = mpsc::sync_channel(1);
@@ -240,6 +438,10 @@ fn v1_worker_delivery_preserves_partial_result_in_both_policy_orders() {
         supervisor.install_process_disposition_dispatcher(dispatcher);
         supervisor.set_process_disposition_registry(fixture.registry.clone());
         supervisor.drain_emitted_events();
+        // The service intentionally keeps a stable command in the first half
+        // of a lease. Reach its renewal window before pausing the force worker.
+        let renewal_at = (before.captured_at + before.families["openai"].valid_until.unwrap()) / 2.0;
+        thread::sleep(Duration::from_secs_f64((renewal_at - native::now()).max(0.0)));
         fixture.environment(&mut supervisor, "claude", "9.9.9.9", native::now());
         let requested = supervisor.snapshot(native::now());
         assert_eq!(requested.families["claude"].process_execution_state.as_deref(), Some("executing"), "{:?}", requested.families["claude"]);
@@ -356,10 +558,10 @@ fn v1_worker_deadline_retains_unconfirmed_exit_when_observation_is_withheld() {
 }
 
 #[test]
-fn independent_risks_submit_only_the_configured_force_intent_for_verified_members() {
+fn independent_risks_submit_only_the_configured_exit_intent_for_verified_members() {
     for (ip,dns,expected,dns_age) in [("warn","force",Some("dns_egress_changed"),0.),
         ("force","warn",Some("egress_ip_changed"),0.),("close","force",Some("dns_egress_changed"),0.),
-        ("close","warn",None,0.),("warn","warn",None,0.),
+        ("close","warn",Some("egress_ip_changed"),0.),("warn","warn",None,0.),
         ("warn","force",Some("dns_egress_changed"),299.5),("warn","force",None,301.)] {
         let mut fixture=Fixture::with_actions(ip,Some(dns));
         let image=fixture.sleeper(); let target=fixture.launch(LaunchTarget::ClaudeCli,&image,vec![]);
@@ -377,7 +579,8 @@ fn independent_risks_submit_only_the_configured_force_intent_for_verified_member
         if ip=="close" && dns=="force" {
             fixture.environment(&mut supervisor,"claude","9.9.9.9",native::now());
             assert_eq!(SessionStore::new(fixture.storage.clone()).load(native::now()).unwrap().unwrap().state,Phase::Locked);
-            assert!(received.try_recv().is_err(),"a close risk alone cannot enqueue force");
+            assert_eq!(received.recv_timeout(Duration::from_secs(2)).unwrap().action,"close",
+                "a close risk requests normal exit, never force");
         }
         let sampled_at=native::now();
         fixture::seed_probe_receipts(&fixture.storage,sampled_at,"JP");
@@ -390,8 +593,8 @@ fn independent_risks_submit_only_the_configured_force_intent_for_verified_member
         }
         fixture.environment(&mut supervisor,"claude","9.9.9.9",now);
         if let Some(reason)=expected {
-            let intent=received.recv_timeout(Duration::from_secs(2)).expect("Supervisor must submit the actual force job");
-            assert_eq!(intent.action,"force"); assert_eq!(intent.risk_code,reason);
+            let intent=received.recv_timeout(Duration::from_secs(2)).expect("Supervisor must submit the configured exit job");
+            assert_eq!(intent.action,if reason=="dns_egress_changed" { dns } else { ip }); assert_eq!(intent.risk_code,reason);
             assert_eq!(intent.session_id,original.session_id); assert_eq!(intent.family,"claude");
             assert_eq!(intent.target_identities.len(),1);
             let token=&intent.target_identities[0];
@@ -402,9 +605,129 @@ fn independent_risks_submit_only_the_configured_force_intent_for_verified_member
                 "rereading a cached probe cannot extend its process authority"); }
             assert_eq!(supervisor.snapshot(now).families["claude"].process_execution_state.as_deref(),Some("executing"));
         } else {
-            assert!(received.recv_timeout(Duration::from_millis(150)).is_err(),"close/warn cannot queue process effects");
+            assert!(received.recv_timeout(Duration::from_millis(150)).is_err(),"warn or expired evidence cannot queue process effects");
             assert!(supervisor.snapshot(now).families["claude"].process_disposition_action.is_none());
         }
         assert_eq!(inspect_process_identity(identity.pid),Some(identity),"the capture executor never signals the owned process");
+    }
+}
+
+#[test]
+fn external_process_actions_use_real_worker_and_preserve_warn_and_later_launches() {
+    use std::{io::Read, os::unix::process::ExitStatusExt};
+    use claude_watch_core::{channel::{BackendCoverageScope, BoundProcessToken, NetworkBackendKind}, processes::ProcessRole};
+    let bound = |p: &claude_watch_system::ProcessKernelIdentity|
+        BoundProcessToken::with_system_identity(p.pid, p.uid, p.start_seconds, p.start_microseconds, ProcessRole::Cli)
+            .with_audit_token(p.audit_token);
+    for (family, action) in [("openai", "warn"), ("openai", "close"), ("openai", "force"), ("claude", "close"), ("claude", "force")] {
+        let mut fixture = Fixture::with_family_actions(family, action, None);
+        let image = fixture.root.join("external-exit-fixture");
+        fixture.compile("#include <signal.h>\n#include <unistd.h>\nint main(int argc,char **argv){if(argc>1){signal(SIGTERM,SIG_IGN);write(1,\"R\",1);}for(;;)pause();}\n", &image);
+        fixture.registry.approve_target_executable(image.to_string_lossy().into_owned(), sha256_file_hex(&image).unwrap());
+        let anchor_image = fixture.root.join("unapproved-anchor");
+        fs::copy(&image, &anchor_image).unwrap();
+        let anchor = Owned(Command::new(&anchor_image).spawn().unwrap());
+        let anchor_id = inspect_process_identity(anchor.0.id()).unwrap();
+        let mut first = Owned(Command::new(&image).spawn().unwrap());
+        let identity = inspect_process_identity(first.0.id()).unwrap();
+        assert!(fixture.registry.instances().is_empty(), "fixture must be launched outside Watch");
+        assert!(fixture.registry.external_disposition_target_current(&bound(&identity), &identity));
+        let mut wrong = bound(&identity); wrong.start_seconds += 1;
+        assert!(!fixture.registry.external_disposition_target_current(&wrong, &identity));
+        wrong = bound(&identity); wrong.uid += 1;
+        assert!(!fixture.registry.external_disposition_target_current(&wrong, &identity));
+        wrong = bound(&identity); wrong.audit_token.as_mut().unwrap()[7] += 1;
+        assert!(!fixture.registry.external_disposition_target_current(&wrong, &identity));
+        wrong = bound(&identity); wrong.audit_token = None;
+        assert!(!fixture.registry.external_disposition_target_current(&wrong, &identity));
+        let mut supervisor = ChannelSupervisor::new(fixture.storage.clone(), Some(fixture.enforcer.clone()), None).unwrap();
+        supervisor.set_process_disposition_registry(fixture.registry.clone());
+        let (events, receipts) = mpsc::channel();
+        let (dispatcher, worker) = ProcessDispositionDispatcher::start(fixture.storage.clone(), fixture.stop.clone(), events).unwrap();
+        fixture.workers.push(worker);
+        supervisor.install_process_disposition_dispatcher(dispatcher);
+        let now = native::now();
+        fixture::seed_probe_receipts(&fixture.storage, now, "US");
+        fixture.observation(&mut supervisor, 1, now);
+        fixture.environment(&mut supervisor, "*", "1.1.1.1", now);
+        let mut audit = fixture::fixture_audit_val(&fixture.storage, now, "1.1.1.1", "US");
+        audit["launch_target"] = json!(if family == "claude" { "claude-cli" } else { "codex-cli" });
+        audit["authorization_scope"] = json!("observation");
+        let egress = fixture::controlled_egress(&fixture.config, now, "1.1.1.1", "US",
+            Some(claude_watch_core::vpn::VpnEpoch::new("vpn-obs-boot-1", 1)));
+        SessionStore::for_family(fixture.storage.clone(), family).begin_channel_verified(
+            &ReceiptStore { storage: fixture.storage.clone() }, &audit, &egress, &[bound(&anchor_id), bound(&identity)], now,
+        ).unwrap();
+        let inventory = |supervisor: &mut ChannelSupervisor, identity: &claude_watch_system::ProcessKernelIdentity| {
+            let at = native::now();
+            supervisor.set_family_coverage_scope(family, Some(BackendCoverageScope {
+                backend: NetworkBackendKind::Seatbelt, unprotected_pids: vec![anchor_id.pid, identity.pid], ..Default::default()
+            }), at);
+            supervisor.handle_event(SupervisionEvent::ProcessInventoryUpdated {
+                family: family.into(), desktops: vec![], processes: vec![bound(&anchor_id), bound(identity)], observed_at: at,
+            }).unwrap();
+        };
+        inventory(&mut supervisor, &identity);
+        fixture.environment(&mut supervisor, family, "9.9.9.9", native::now());
+        if action == "warn" {
+            assert!(receipts.recv_timeout(Duration::from_millis(150)).is_err(), "warn must never send process signals");
+            assert_eq!(inspect_process_identity(identity.pid), Some(identity));
+            continue;
+        }
+        let accept = |supervisor: &mut ChannelSupervisor, identity: &claude_watch_system::ProcessKernelIdentity| {
+            let event = receipts.recv_timeout(Duration::from_secs(3)).unwrap_or_else(|error|
+                panic!("real worker must return the exit receipt: {error:?}; family={family}; state={:?}", supervisor.snapshot(native::now()).families[family]));
+            let SupervisionEvent::ProcessReceiptArrived { receipt, .. } = &event else { panic!("wrong event") };
+            assert_eq!(receipt.process_execution_state, "confirmed", "{receipt:?}");
+            assert_eq!(receipt.target_results[0].pid, identity.pid);
+            assert_eq!(receipt.action, action);
+            assert_eq!(receipt.target_results[0].requested_action, if action == "force" { "force_quit" } else { "quit" });
+            assert_eq!(receipt.target_results[0].process_state, "confirmed_exit_after_request");
+            assert!(receipt.authority.as_ref().unwrap().target_instances.is_empty());
+            let authority = receipt.authority.as_ref().unwrap();
+            let mut replaced = bound(identity); replaced.start_microseconds += 1;
+            assert!(!current_policy_and_session(&fixture.storage, authority, &replaced, native::now()),
+                "a replaced lifetime is not authorized by the old session");
+            let mut wrong = authority.clone(); wrong.executor_boot_id = "old-executor".into();
+            assert!(!fixture.registry.current_disposition_member(&wrong, &bound(identity), identity, native::now()));
+            wrong = authority.clone(); wrong.session_id = "other-session".into();
+            assert!(!current_policy_and_session(&fixture.storage, &wrong, &bound(identity), native::now()));
+            wait_until_exited(identity);
+            supervisor.handle_event(event).unwrap();
+            let state = &supervisor.snapshot(native::now()).families[family];
+            assert_eq!(state.process_execution_state.as_deref(), Some("confirmed"));
+            assert!(state.coverage_scope.protected_pids.is_empty(), "force does not invent gateway coverage");
+        };
+        accept(&mut supervisor, &identity);
+        assert_eq!(first.0.wait().unwrap().signal(), Some(if action == "force" { 9 } else { 15 }));
+        // Same risk, same session: an external process started later must not
+        // be skipped by the previous process episode's deduplication.
+        let mut later = Owned(Command::new(&image).spawn().unwrap());
+        let later_id = inspect_process_identity(later.0.id()).unwrap();
+        inventory(&mut supervisor, &later_id);
+        accept(&mut supervisor, &later_id);
+        assert_eq!(later.0.wait().unwrap().signal(), Some(if action == "force" { 9 } else { 15 }));
+        assert!(fixture.registry.instances().is_empty());
+        assert_eq!(inspect_process_identity(anchor_id.pid), Some(anchor_id.clone()), "unapproved images remain untouched");
+        if action == "close" {
+            let mut ignoring = Owned(Command::new(&image).arg("ignore-term").stdout(Stdio::piped()).spawn().unwrap());
+            ignoring.0.stdout.as_mut().unwrap().read_exact(&mut [0]).unwrap();
+            let ignoring_id = inspect_process_identity(ignoring.0.id()).unwrap();
+            inventory(&mut supervisor, &ignoring_id);
+            let event = receipts.recv_timeout(Duration::from_secs(3)).unwrap();
+            let SupervisionEvent::ProcessReceiptArrived { receipt, .. } = &event else { panic!("wrong event") };
+            assert_eq!(receipt.action, "close");
+            assert_eq!(receipt.target_results[0].process_state, "timeout");
+            assert!(!receipt.target_results[0].terminated);
+            assert!(ignoring.0.try_wait().unwrap().is_none(), "normal close must not escalate to SIGKILL");
+            supervisor.handle_event(event).unwrap();
+        }
+        let unapproved = Owned(Command::new(&image).spawn().unwrap());
+        let unapproved_id = inspect_process_identity(unapproved.0.id()).unwrap();
+        fixture.registry.replace_approved_targets(Default::default(), Default::default());
+        assert!(!fixture.registry.external_disposition_target_current(&bound(&unapproved_id), &unapproved_id));
+        inventory(&mut supervisor, &unapproved_id);
+        assert!(receipts.recv_timeout(Duration::from_millis(150)).is_err(), "revoked executable approval cannot fall back to PID-only authority");
+        assert_eq!(inspect_process_identity(unapproved_id.pid), Some(unapproved_id));
     }
 }

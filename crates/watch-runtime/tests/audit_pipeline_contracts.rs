@@ -51,18 +51,16 @@ impl AuditSystem for ScopedFake {
     fn online(&mut self, _: &Config, _: &Value) -> Result<Value> {
         panic!("scope must not run full online/ASN/STUN/service collection")
     }
-    fn refresh_dns(&mut self) -> Result<Option<Value>> {
+    fn refresh_leaks(&mut self, _: &Value, include_webrtc: bool) -> Result<(Option<Value>, Option<Value>)> {
+        assert!(!include_webrtc, "scope must not refresh WebRTC");
         self.dns_refreshes += 1;
         if self.fail_refresh {
             return Err(claude_watch_core::error::CoreError::new(
-                "dns_bridge_unavailable",
-                "图形DNS刷新未响应",
+                "daemon_unavailable",
+                "后台检测服务不可用",
             ));
         }
-        Ok(None)
-    }
-    fn refresh_webrtc(&mut self) -> Result<Option<Value>> {
-        panic!("scope must not refresh WebRTC")
+        Ok((None, None))
     }
 }
 #[test]
@@ -121,7 +119,7 @@ fn scoped_commands_share_policy_and_receipts_without_full_probes_or_audit_writes
         .unwrap();
     assert_eq!(
         failed_refresh["evidence"]["dns_refresh"]["error"]["code"],
-        "dns_bridge_unavailable"
+        "daemon_unavailable"
     );
     assert_eq!(
         failed_refresh["evidence"]["dns"]["receipt"]["finished_at"],
@@ -419,7 +417,7 @@ impl AuditSystem for GuardFlip {
         Ok(value)
     }
     fn online(&mut self, _: &Config, _: &Value) -> Result<Value> {
-        panic!("offline guard diagnostic test must not probe")
+        Fake { now: self.now() }.online(&Config::default(), &json!({}))
     }
 }
 
@@ -431,7 +429,9 @@ fn guard_round_records_both_decisions_without_changing_a_fluctuating_audit() {
     let storage = StateStore::new(Paths::new(&root).unwrap());
     let audit = AuditStore::new(storage);
     let options = AuditOptions {
-        online: false,
+        // A second observation is required after online work. An offline
+        // projection deliberately reuses its one immutable local sample.
+        online: true,
         persist: false,
         launch: false,
     };
@@ -480,7 +480,7 @@ fn guard_round_records_both_decisions_without_changing_a_fluctuating_audit() {
 }
 
 #[test]
-fn unreadable_diagnostic_heartbeat_never_changes_environment_audit() {
+fn retired_diagnostic_heartbeat_never_changes_environment_audit() {
     use claude_watch_core::processes::LaunchTarget;
     use std::os::unix::fs::symlink;
     let root =
@@ -519,7 +519,9 @@ fn unreadable_diagnostic_heartbeat_never_changes_environment_audit() {
             options,
         )
         .unwrap();
-    assert_eq!(trace.unwrap().before.guard_heartbeat_status, "unreadable");
+    // The retired guard-heartbeat file cannot influence the authoritative
+    // channel-supervision frame (absent here), even when the old path is bad.
+    assert_eq!(trace.unwrap().before.guard_heartbeat_status, "missing");
     original.as_object_mut().unwrap().remove("observation_id");
     observed.as_object_mut().unwrap().remove("observation_id");
     observed["display_facts"]
@@ -762,7 +764,7 @@ fn failed_samples_do_not_become_network_changes_but_positive_changes_still_block
                 &mut system,
                 &zones,
                 claude_watch_runtime::audit_store::AuditOptions {
-                    online: false,
+                    online: true,
                     persist: false,
                     launch: false,
                 },
@@ -880,5 +882,39 @@ fn cli_setting_change_is_local_to_cli_requirement_and_never_becomes_an_ip_mismat
         "ok"
     );
     assert_eq!(result["ready"], false);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[path = "support/evidence_fixture.rs"]
+mod evidence_fixture;
+
+#[test]
+fn phase1_same_receipt_is_displayable_but_cannot_pass_launch_audit_after_thirty_seconds() {
+    use claude_watch_runtime::background_evidence::{EvidenceSystem, ProbeKind};
+    let root=std::env::temp_dir().join(format!("audit-phase1-{}", uuid::Uuid::new_v4()));
+    fs::create_dir(&root).unwrap();
+    let storage=StateStore::new(Paths::new(&root).unwrap());
+    let config=Config { require_dns:true, ..Config::default() };
+    storage.atomic_json(&storage.paths.config(), &config.value().unwrap()).unwrap();
+    let mut facts=evidence_fixture::EvidenceFacts::new(root.join("control.json"));
+    let probe=facts.collect(ProbeKind::Dns).unwrap();
+    let sampled=probe["finishedAt"].as_f64().unwrap();
+    let local=Fake { now:sampled }.local(&config).unwrap();
+    let receipts=ReceiptStore {storage:storage.clone()};
+    receipts.record_dns(&probe,&local,Some("ctx"),sampled).unwrap();
+    let original=receipts.probe_receipts().0;
+    let store=AuditStore::new(storage.clone());
+    let zones=serde_json::from_value::<ZoneCatalog>(json!({"JP":["Asia/Tokyo"]})).unwrap();
+    for age in [31.,45.,299.] {
+        let mut system=Fake {now:sampled+age};
+        let options=AuditOptions {online:true,persist:false,launch:false};
+        let display=store.collect_options(&mut system,&zones,options).unwrap();
+        assert_eq!(display["ready"],true,"{display}");
+        let launch=store.collect_options(&mut system,&zones,AuditOptions {launch:true,..options}).unwrap();
+        assert_eq!(launch["ready"],false,"{launch}");
+        assert_eq!(launch["blocked"],json!(["dns"]),"only the launch DNS freshness gate differs");
+        assert_eq!(launch["display_facts"]["online"]["dns"]["receipt"]["finished_at"],original["finished_at"]);
+    }
+    assert_eq!(receipts.probe_receipts().0, original,"an audit cannot renew a sample timestamp");
     fs::remove_dir_all(root).unwrap();
 }

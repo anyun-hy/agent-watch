@@ -124,7 +124,7 @@ struct GraphModelTests {
         expect(inconsistentLocal.targetEdgeState == .pending, "rejected local proxy cannot certify target")
 
         let tun = ConnectionGraphProjection(proxy: proxy([flow(peer: "203.0.113.9:443", route: "Tun", interface: "utun4")]), processes: [process], selectedFlowID: "f1", fresh: true)
-        expect(tun.gatewayTitle == "TUN 通道", "tun replaces central gateway")
+        expect(tun.gatewayTitle == "TUN 网关", "tun replaces central gateway")
         expect(tun.gatewayEndpoint == "utun4", "tun exposes observed interface")
         expect(tun.gatewayEdgeState == .confirmed, "explicit tun route evidence")
         expect(tun.nodeEdgeState == .confirmed, "explicit tun node evidence")
@@ -134,15 +134,15 @@ struct GraphModelTests {
         let interfaceOnly = ConnectionGraphProjection(proxy: proxy([flow(route: nil, interface: "utun4")]), processes: [process], selectedFlowID: "f1", fresh: true)
         expect(interfaceOnly.gatewayEdgeState == .pending, "interface alone is not TUN proof")
         let tunLoopback = ConnectionGraphProjection(proxy: proxy([flow(route: "Tun", interface: "utun4")]), processes: [process], selectedFlowID: "f1", fresh: true)
-        expect(tunLoopback.gatewayTitle != "TUN 通道", "Tun with loopback peer is rejected")
+        expect(tunLoopback.gatewayTitle != "TUN 网关", "Tun with loopback peer is rejected")
         expect(tunLoopback.nodeEdgeState == .pending, "Tun loopback path cannot be green")
         expect(!tunLoopback.supportsPathAnimation, "loopback-labelled TUN cannot animate as a TUN platform path")
         let tunOtherLoopback = ConnectionGraphProjection(proxy: proxy([flow(peer: "127.0.0.2:443", route: "Tun", interface: "utun4")]), processes: [process], selectedFlowID: "f1", fresh: true)
-        expect(tunOtherLoopback.gatewayTitle != "TUN 通道", "127 slash 8 peer is rejected for TUN")
+        expect(tunOtherLoopback.gatewayTitle != "TUN 网关", "127 slash 8 peer is rejected for TUN")
         let tunLocalhost = ConnectionGraphProjection(proxy: proxy([flow(peer: "localhost:443", route: "Tun", interface: "utun4")]), processes: [process], selectedFlowID: "f1", fresh: true)
         expect(tunLocalhost.routePresentation == "unresolved", "localhost is rejected for TUN")
         let notTun = ConnectionGraphProjection(proxy: proxy([flow(peer: "203.0.113.9:443", route: "not_tun", interface: "utun4")]), processes: [process], selectedFlowID: "f1", fresh: true)
-        expect(notTun.gatewayTitle != "TUN 通道", "similar route name is not TUN")
+        expect(notTun.gatewayTitle != "TUN 网关", "similar route name is not TUN")
         expect(notTun.gatewayEdgeState == .pending, "similar route name cannot confirm path")
 
         let unconfirmed = ConnectionGraphProjection(proxy: proxy([flow(association: "unconfirmed", route: nil)]), processes: [process], selectedFlowID: "f1", fresh: true)
@@ -185,11 +185,29 @@ struct GraphModelTests {
         let unowned = channel()
         expect(!unowned.isConfirmedFlowBlocked, "an empty gateway cannot claim all 90 unmanaged processes are blocked")
         expect(unowned.protectionScopeLabel == "发现但未接管" && unowned.managedMemberCount == 0, "empty scope names discovery, not enforcement")
-        expect(unowned.scopeSummary.contains("未接管 90 个") && !unowned.scopeSummary.contains("1000"), "summary shows counts instead of a long PID list")
+        expect(unowned.scopeSummary.contains("未覆盖 90 个") && !unowned.scopeSummary.contains("1000"), "summary shows counts instead of a long PID list")
         expect(unowned.gatewayCountsLabel.contains("受控网关") && unowned.gatewayCountsLabel.contains("累计断开 40"), "gateway historical counters are scoped and explicitly cumulative")
         expect(channel(["unmanaged_member_pids":[]]).protectionScopeLabel == "受控网关待命", "an idle gateway is distinct from blocking a managed application")
         let member: [String: Any] = ["pid":77,"uid":501,"start_seconds":900,"start_microseconds":1,
                                     "role":"desktop_main","audit_token":[501,501,20,501,20,77,0,9]]
+        let supervised = channel(["active_members":[member], "unmanaged_member_pids":[77]])
+        expect(supervised.supervisedMemberCount == 1 && supervised.managedMemberCount == 0,
+               "verified external processes are supervised independently of gateway coverage")
+        expect(supervised.protectionScopeLabel == "已纳入监管 · 保护待核验" && !supervised.isConfirmedFlowBlocked,
+               "supervision does not falsely claim network enforcement")
+        let normalReceipt: [String: Any] = ["intent_id":"normal", "family":"openai", "session_id":"current",
+            "action":"close", "process_execution_state":"confirmed", "observed_at":1000,
+            "target_results":[["pid":77, "requested_action":"quit", "terminated":true,
+                "process_state":"confirmed_exit_after_request", "timestamp":1000, "signal_sent_at":999]],
+            "authority":["intent_id":"normal", "producer_boot_id":"producer",
+                "policy_version":["policy_digest":"p", "guard_policy_digest":"g"], "command_seq":1, "permit_generation":1]]
+        var normalFields: [String: Any] = ["producer_boot_id":"producer", "session_id":"current",
+            "process_disposition_action":"close", "process_execution_state":"confirmed", "process_disposition_receipt":normalReceipt]
+        expect(channel(normalFields).processDispositionLabel(now: 1001).hasPrefix("已核验目标退出"),
+               "normal-close receipts are displayed using the same authority checks as force")
+        normalFields["process_disposition_action"] = "force"
+        expect(channel(normalFields).processDispositionLabel(now: 1001) == "退出处置结果待验证",
+               "a normal-close receipt cannot confirm a force action")
         let coverage: [String: Any] = ["backend":"seatbelt","configured_entries":["openai"],"protected_pids":[77],
             "unprotected_pids":Array(1000..<1090),"uncovered_boundaries":["direct_launch_outside_controlled_entry"],
             "server_identity_verified":true,"gateway_endpoint_protection_verified":true,"gateway_endpoint_protection_method":"fixture"]
@@ -203,7 +221,7 @@ struct GraphModelTests {
         var cliCoverage = coverage; cliCoverage["configured_entries"] = ["codex-cli"]
         cliFields["coverage_scope"] = cliCoverage
         expect(channel(cliFields).isConfirmedFlowBlocked, "a controlled entry identifier is not required to equal the family name")
-        expect(mixed.protectionScopeLabel == "受控通道：已阻断" && mixed.scopeSummary.contains("未接管 90 个"), "partial coverage never becomes all-application protection")
+        expect(mixed.protectionScopeLabel == "受控通道：已阻断" && mixed.scopeSummary.contains("未覆盖 90 个"), "partial coverage never becomes all-application protection")
         var changed = managedFields; changed["session_id"] = NSNull()
         expect(!channel(changed).isConfirmedFlowBlocked, "member evidence without a session does not establish protection")
         changed = managedFields; changed["active_members"] = []

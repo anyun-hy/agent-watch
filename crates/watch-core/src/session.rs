@@ -273,7 +273,7 @@ fn risk(value: &Value, now: f64) -> Value {
 }
 fn risk_fresh(value: &Value, now: f64) -> bool {
     value
-        .get("observed_at")
+        .get("validated_at").or_else(|| value.get("observed_at"))
         .and_then(Value::as_f64)
         .is_some_and(|time| {
             time.is_finite() && time > 0.0 && (-5.0..=RISK_EVIDENCE_TTL).contains(&(now - time))

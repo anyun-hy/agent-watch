@@ -60,7 +60,7 @@ struct GraphContinuityTests {
             let idle = apply(snapshot(product, time: 1010, flows: [], collector: "empty"))
             expect(idle.phase == .noSample && idle.platformFlowCount == 0, "\(product) valid empty stays zero")
             expect(idle.isHistorical && !idle.canAnimate && idle.sampledAt == 1000, "\(product) idle retains original time only")
-            expect(idle.projection.gatewayTitle == "TUN 通道" && idle.projection.groupTitle == "GLOBAL" && idle.projection.nodeTitle == "JP", "\(product) idle never switches to configuration reference")
+            expect(idle.projection.gatewayTitle == "TUN 网关" && idle.projection.groupTitle == "GLOBAL" && idle.projection.nodeTitle == "JP", "\(product) idle never switches to configuration reference")
             expect(idle.projection.nodeState == .pending, "\(product) history does not stay green")
             let failure = apply(snapshot(product, time: 1020, flows: []), error: "read failed")
             expect(failure.phase == .failed && !failure.countsAvailable && failure.platformFlowCount == nil, "\(product) failure is not zero")
@@ -107,7 +107,7 @@ struct GraphContinuityTests {
             }
             _ = apply(snapshot(product, time: 1150, flows: [flow(product, id: "latest")], node: "JP2"), ip: "222.10.87.170")
             let locked = apply(snapshot(product, time: 1151, flows: [flow(product, id: "still-visible")], node: "JP2"), ip: "222.10.87.170", blocked: true)
-            expect(product == .claude ? !locked.canAnimate && locked.sample == nil : locked.canAnimate, "only Claude graph reflects its own session stop")
+            expect(!locked.canAnimate && locked.sample == nil, "\(product) confirmed blocking stops its own path animation")
         }
         var referenceTimeline = GraphContinuityStore(), referenceSelection = NetworkGraphSelection()
         var dnsFlow = flow(.openAI, id: "reference-flow")

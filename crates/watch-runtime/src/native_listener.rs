@@ -560,6 +560,15 @@ impl ListenerStream {
     pub fn is_finished(&self) -> bool {
         self.finished.load(Ordering::Acquire)
     }
+    /// Scheduling hint only. Callers must still read and authenticate the frame;
+    /// a notification neither renews its capture time nor proves its owner.
+    pub fn wait_for_revision(&self, previous: u64, timeout: Duration) -> Result<u64> {
+        let state = self.state.0.lock().map_err(|_| invalid())?;
+        let (_state, _) = self.state.1.wait_timeout_while(state, timeout, |_| {
+            self.revision.load(Ordering::Acquire) == previous
+        }).map_err(|_| invalid())?;
+        Ok(self.revision.load(Ordering::Acquire))
+    }
     fn latest_with_timeout(&self, timeout: Duration) -> Result<Evidence> {
         self.publication_snapshot(timeout)?.1
     }
@@ -929,6 +938,7 @@ mod tests {
             let mut state = self.stream.state.0.lock().unwrap();
             *state = Some(observed);
             self.stream.revision.fetch_add(1,Ordering::Release);
+            self.stream.state.1.notify_all();
         }
         fn frame(&self, sequence: u64) -> f64 {
             let mut raw = raw();
@@ -941,6 +951,29 @@ mod tests {
     }
     impl Drop for PublisherFixture {
         fn drop(&mut self) { let _ = fs::remove_dir_all(&self.home); }
+    }
+    #[test]
+    fn vpn_frame_handoff_wakes_for_new_evidence_without_renewing_or_trusting_old_frames() {
+        let fixture = PublisherFixture::new();
+        let first = fixture.stream.wait_for_revision(0, Duration::ZERO).unwrap();
+        assert_eq!(first, 1);
+        assert_eq!(fixture.stream.wait_for_revision(first, Duration::from_millis(20)).unwrap(), first);
+        let stream = fixture.stream.clone();
+        let began = std::time::Instant::now();
+        let waiter = thread::spawn(move || stream.wait_for_revision(first, Duration::from_secs(2)).unwrap());
+        thread::sleep(Duration::from_millis(20));
+        let captured_at = fixture.frame(2);
+        assert_eq!(waiter.join().unwrap(), 2, "a pending or arriving frame must not be lost");
+        assert!(began.elapsed() < Duration::from_secs(1), "new frame must interrupt the wait");
+        let output = fixture.stream.read(fixture.source.as_ref()).unwrap();
+        let metadata: Value = serde_json::from_str(output.text().unwrap().lines().next().unwrap()
+            .strip_prefix(FRAME_META_PREFIX).unwrap()).unwrap();
+        assert_eq!(metadata["captured_at"], captured_at);
+        assert_eq!(metadata["sequence"], 2);
+        // A changed revision only wakes the consumer; it cannot pass bad evidence.
+        fixture.set(Err(error("native_listener_origin_changed", "fixture identity changed")));
+        assert_eq!(fixture.stream.wait_for_revision(2, Duration::ZERO).unwrap(), 3);
+        assert_eq!(fixture.stream.read(fixture.source.as_ref()).err().unwrap().code, "native_listener_origin_changed");
     }
     #[test]
     fn independent_publisher_updates_during_blocked_collection_without_refreshing_the_same_frame() {

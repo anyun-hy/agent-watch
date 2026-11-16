@@ -150,7 +150,7 @@ fn online_target(
         service_calls: AtomicUsize::new(0),
         chatgpt_calls: AtomicUsize::new(0),
     });
-    let mut macos = Macos {
+    let mut macos = Macos { request_evidence: true,
         runner: R,
         network: NetworkClient::new(transport.clone(), None).unwrap(),
         storage: StateStore::new(Paths::new(&root).unwrap()),

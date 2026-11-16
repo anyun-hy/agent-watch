@@ -107,7 +107,31 @@ fn receipt_generation_matches_mature_dns_and_webrtc_behavior() {
         } else {
             receipts::record_webrtc
         };
-        for (case, expected) in cases.iter().zip(oracle(&format!("{kind}_record"), &cases)) {
+        for (case, mut expected) in cases.iter().zip(oracle(&format!("{kind}_record"), &cases)) {
+            // Keep the retired implementation's answers unchanged. Extend
+            // their expected envelope from the historical facts and fixture
+            // inputs, never from the current implementation's output.
+            if let Some(receipt) = expected.get_mut("value") {
+                if kind == "dns" {
+                    let mut observations = Vec::new();
+                    for (bucket, observation_kind) in [("http", "http"), ("dns", "resolver")] {
+                        let countries = receipt[bucket]["countries"].as_array().unwrap();
+                        let addresses = receipt[bucket]["egress_ips"].as_array().unwrap();
+                        // Each historical case has at most one country per
+                        // bucket; do not guess an address/country pairing.
+                        assert!(countries.len() <= 1 && (addresses.is_empty() || countries.len() == 1));
+                        for address in addresses {
+                            observations.push(json!({"address":address,"kind":observation_kind,
+                                "country":countries[0],"source":"fixture"}));
+                        }
+                    }
+                    receipt["observations"] = json!(observations);
+                } else {
+                    receipt["started_at"] = case["probe"]["startedAt"].clone();
+                    receipt["display_expires_at"] = json!(case["probe"]["finishedAt"].as_f64().unwrap() + 300.0);
+                    receipt["diagnostic"] = Value::Null; // No user-supplied expected IP in these cases.
+                }
+            }
             let actual = match method(
                 &case["probe"],
                 &case["local"],
@@ -212,6 +236,23 @@ fn real_ipleak_collector_payload_reaches_the_backend_gate() {
 }
 #[test]
 fn stored_receipt_status_matches_legacy_ttl_and_history_contract() {
+    // The historical oracle predates these additive receipt fields. Project
+    // only its lookup input; exercise both persisted legacy and full current
+    // receipts below, including exact passthrough of the current receipt.
+    fn legacy_envelope(kind: &str, value: &Value) -> Value {
+        let mut legacy = value.clone();
+        let added: &[&str] = if kind == "dns" {
+            &["observations"]
+        } else {
+            &["started_at", "display_expires_at", "diagnostic"]
+        };
+        for field in ["receipt", "last_valid", "display_receipt"] {
+            if let Some(receipt) = legacy.get_mut(field).and_then(Value::as_object_mut) {
+                for key in added { receipt.remove(*key); }
+            }
+        }
+        legacy
+    }
     let good = receipts::record_dns(&probe("dns", NOW), &local(), None, NOW + 1.0).unwrap();
     let mut partial = probe("dns", NOW + 3.0);
     partial["status"] = json!("timeout");
@@ -233,34 +274,27 @@ fn stored_receipt_status_matches_legacy_ttl_and_history_contract() {
     cases.push(
         json!({"receipt":latest,"last_valid":good,"context":"ctx","now":NOW+310.0,"launch":true}),
     );
-    for (case, expected) in cases.iter().zip(oracle("dns_status", &cases)) {
-        assert_eq!(
-            receipts::dns_status(
-                &case["receipt"],
-                &case["last_valid"],
-                case["context"].as_str().unwrap(),
-                case["launch"].as_bool().unwrap_or(false),
-                case["now"].as_f64().unwrap(),
-                |v| format!("T{v:.0}")
-            ),
-            expected,
-            "{case}"
-        );
+    let legacy_cases: Vec<_> = cases.iter().map(|c| legacy_envelope("dns", c)).collect();
+    let evaluate = |case: &Value| receipts::dns_status(
+        &case["receipt"], &case["last_valid"], case["context"].as_str().unwrap(),
+        case["launch"].as_bool().unwrap_or(false), case["now"].as_f64().unwrap(),
+        |v| format!("T{v:.0}"),
+    );
+    let mut statuses = Vec::new();
+    for ((case, legacy), mut expected) in cases.iter().zip(&legacy_cases).zip(oracle("dns_status", &legacy_cases)) {
+        assert_eq!(evaluate(legacy), expected, "legacy={legacy}");
+        // The historical decision selects the display source. New metadata
+        // must survive intact, without changing that decision or its TTL.
+        expected["receipt"] = case["receipt"].clone();
+        expected["display_receipt"] = if expected["display_cached"] == true {
+            case["last_valid"].clone()
+        } else { case["receipt"].clone() };
+        let actual = evaluate(case);
+        assert_eq!(actual, expected, "current={case}");
+        statuses.push(actual);
     }
-    let statuses: Vec<_> = cases
-        .iter()
-        .map(|c| {
-            receipts::dns_status(
-                &c["receipt"],
-                &c["last_valid"],
-                c["context"].as_str().unwrap(),
-                c["launch"].as_bool().unwrap_or(false),
-                c["now"].as_f64().unwrap(),
-                |v| format!("T{v:.0}"),
-            )
-        })
-        .collect();
-    for (status, expected) in statuses.iter().zip(oracle("dns_row", &statuses)) {
+    let legacy_statuses: Vec<_> = statuses.iter().map(|s| legacy_envelope("dns", s)).collect();
+    for (status, expected) in statuses.iter().zip(oracle("dns_row", &legacy_statuses)) {
         assert_eq!(receipts::dns_row(status), expected);
     }
     let rtc = receipts::record_webrtc(&probe("webrtc", NOW), &local(), None, NOW + 1.0).unwrap();
@@ -270,15 +304,14 @@ fn stored_receipt_status_matches_legacy_ttl_and_history_contract() {
         json!({"receipt":rtc,"context":"other","now":NOW+2.0}),
         json!({"receipt":{},"context":"ctx","now":NOW+2.0}),
     ];
-    for (case, expected) in cases.iter().zip(oracle("webrtc_status", &cases)) {
-        assert_eq!(
-            receipts::webrtc_status(
-                &case["receipt"],
-                case["context"].as_str().unwrap(),
-                case["now"].as_f64().unwrap()
-            ),
-            expected
-        );
+    let legacy_cases: Vec<_> = cases.iter().map(|c| legacy_envelope("webrtc", c)).collect();
+    let evaluate = |case: &Value| receipts::webrtc_status(
+        &case["receipt"], case["context"].as_str().unwrap(), case["now"].as_f64().unwrap(),
+    );
+    for ((case, legacy), mut expected) in cases.iter().zip(&legacy_cases).zip(oracle("webrtc_status", &legacy_cases)) {
+        assert_eq!(evaluate(legacy), expected, "legacy={legacy}");
+        if expected.get("receipt").is_some() { expected["receipt"] = case["receipt"].clone(); }
+        assert_eq!(evaluate(case), expected, "current={case}");
     }
 }
 #[test]

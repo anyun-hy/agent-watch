@@ -109,6 +109,8 @@ pub trait Mutator: Send {
     fn restore(&mut self, action: &Value) -> Result<bool>;
 }
 pub struct Macos<R: ReadRunner, T: Transport, M: Mutator> {
+    /// False only for audits running inside the resident evidence worker.
+    pub request_evidence: bool,
     pub runner: R,
     pub network: NetworkClient<T>,
     pub storage: StateStore,
@@ -359,9 +361,7 @@ impl<R: ReadRunner, T: Transport, M: Mutator> Macos<R, T, M> {
             Some((fields[0].parse::<u32>().ok()?, fields[1], fields[2].parse::<f64>().ok()?, fields[3]))
         });
         let now = native::now();
-        let pulse = self.storage.read_json(
-            &self.storage.paths.watch().join("state/guard-service-heartbeat.json"), Value::Null,
-        ).unwrap_or_else(|_| json!({"invalid":true}));
+        let pulse = crate::services::read_guard_heartbeat(&self.storage).unwrap_or_else(|_| json!({"invalid":true}));
         let service_identity = pulse["pid"].as_u64().and_then(|pid| u32::try_from(pid).ok())
             .zip(pulse["start_stamp"].as_str().filter(|stamp| !stamp.is_empty()))
             .filter(|(pid, stamp)| guard_service_pulse(&pulse, *pid, stamp, false, now));
@@ -653,11 +653,15 @@ impl<R: ReadRunner, T: Transport, M: Mutator> Macos<R, T, M> {
         if selected == "tag" {
             identity["selection"] = json!({"mode":tag["api"]["mode"],"selected_node":tag["api"]["selected_node"],"global_node":tag["api"]["global_node"]});
             identity["group"] = tag["expected_group"].clone();
+            identity["network_config"] = tag["api"]["network_config"].clone();
+            identity["runtime_config_revision"] = tag["runtime_config_revision"].clone();
+            if identity["network_config"].is_null() { unavailable.push("network_config_sampling"); }
         }
         let context = crate::config_store::policy_digest(&identity)?;
         let backend = self.backend_facts_using(Some(&table));
         let guard = self.guard_heartbeat(c, backend.guard_healthy);
         let mut out = json!({"proxy":proxy,"proxy_detail":detail,"tun":tun,"mode":selected,"candidates":candidates.keys().collect::<Vec<_>>(),"context":context,"context_id":context,"timezone":env.get("timezone"),"locale":env.get("locale"),"language":env.get("language"),"app_language":env.get("app_language"),"date_format":env.get("date_format"),"ipv6":env.get("ipv6"),"ipv6_method":env.get("ipv6_method"),"network":env.get("network"),"network_identity":identity,"service":env.pointer("/network/service"),"interface":interface,"processes":processes,"tag":tag,"observation_unavailable":unavailable,"backend_healthy":backend.sampling_healthy,"backend_native":backend.sampling_native,"backend_detail":backend.sampling_detail,"guard_backend_healthy":backend.guard_healthy,"guard_backend_native":backend.guard_native,"guard_backend_detail":backend.guard_detail,"guard":guard,"guard_state":if guard{"ok"}else if !c.guard_enabled{"disabled"}else{"unknown"},"guard_detail":if guard{"保护心跳已确认"}else if !c.guard_enabled{"保护策略已禁用"}else{"保护心跳或后台身份未能确认"}});
+        out["evidence_network_bound"] = json!(selected == "tag" && !tag["api"]["network_config"].is_null());
         out["verified_proxy_url"] = if selected == "tag"
             && proxy == "ok"
             && tag["entry"]["state"] == "verified"
@@ -1127,25 +1131,22 @@ impl<R: ReadRunner, T: Transport, M: Mutator> AuditSystem for Macos<R, T, M> {
         );
         self.online_facts(c, l, !openai, openai)
     }
-    fn refresh_dns(&mut self) -> Result<Option<Value>> {
-        let token = std::env::var("CLAUDE_WATCH_DNS_REFRESH_TOKEN").ok();
-        if token.is_none() {
-            return Ok(None);
-        }
-        let env = self.environment()?;
-        let uid = env["uid"]
-            .as_u64()
-            .and_then(|v| u32::try_from(v).ok())
-            .ok_or_else(|| CoreError::new("invalid_native_observation", "当前用户身份未确认"))?;
-        crate::leak_refresh::refresh_for_launch(
-            &self.storage,
-            uid,
-            token.as_deref(),
-            Duration::from_secs(85),
-        )?;
-        // The GUI records the result through the receipt command. Revalidate the
-        // persisted receipt in AuditStore; an acknowledgement cannot grant launch.
-        Ok(None)
+    fn refresh_leaks(&mut self, local: &Value, include_webrtc: bool) -> Result<(Option<Value>, Option<Value>)> {
+        use claude_watch_core::evidence::{EvidenceAction, EvidencePurpose, EvidenceRequest, ProbeKind};
+        // The evidence thread already collected these receipts before its
+        // revalidation audit. It must never wait on its own IPC listener.
+        if !self.request_evidence { return Ok((None, None)); }
+        let context = local.get("context_id").or_else(|| local.get("context"))
+            .and_then(Value::as_str).filter(|s| !s.is_empty())
+            .ok_or_else(|| CoreError::new("evidence_context_unconfirmed", "启动检测缺少当前网络上下文"))?;
+        let request = EvidenceRequest { schema: 1, id: uuid::Uuid::new_v4().to_string(),
+            action: EvidenceAction::Refresh,
+            purpose: if include_webrtc { EvidencePurpose::Launch } else { EvidencePurpose::Display },
+            kinds: if include_webrtc { vec![ProbeKind::Dns, ProbeKind::WebRtc] } else { vec![ProbeKind::Dns] },
+            expected_context: Some(context.into()), expected_ip: None, force: false };
+        crate::evidence_client::request_daemon_evidence(&self.storage.paths, &request,
+            Duration::from_secs(claude_watch_core::evidence::REQUEST_TIMEOUT_SECONDS))?;
+        Ok((None, None))
     }
     fn refresh_stun(&mut self, context: &str) -> Result<Option<Value>> {
         // A launch gate must judge a fresh round, so probe now and persist the

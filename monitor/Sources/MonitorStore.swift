@@ -49,17 +49,11 @@ final class MonitorStore: ObservableObject {
         self.leakChecks.contextProvider = bindingContext
         self.leakChecks.automaticContextProvider = currentContext
         self.switcher.diagnosticContextProvider = bindingContext
-        self.leakChecks.onDNSComplete = { [weak self] result, runID in
-            guard let self else { return false }
-            return await self.switcher.recordDNSLeak(result, runID: runID)
+        self.leakChecks.onEvidenceReceived = { [weak self] kind, reply, item in
+            self?.switcher.acceptEvidence(kind, reply: reply, item: item)
         }
-        self.leakChecks.onWebRTCComplete = { [weak self] result, runID in
-            guard let self else { return false }
-            return await self.switcher.recordWebRTCRisk(result, runID: runID)
-        }
-        self.switcher.awaitFreshDNSReceipt = { [weak self] maximumAge in
-            guard let self else { return false }
-            return await self.leakChecks.ensureFreshDNSReceipt(maximumAge: maximumAge)
+        self.leakChecks.onEvidenceFailed = { [weak self] kind, detail in
+            self?.switcher.acceptEvidenceFailure(kind, detail: detail)
         }
         self.switcher.onDNSReceiptRecorded = { [weak self] in
             self?.requestEnvironmentRefreshAfterDNS()
@@ -73,12 +67,6 @@ final class MonitorStore: ObservableObject {
             self.channelSubscription.markReconnected()
             self.refresh(full: true, manual: true)
         }
-        self.switcher.onReceiptDiagnostic = { kind, event, runID, code in
-            guard case .rustCandidate? = BundledBackendVariant.current(), let runID else { return }
-            if event != "receipt_accepted" { LeakDiagnosticTrace.shared.record(kind: kind.rawValue, event: event, run: runID) }
-            let input = ReceiptDiagnosticInput(kind: kind.rawValue, outcome: event == "receipt_accepted" ? "accepted" : "rejected", code: code ?? "none", run_id: runID.uuidString)
-            if let data = try? JSONEncoder().encode(input) { DiagnosticLogRunner.submit(data, command: "receipt-diagnostic") }
-        }
         self.aiChecks.contextProvider = bindingContext
         self.aiChecks.onResult = { [weak self] result in
             let ip = result.exitIP
@@ -86,6 +74,7 @@ final class MonitorStore: ObservableObject {
             self?.netCoffee.fetchAI(ip)
         }
         self.switcher.onCurrentEnvironment = { [weak self] result in
+            self?.leakChecks.acceptEnvironment(result)
             self?.refreshEnvironmentQuality(result)
         }
         // Fixture snapshots have an explicit producer. Live daemon events
@@ -197,7 +186,7 @@ final class MonitorStore: ObservableObject {
     /// touches the Rust backend, so it can run on the 2s tick while the full
     /// snapshot (which also resolves CLI/daemon/connections) stays at ~20s.
     /// The bundle-id → product mapping mirrors `WorkspaceAppObserver` and the
-    /// desktop attribution in `AIProcessInventory.read()`.
+    /// Rust's desktop classification used for the exit plan.
     private func refreshDesktopState() {
         let claudeBundles = Set(["com.anthropic.claudefordesktop"])
         let openAIBundles = Set(["com.openai.codex", "com.openai.chat"])
@@ -265,7 +254,6 @@ final class MonitorStore: ObservableObject {
         leakChecks.now = now; aiChecks.now = now
         if automatic && transition == .changed { switcher.invalidateCurrentEnvironmentRequest() }
         if automatic && !initializing {
-            leakChecks.refreshWebRTCIfNeeded()
             refreshEnvironmentIfNeeded()
         }
     }
@@ -328,7 +316,6 @@ final class MonitorStore: ObservableObject {
         }
         Task { @MainActor [weak self] in
             guard let self else { return }
-            let dnsRecorded = await self.leakChecks.ensureFreshDNSReceipt()
             guard self.currentDiagnosticContext() == usableContext else {
                 self.environmentRefreshScheduler.complete(context: usableContext, accepted: false, now: Date())
                 return
@@ -341,7 +328,7 @@ final class MonitorStore: ObservableObject {
                 self.environmentRefreshScheduler.complete(context: usableContext, accepted: false, now: Date())
                 return
             }
-            self.environmentRefreshScheduler.complete(context: usableContext, accepted: dnsRecorded && accepted, now: Date())
+            self.environmentRefreshScheduler.complete(context: usableContext, accepted: accepted, now: Date())
         }
     }
     private func context(from value: ProxySnapshot?) -> String? {
@@ -364,7 +351,7 @@ final class MonitorStore: ObservableObject {
     private func currentDiagnosticContext() -> String? {
         context(from: freshProxy(in: snapshot, at: now))
     }
-    var initializationContext: String? { retainedDiagnosticContext() }
+    var initializationContext: String? { currentDiagnosticContext() }
     func beginInitialization(startSnapshotPolling: Bool = true) {
         initializing = true
         if startSnapshotPolling { start() }
@@ -373,7 +360,6 @@ final class MonitorStore: ObservableObject {
         // Preserve the exact receipts just checked; normal polling adopts them
         // instead of clearing or immediately recollecting all page data.
         environmentRefreshScheduler.complete(context: currentDiagnosticContext(), accepted: true, now: Date())
-        leakChecks.adoptInitializationReceipts()
         initializing = false
         referenceQueriesEnabled = true
     }

@@ -315,7 +315,7 @@ class RustSwiftReceiptContractTests(unittest.TestCase):
     maxDiff = None
 
     def test_offline_engine_receipts_decode_with_real_swift_models(self):
-        self.assertTrue(ENGINE.is_file(), f"missing built engine: {ENGINE}; run cargo build first")
+        self.assertTrue(ENGINE.is_file(), f"missing built engine: {ENGINE}; run cargo build -p claude-watch-engine first")
         self.assertTrue(RUST_ONLINE_LOOKUP.is_file(), f"missing Rust online lookup fixture: {RUST_ONLINE_LOOKUP}")
         swift_flags = ["-parse-as-library"]
         if platform.system() == "Darwin":

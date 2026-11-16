@@ -1,5 +1,5 @@
 #!/bin/bash
-# One entry for the reviewed local fixture suite; never installs a service.
+# Default pure contracts; --level 2 selects native fixtures. Never installs a service.
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd -P)
 command -v python3 >/dev/null || { echo 'python3 is required to collect test results.' >&2; exit 2; }

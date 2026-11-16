@@ -281,7 +281,12 @@ final class FirstRunInitialization: ObservableObject {
                 if nextAutomaticRefresh.map({ retry < $0 }) ?? true { nextAutomaticRefresh = retry }
             }
             var dependent: Set<InitializationStep> = [.protection, .verification]
-            if invalidSteps.contains(.connection) { dependent.formUnion([.environment, .dns, .webrtc]) }
+            if invalidSteps.contains(.connection) {
+                dependent.insert(.environment)
+                if failures[.connection].map({ if case .failed(let code, _) = $0 { return code == "context_changed" }; return false }) == true {
+                    dependent.formUnion([.dns, .webrtc])
+                }
+            }
             for index in rows.indices where dependent.contains(rows[index].step) &&
                     (rows[index].status == .passed || rows[index].status == .authorization) {
                 rows[index].status = .pending; rows[index].code = "dependency_invalidated"
@@ -384,6 +389,7 @@ final class FirstRunInitialization: ObservableObject {
         validUntil = nil
         for step in [InitializationStep.dns, .webrtc, .verification] {
             guard let index = rows.firstIndex(where: { $0.step == step }) else { continue }
+            if step != .verification && rows[index].status == .passed { continue }
             rows[index].status = .running; rows[index].code = "automatic_refresh"
             rows[index].detail = "正在自动刷新并核对本轮结果…"
             log("step_started", index: index, code: "automatic_refresh")
@@ -430,6 +436,7 @@ final class FirstRunInitialization: ObservableObject {
                 }
                 for item in [InitializationStep.dns, .webrtc, .protection, .verification] {
                     let index = self.rows.firstIndex { $0.step == item }!
+                    if (item == .dns || item == .webrtc) && self.rows[index].status == .passed && code != "context_changed" { continue }
                     self.rows[index].status = .pending; self.rows[index].code = "dependency_invalidated"
                     self.rows[index].detail = "自动刷新未完成，等待重新核对。"
                 }

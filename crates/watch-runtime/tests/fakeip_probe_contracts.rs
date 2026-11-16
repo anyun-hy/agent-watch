@@ -269,6 +269,72 @@ fn queries_are_capped_at_eight_and_have_one_hard_budget() {
     assert_eq!(result.attempts[0]["accepted"], false);
     assert_eq!(result.attempts[0]["state"], "deadline_exceeded");
 }
+
+#[test]
+fn disk_redir_host_requires_live_same_core_mapping_and_unchanged_identities() {
+    let mut good = sample();
+    good["source"] = json!(good["source"].as_str().unwrap().replace("enhanced-mode: fake-ip", "enhanced-mode: redir-host"));
+    let (result, source) = collect(&good);
+    assert_eq!(source.queries, 1);
+    assert_eq!(result.proofs.as_object().unwrap().len(), 1);
+    let flow = Flow::from_value(good["flows"][0]["flow"].clone()).unwrap();
+    let correlated = tag_flow::correlate(tag_flow::CorrelationInput {
+        flow: &flow, stamp: good["flows"][0]["stamp"].as_str().unwrap(),
+        process_start: good["process_start"].as_f64(), api: &good["api"],
+        records: good["records"].as_array().unwrap(), group: "AI", expected_node: "JP11",
+        now: NOW, fakeip_evidence: &result.proofs, interface: Some("utun4"),
+    });
+    assert_eq!(correlated["association"], "correlated");
+    assert_eq!(correlated["host"], "claude.ai");
+
+    let mut cases = Vec::new();
+    for (key, value) in [
+        ("answer", json!(["8.8.8.8", 1])),
+        ("answer", json!(["198.18.1.11", 1])),
+        ("query_error", json!(true)),
+        ("after_query_elapsed", json!(3.0)),
+        ("current_records", json!([])),
+        ("current_source", json!(good["source"].as_str().unwrap().replace("redir-host", "fake-ip"))),
+    ] { let mut c = good.clone(); c[key] = value; cases.push(c); }
+    let mut bad = good.clone();
+    bad["records"][0]["metadata"]["dnsMode"] = json!("redir-host");
+    cases.push(bad);
+    for pid in ["100", "77"] {
+        let mut c = good.clone(); c["current_processes"] = good["processes"].clone();
+        c["current_processes"][pid]["stamp"] = json!("changed"); cases.push(c);
+    }
+    let mut duplicate = good.clone(); duplicate["records"] = json!([good["records"][0], good["records"][0]]);
+    cases.push(duplicate);
+    for (index, c) in cases.iter().enumerate() {
+        assert!(collect(c).0.proofs.as_object().unwrap().is_empty(), "unverified case {index} must stay rejected");
+    }
+}
+
+#[test]
+#[ignore = "read-only current TAG, running processes and DNS; no configuration or state writes"]
+fn current_tag_connections_correlate_through_production_sampler_readonly() {
+    use claude_watch_runtime::{commands::SystemRunner, config_store::ConfigStore,
+        sampler::Sampler, storage::{Paths, StateStore}};
+    let paths = Paths::new(std::env::var_os("HOME").expect("current user home")).unwrap();
+    paths.require_owner(claude_watch_system::effective_uid()).unwrap();
+    let storage = StateStore::new(paths.clone());
+    let config = ConfigStore { storage: storage.clone() }.load().unwrap();
+    let runner = SystemRunner::development().unwrap().with_listener_cache(storage);
+    let mut sampler = Sampler::new(runner, paths);
+    let processes = sampler.processes_with_system_metadata().unwrap();
+    let sockets = sampler.sockets(&processes).unwrap();
+    let report = sampler.tag_report(&processes, &sockets, &config.proxy_group, "");
+    let flows = report["flows"].as_array().unwrap();
+    let platform = flows.iter().filter(|flow| flow["association"] == "correlated"
+        && flow["host"].as_str().is_some_and(|host| ["openai.com", "chatgpt.com", "oaiusercontent.com"]
+            .iter().any(|domain| host == *domain || host.ends_with(&format!(".{domain}"))))).count();
+    eprintln!("targets={} flows={} correlated={} openai_platform={} mapping_detail={} dns_attempt_states={}",
+        processes.targets.len(), flows.len(), report["connection_observation"]["correlated_count"],
+        platform, report["fakeip_probe"]["detail"],
+        json!(report["fakeip_probe"]["attempts"].as_array().into_iter().flatten()
+            .map(|attempt| attempt["state"].clone()).collect::<Vec<_>>()));
+    assert!(platform > 0, "current platform flows must be confirmed by the production sampler");
+}
 #[test]
 fn pid_reuse_with_same_second_stamp_is_rejected_when_native_identity_is_available() {
     for pid in ["100", "77"] {

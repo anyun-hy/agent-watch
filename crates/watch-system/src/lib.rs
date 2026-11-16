@@ -11,7 +11,8 @@ use std::{
     path::Path,
 };
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProcessKernelIdentity {
     pub pid: u32,
     pub ppid: u32,
@@ -88,6 +89,15 @@ pub fn kill_process(pid: u32) -> std::io::Result<()> {
 pub enum BoundSignalResult { Sent, AlreadyExited, IdentityChanged, Failed }
 
 pub fn signal_bound_process(expected: &ProcessKernelIdentity) -> BoundSignalResult {
+    send_bound_signal(expected, libc::SIGKILL)
+}
+
+/// Normal CLI exit never escalates to SIGKILL.
+pub fn terminate_bound_process(expected: &ProcessKernelIdentity) -> BoundSignalResult {
+    send_bound_signal(expected, libc::SIGTERM)
+}
+
+fn send_bound_signal(expected: &ProcessKernelIdentity, signal: i32) -> BoundSignalResult {
     if expected.pid <= 1 || expected.pid > i32::MAX as u32 || expected.pid == std::process::id()
         || expected.uid != effective_uid()
     {
@@ -99,7 +109,7 @@ pub fn signal_bound_process(expected: &ProcessKernelIdentity) -> BoundSignalResu
         && actual.start_microseconds == expected.start_microseconds
         && actual.audit_token == expected.audit_token && actual.executable_path == expected.executable_path);
     if !same { return BoundSignalResult::IdentityChanged; }
-    if unsafe { libc::kill(expected.pid as i32, libc::SIGKILL) } == 0 {
+    if unsafe { libc::kill(expected.pid as i32, signal) } == 0 {
         BoundSignalResult::Sent
     } else if std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
         BoundSignalResult::AlreadyExited

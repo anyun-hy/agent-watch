@@ -1,25 +1,10 @@
 //! Read-only classification projection for native process control.
-use claude_watch_core::{policy::PolicyCatalog, processes::{MatchReason, ProcessIdentityRef, ProcessRole}};
+use claude_watch_core::{policy::PolicyCatalog, processes::{MatchReason, ProcessRole}};
 use claude_watch_runtime::sampler::ProcessRound;
 use serde_json::{json, Value};
 
 pub fn value(round: &ProcessRound) -> Value {
-    let targets: Vec<_> = round.targets.iter().filter_map(|target| {
-        // Swift's close planner expands descendants itself and protects its
-        // ancestors. Lease-associated launchers/children must not become roots.
-        if !matches!(target.kind.role(), ProcessRole::DesktopMain | ProcessRole::DesktopHelper | ProcessRole::Cli) {
-            return None;
-        }
-        let evidence = round.match_evidence.get(&target.identity.pid)?;
-        if !evidence.identity.same_process(&target.identity)
-            || evidence.parent.is_some()
-            || evidence.root.as_ref() != Some(&ProcessIdentityRef::from(&target.identity))
-            || !matches!(evidence.reason, MatchReason::SupportedCliAlias | MatchReason::KnownCliLayout
-                | MatchReason::VerifiedBundle | MatchReason::VerifiedBundleComponent
-                | MatchReason::ScriptEntry | MatchReason::ManagedAppServer)
-        {
-            return None;
-        }
+    let targets: Vec<_> = claude_watch_runtime::process_exit::classified_roots(round).filter_map(|target| {
         let family = PolicyCatalog::family_for(target.kind.provider())?;
         Some(json!({
             "identity": target.identity,
@@ -39,7 +24,7 @@ pub fn value(round: &ProcessRound) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use claude_watch_core::processes::{Identity, Kind, MatchEvidence, Target};
+    use claude_watch_core::processes::{Identity, Kind, MatchEvidence, MatchReason, Target};
 
     #[test]
     fn process_control_projection_preserves_identity_and_partial_state_without_authority() {

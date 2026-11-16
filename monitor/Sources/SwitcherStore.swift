@@ -121,6 +121,7 @@ struct CurrentEnvironmentReceipt: Decodable {
     let purpose: String
     let grants_launch_permission: Bool
     var observed_at, expires_at: Double
+    var audit_expires_at: Double?
     var rows: [EnvironmentCheckRow]
     let candidates: [String]
     let message: String
@@ -148,6 +149,7 @@ struct InitializationReceiptEvidence: Decodable {
 struct InitializationBackendReceipt: Decodable {
     var state, context_id: String?
     var sampled_at: Double?
+    var network_state: String? = nil
 }
 /// Engine-side evidence for the routing row.  The audit row itself only carries
 /// state and detail; the missing/bypass lists live here so the UI can name the
@@ -415,7 +417,7 @@ struct ProxyDiagnosticReceipt: Decodable {
 
 enum SwitcherCommandRunner {
     static func run(_ args: [String], input: Data? = nil, cancellation: SwitcherReadCancellation? = nil,
-                    dnsRefreshToken: String? = nil, setupProgress: SetupProgressReader? = nil) throws -> Data {
+                    setupProgress: SetupProgressReader? = nil) throws -> Data {
         let task = Process()
         guard let variant = BundledBackendVariant.current() else {
             throw NSError(domain: "Switcher", code: 1, userInfo: [NSLocalizedDescriptionKey: "构建包未声明后台类型，请重新构建界面。"])
@@ -433,7 +435,6 @@ enum SwitcherCommandRunner {
         env.removeValue(forKey: "BASH_ENV")
         env.removeValue(forKey: "CLAUDE_WATCH_DNS_REFRESH_TOKEN")
         env.removeValue(forKey: "CW_SETUP_PROGRESS")
-        if let dnsRefreshToken { env["CLAUDE_WATCH_DNS_REFRESH_TOKEN"] = dnsRefreshToken }
         // Any command whose slow stage the user has to sit through streams its
         // stage announcements. A launch or a launch requirements preview used to
         // run with no progress at all, which read as a frozen button.
@@ -474,6 +475,16 @@ enum SwitcherCommandRunner {
             case .longRunningInteractive: return 60.0
             case .mutatingTransaction: return 120.0
             }
+        }
+
+        static func timeoutSeconds(args: [String]?) -> TimeInterval {
+            guard let args, let first = args.first else { return readOnlyQuery.timeoutSeconds }
+            // Rust bounds a pair of native probes at 180 seconds. Leave IPC
+            // response time; preflights also collect the other audit facts.
+            if first == "evidence" { return 190 }
+            if ["check", "checkdetail", "launch"].contains(first)
+                || args.starts(with: ["account", "switch"]) { return 240 }
+            return classify(args: args).timeoutSeconds
         }
     }
 
@@ -537,7 +548,7 @@ enum SwitcherCommandRunner {
     static func execute(_ task: Process, input: Data? = nil, cancellation: SwitcherReadCancellation? = nil,
                         setupProgress: SetupProgressReader? = nil) throws -> Data {
         let category = CommandCategory.classify(args: task.arguments)
-        let timeoutSeconds = category.timeoutSeconds
+        let timeoutSeconds = CommandCategory.timeoutSeconds(args: task.arguments)
         let deadline = DispatchTime.now() + timeoutSeconds
 
         let output = Pipe(), progressOutput = Pipe()
@@ -732,12 +743,9 @@ final class SwitcherStore: ObservableObject {
     /// The parameter is the receipt-age budget in seconds that the upcoming
     /// backend audit will actually apply: 300 (display TTL) for environment
     /// detections, 30 (DNS_LAUNCH_TTL) for launch-grade rounds.
-    var awaitFreshDNSReceipt: ((TimeInterval) async -> Bool)?
     var onDNSReceiptRecorded: (() -> Void)?
     var onWebRTCRiskRecorded: (() -> Void)?
     var onConfigUpdated: (() -> Void)?
-    var onReceiptDiagnostic: ((LeakKind, String, UUID?, String?) -> Void)?
-    var receiptCommandFixture: ((String, Data) async throws -> Data)?
     /// Test-only transport; production configuration always uses the Rust command runner.
     var configurationCommandFixture: (([String], Data) async throws -> Data)?
     var diagnosticContextProvider: (() -> String?)?
@@ -772,13 +780,10 @@ final class SwitcherStore: ObservableObject {
     private var detectionCancellation: SwitcherReadCancellation?
     private var environmentGeneration = 0
     private var backgroundRequest: Task<Void, Never>?
-    private var leakReceiptGeneration: [LeakKind: Int] = [:]
     private var reviewScenario: SwitcherReviewScenario?
     private var reviewBackground: BackgroundServiceReceipt?
     private var lastLoginProbeAt: Date = .distantPast
     private var loginProbeGeneration = 0
-    var dnsRefreshRoot = FileManager.default.homeDirectoryForCurrentUser
-        .appendingPathComponent("Library/Application Support/ClaudeWatch/switcher", isDirectory: true)
     private var activityGeneration = 0
     var fixtureEnvironmentReadDelayNanoseconds: UInt64 = 0
     var environmentReadWaitTimeout: TimeInterval = 4
@@ -794,6 +799,11 @@ final class SwitcherStore: ObservableObject {
         if kind == .dns { receipts.dns?.sampled_at = sampled }
         else { receipts.webrtc?.sampled_at = sampled }
         value.initialization_receipts = receipts
+        currentEnvironment = value
+    }
+    func setInitializationAuditExpiryForFixture(_ expiry: Double?) {
+        guard isFixture, var value = currentEnvironment else { return }
+        value.audit_expires_at = expiry
         currentEnvironment = value
     }
     #else
@@ -1353,142 +1363,21 @@ final class SwitcherStore: ObservableObject {
         currentPolicyEvaluation = nil
         if currentEnvironment != nil { currentEnvironmentIsHistorical = true }
     }
-    static func initializationReceiptMetadata(_ raw: [String: Any], kind: LeakKind,
-                                              sampledAt: Double) -> (context: String, state: String, sampled: Double)? {
-        guard raw["status"] as? String == "ok", let receipt = raw["receipt"] as? [String: Any],
-              let context = receipt["context_id"] as? String, !context.isEmpty,
-              let sampled = receipt[kind == .dns ? "finished_at" : "sampled_at"] as? Double,
-              sampled == sampledAt,
-              let verdict = receipt[kind == .dns ? "comparison" : "risk"] as? [String: Any],
-              let state = verdict["state"] as? String, ["ok", "fail", "unknown"].contains(state) else { return nil }
-        return (context, state, sampled)
-    }
-    static func safeReceiptCode(_ code: String?) -> String {
-        let allowed = ["dns_context_changed", "dns_context_unknown", "dns_stale", "invalid_dns_receipt", "oversize_dns_receipt", "webrtc_context_changed", "webrtc_context_unavailable", "webrtc_stale", "invalid_webrtc_receipt", "oversize_webrtc_receipt", "context_changed", "context_unavailable", "busy", "recovery_required", "superseded_receipt", "receipt_conflict", "state_io_failed", "unsafe_path", "invalid_config"]
-        return code.flatMap { allowed.contains($0) ? $0 : nil } ?? "other"
-    }
-    func recordDNSLeak(_ probe: LeakProbeResult, runID: UUID? = nil) async -> Bool {
-        leakReceiptGeneration[.dns, default: 0] += 1
-        let generation = leakReceiptGeneration[.dns]
-        guard !isFixture || receiptCommandFixture != nil else {
-            initializationDNSReceipt = ("fixture-context-0001", "ok", probe.finishedAt)
-            return true
-        }
-        guard let expectedContext = diagnosticContextProvider?(), !expectedContext.isEmpty else {
-            onReceiptDiagnostic?(.dns, "context_missing", runID, "context_missing")
-            dnsReceiptError = "DNS 检测时代理上下文未稳定，未记录为当前网络结果。"
-            return false
-        }
-        var backendRejected = false
-        do {
-            let payload = try JSONEncoder().encode(DNSLeakRecordInput(probe: probe, expected_context: expectedContext))
-            let data: Data
-            if isFixture, let fixture = receiptCommandFixture { data = try await fixture("dns-leak-record", payload) }
-            else { data = try await Task.detached { try SwitcherCommandRunner.run(["dns-leak-record", "--apply"], input: payload) }.value }
-            let raw = try JSONSerialization.jsonObject(with: data) as? [String: Any] ?? [:]
-            guard generation == leakReceiptGeneration[.dns] else { return false }
-            guard raw["status"] as? String != "error" else {
-                backendRejected = true
-                let code = raw["code"] as? String
-                onReceiptDiagnostic?(.dns, code == "superseded_receipt" ? "receipt_superseded" : code == "receipt_conflict" ? "receipt_conflict" : "receipt_backend_error", runID, Self.safeReceiptCode(code))
-                throw NSError(domain: "Switcher", code: 7, userInfo: [NSLocalizedDescriptionKey: raw["message"] as? String ?? "DNS 泄漏回执未保存"])
-            }
-            dnsReceiptError = ""
-            guard diagnosticContextProvider?() == expectedContext else {
-                onReceiptDiagnostic?(.dns, "context_changed", runID, "context_changed")
-                dnsReceiptError = "DNS 检测完成后代理上下文已变化，未接受该回执。"
-                return false
-            }
-            // `expectedContext` is the TAG signature verified above and by
-            // Rust on submission. The receipt carries Rust's network digest;
-            // FirstRunChecks compares that digest with the environment receipt.
-            guard let receipt = Self.initializationReceiptMetadata(raw, kind: .dns, sampledAt: probe.finishedAt) else {
-                onReceiptDiagnostic?(.dns, "receipt_invalid", runID, "receipt_invalid")
-                dnsReceiptError = "DNS 后台回执缺少本轮上下文、时间或判定。"
-                return false
-            }
-            initializationDNSReceipt = receipt
-            // A DNS receipt cannot update only the environment card: the
-            // same observation's display-only launch preview would retain its
-            // previous DNS row. Keep both views atomic and request a fresh
-            // complete environment receipt instead.
-            onDNSReceiptRecorded?()
-            onReceiptDiagnostic?(.dns, "receipt_accepted", runID, "none")
-            return true
-        } catch {
-            guard generation == leakReceiptGeneration[.dns] else { return false }
-            if !backendRejected { onReceiptDiagnostic?(.dns, "receipt_transport_error", runID, "receipt_transport_error") }
-            dnsReceiptError = "DNS 泄漏结果未能提交给启动预检：" + error.localizedDescription
-            return false
+    func acceptEvidence(_ kind: LeakKind, reply: LeakEvidenceReply, item: LeakEvidenceItem) {
+        let metadata = item.stored ? item.probe.map { (context: reply.context_id, state: item.state, sampled: $0.finishedAt) } : nil
+        if kind == .dns {
+            initializationDNSReceipt = metadata
+            dnsReceiptError = item.stored ? "" : item.detail
+            if item.stored { onDNSReceiptRecorded?() }
+        } else {
+            initializationWebRTCReceipt = metadata
+            webRTCReceiptError = item.stored ? "" : item.detail
+            if item.stored { onWebRTCRiskRecorded?() }
         }
     }
-    func recordWebRTCRisk(_ probe: LeakProbeResult, runID: UUID? = nil) async -> Bool {
-        leakReceiptGeneration[.webrtc, default: 0] += 1
-        let generation = leakReceiptGeneration[.webrtc]
-        if isFixture && receiptCommandFixture == nil {
-            webRTCReceiptError = ""
-            initializationWebRTCReceipt = ("fixture-context-0001", "ok", probe.finishedAt)
-            return true
-        }
-        guard let expectedContext = diagnosticContextProvider?(), !expectedContext.isEmpty else {
-            onReceiptDiagnostic?(.webrtc, "context_missing", runID, "context_missing")
-            if generation == leakReceiptGeneration[.webrtc] {
-                webRTCReceiptError = Self.webRTCSubmissionError(backendMessage: nil, hasContext: false, contextStillMatches: false)
-            }
-            return false
-        }
-        do {
-            let payload = try JSONEncoder().encode(WebRTCRiskRecordInput(probe: probe, expected_context: expectedContext))
-            let data: Data
-            if isFixture, let fixture = receiptCommandFixture { data = try await fixture("webrtc-risk-record", payload) }
-            else { data = try await Task.detached { try SwitcherCommandRunner.run(["webrtc-risk-record", "--apply"], input: payload) }.value }
-            let raw = try JSONSerialization.jsonObject(with: data) as? [String: Any] ?? [:]
-            let backendMessage = raw["message"] as? String
-            guard raw["status"] as? String != "error" else {
-                let code = raw["code"] as? String
-                onReceiptDiagnostic?(.webrtc, code == "superseded_receipt" ? "receipt_superseded" : code == "receipt_conflict" ? "receipt_conflict" : "receipt_backend_error", runID, Self.safeReceiptCode(code))
-                if generation == leakReceiptGeneration[.webrtc] {
-                    webRTCReceiptError = Self.webRTCSubmissionError(backendMessage: backendMessage, hasContext: true, contextStillMatches: true)
-                }
-                return false
-            }
-            guard diagnosticContextProvider?() == expectedContext else {
-                onReceiptDiagnostic?(.webrtc, "context_changed", runID, "context_changed")
-                if generation == leakReceiptGeneration[.webrtc] {
-                    webRTCReceiptError = Self.webRTCSubmissionError(backendMessage: nil, hasContext: true, contextStillMatches: false)
-                }
-                return false
-            }
-            guard generation == leakReceiptGeneration[.webrtc] else { onReceiptDiagnostic?(.webrtc, "receipt_superseded", runID, "receipt_superseded"); return false }
-            // Keep the verified TAG binding separate from Rust's network
-            // digest, which is checked against the environment before entry.
-            guard let receipt = Self.initializationReceiptMetadata(raw, kind: .webrtc, sampledAt: probe.finishedAt) else {
-                onReceiptDiagnostic?(.webrtc, "receipt_invalid", runID, "receipt_invalid")
-                webRTCReceiptError = "WebRTC 后台回执缺少本轮上下文、时间或判定。"
-                return false
-            }
-            initializationWebRTCReceipt = receipt
-            webRTCReceiptError = ""
-            onWebRTCRiskRecorded?()
-            onReceiptDiagnostic?(.webrtc, "receipt_accepted", runID, "none")
-            return true
-        } catch {
-            onReceiptDiagnostic?(.webrtc, "receipt_transport_error", runID, "receipt_transport_error")
-            if generation == leakReceiptGeneration[.webrtc] {
-                webRTCReceiptError = Self.webRTCSubmissionError(backendMessage: error.localizedDescription, hasContext: true, contextStillMatches: true)
-            }
-            return false
-        }
-    }
-    static func webRTCSubmissionError(backendMessage: String?, hasContext: Bool, contextStillMatches: Bool) -> String {
-        if !hasContext { return "本地检测已完成，但当前代理上下文未稳定，未提交当前保护判定。" }
-        if !contextStillMatches { return "本地检测完成后代理上下文已变化，未接受该保护判定。" }
-        let detail = backendMessage?.trimmingCharacters(in: .whitespacesAndNewlines)
-        return "本地检测已完成，但未提交当前保护判定" + ((detail?.isEmpty == false) ? "：" + detail! : "。")
-    }
-    func setWebRTCReceiptErrorForFixture(_ value: String) {
-        guard isFixture else { return }
-        webRTCReceiptError = value
+    func acceptEvidenceFailure(_ kind: LeakKind, detail: String) {
+        if kind == .dns { initializationDNSReceipt = nil; dnsReceiptError = detail }
+        else { initializationWebRTCReceipt = nil; webRTCReceiptError = detail }
     }
     func refreshBackground(maximumAge: TimeInterval = 0) async {
         if let request = backgroundRequest { await request.value; return }
@@ -1612,7 +1501,7 @@ final class SwitcherStore: ObservableObject {
         defer { busy = false }
         do {
             if isFixture {
-                let expires = id == candidate?.id ? candidate?.expires_at : currentEnvironment?.expires_at
+                let expires = id == candidate?.id ? candidate?.expires_at : currentEnvironment?.audit_expires_at
                 guard let expires else { throw CocoaError(.fileReadCorruptFile) }
                 setupPlan = .init(id: "fixture-setup", candidate_id: id, actions: [], rows: candidate?.rows ?? [], expires_at: expires)
             } else {
@@ -1668,45 +1557,6 @@ final class SwitcherStore: ObservableObject {
         self.plan = nil
         await refreshBackground()
     }
-    private func pollDNSRefreshRequests(_ bridge: DNSRefreshBridge) async {
-        var answered = Set<String>()
-        while !Task.isCancelled {
-            if let id = bridge.pendingRequestID(), !answered.contains(id) {
-                answered.insert(id)
-                let ready = await awaitFreshDNSReceipt?(30) ?? false
-                guard !Task.isCancelled else { return }
-                // A silently dropped reply leaves the backend waiting on the
-                // rendezvous until its own timeout, stalling the account
-                // switch for nothing. One retry covers a transient filesystem
-                // hiccup; the backend's conservative timeout remains the
-                // backstop when the reply truly cannot land.
-                do {
-                    try bridge.writeReply(id: id, ready: ready)
-                } catch {
-                    try? await Task.sleep(nanoseconds: 250_000_000)
-                    guard !Task.isCancelled else { return }
-                    do { try bridge.writeReply(id: id, ready: ready) }
-                    catch { NSLog("ClaudeWatch: dns-refresh reply %@ could not be written: %@", id, error.localizedDescription) }
-                }
-            }
-            try? await Task.sleep(nanoseconds: 150_000_000)
-        }
-    }
-    private func runAccountSwitchWithDNSRefresh(_ args: [String], input: Data?, setupProgress: SetupProgressReader?) async throws -> Data {
-        let bridge = try DNSRefreshBridge(root: dnsRefreshRoot)
-        let poller = Task { @MainActor [weak self] in
-            guard let self else { return }
-            await self.pollDNSRefreshRequests(bridge)
-        }
-        defer {
-            poller.cancel()
-            bridge.cleanup()
-        }
-        let token = bridge.token
-        return try await Task.detached {
-            try SwitcherCommandRunner.run(args, input: input, dnsRefreshToken: token, setupProgress: setupProgress)
-        }.value
-    }
     func perform(_ args: [String], input: Data? = nil, refresh: Bool = true, setupProgress: SetupProgressObserver? = nil) async {
         guard !busy else { return }
         busy = true
@@ -1725,29 +1575,6 @@ final class SwitcherStore: ObservableObject {
                 message = text
             }
             return
-        }
-        let requiresFreshDNS = args.first == "checkdetail" || args.first == "launch" ||
-            (args.starts(with: ["account", "switch"]) && args.contains("--apply"))
-        if requiresFreshDNS, let awaitFreshDNSReceipt {
-            updateActivity("正在完成 DNS 泄漏检测并同步启动预检…", token: activityToken)
-            // Environment detections evaluate the stored receipt with the
-            // backend display TTL (300s); only launch-grade rounds apply the
-            // 30s launch window. Demanding 10s freshness here used to force a
-            // redundant full DNS re-run before nearly every detection.
-            let launchGrade = args.first == "launch" ||
-                (args.starts(with: ["account", "switch"]) && args.contains("--apply"))
-            let ready = await awaitFreshDNSReceipt(launchGrade ? 30 : 300)
-            guard ready else {
-                failure = true
-                invalidateCurrentEnvironmentRequest()
-                detectionError = "启动前 DNS 泄漏复核未完成；此前环境结果仅供参考。"
-                let failureText = args.first == "checkdetail"
-                    ? "DNS 泄漏检测未在当前网络上下文内完成，未执行启动预检。"
-                    : "DNS 泄漏检测未在当前网络上下文内完成，未执行启动预检或启动 \(Self.launchDisplayName(args))。"
-                if args.first == "checkdetail" { auditOperationMessage = failureText; message = "" }
-                else { message = failureText }
-                return
-            }
         }
         updateActivity(args.first == "checkdetail" ? "按已接受策略检查启动条件…" : "正在核对并完成操作…", token: activityToken)
         do {
@@ -1825,12 +1652,9 @@ final class SwitcherStore: ObservableObject {
                     }
                 } }
                 defer { channel?.finish() }
-                let data: Data
-                if args.starts(with: ["account", "switch"]) && args.contains("--apply") {
-                    data = try await runAccountSwitchWithDNSRefresh(args, input: input, setupProgress: channel)
-                } else {
-                    data = try await Task.detached { try SwitcherCommandRunner.run(args, input: input, setupProgress: channel) }.value
-                }
+                let data = try await Task.detached {
+                    try SwitcherCommandRunner.run(args, input: input, setupProgress: channel)
+                }.value
                 let raw = try JSONSerialization.jsonObject(with: data) as? [String: Any] ?? [:]
                 let status = raw["status"] as? String ?? ""
                 failure = ["error", "partial"].contains(status)
@@ -1991,7 +1815,7 @@ final class SwitcherStore: ObservableObject {
             "context_transition": ["state": "stable",
                                    "before": ["proxy": "tag", "network": "en0"],
                                    "after": ["proxy": "tag", "network": "en0"]],
-            "observed_at": now, "expires_at": now + 300, "rows": rows, "candidates": ["tag"],
+            "observed_at": now, "expires_at": now + 300, "audit_expires_at": now + 30, "rows": rows, "candidates": ["tag"],
             "egress_reference": ["ip": "8.8.8.8", "country": "JP", "timezone": "Asia/Tokyo", "checked_at": now, "context_id": "fixture-context-0001"],
             "facts": ["state": "ok", "risks": []],
             "policy_evaluation": ["purpose": "launch_requirements_preview", "grants_launch_permission": false,

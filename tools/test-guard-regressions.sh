@@ -12,7 +12,7 @@ if [[ "$MODE" != swift ]]; then
   command -v cargo >/dev/null || { echo 'cargo is required; no Rust tests have run.' >&2; exit 1; }
   cargo check --locked -p claude-watch-runtime -p claude-watch-engine
   cargo test --locked -p claude-watch-runtime --lib controlled::guard_regressions -- --nocapture
-  cargo test --locked -p claude-watch-runtime --lib desktop_native::close_receipt::tests -- --nocapture
+  cargo test --locked -p claude-watch-runtime --lib process_exit::tests::normal_exit_selection_preserves_manual_cli_and_account_desktop_scope -- --nocapture
   cargo test --locked -p claude-watch-runtime --test supervised_evidence_regressions -- --nocapture
 fi
 if [[ "$MODE" != rust ]]; then

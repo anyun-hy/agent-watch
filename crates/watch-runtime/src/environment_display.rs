@@ -601,6 +601,8 @@ pub fn receipt(store: &StateStore, audit: Value, session: Value, persist: bool) 
     output["status"] = json!("ok");
     output["purpose"] = json!("environment_detection");
     output["grants_launch_permission"] = json!(false);
+    // Protection must use the original audit deadline, not the display window.
+    output["audit_expires_at"] = output["expires_at"].clone();
     output["expires_at"] = json!(display_expires);
     output["rows"] = json!(rows);
     // The native adapter already measured the running proxy candidates; expose
@@ -612,9 +614,11 @@ pub fn receipt(store: &StateStore, audit: Value, session: Value, persist: bool) 
     // initialization gate without exposing the rest of display_facts.
     output["initialization_receipts"] = json!({
         "dns": {"state": output["display_facts"]["online"]["dns"]["state"],
+                "network_state": output["display_facts"]["online"]["dns"]["network_state"],
                 "context_id": output["display_facts"]["online"]["dns"]["receipt"]["context_id"],
                 "sampled_at": output["display_facts"]["online"]["dns"]["receipt"]["finished_at"]},
         "webrtc": {"state": output["display_facts"]["online"]["webrtc"]["state"],
+                   "network_state": output["display_facts"]["online"]["webrtc"]["network_state"],
                    "context_id": output["display_facts"]["online"]["webrtc"]["receipt"]["context_id"],
                    "sampled_at": output["display_facts"]["online"]["webrtc"]["receipt"]["sampled_at"]}
     });

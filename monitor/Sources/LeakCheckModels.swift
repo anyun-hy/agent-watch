@@ -65,7 +65,7 @@ struct LeakProbeResult: Codable, Sendable {
     static func failure(_ kind: LeakKind, code: String, message: String, at now: Date = Date()) -> LeakProbeResult {
         LeakProbeResult(kind: kind.rawValue, status: code == "timeout" ? "timeout" : "error",
             startedAt: now.timeIntervalSince1970, finishedAt: now.timeIntervalSince1970,
-            scope: kind == .dns ? "本机 dig DNS 路径" : "当前检测 WebView",
+            scope: "后台 WebKit 检测",
             observations: [], errors: [.init(stage: "collector", code: code, message: message)],
             contextChanged: false, details: [])
     }
@@ -144,125 +144,5 @@ struct LeakIPAddress: Hashable, Sendable {
         if a == 198 && (c == 18 || c == 19 || (c == 51 && d == 100)) { return false }
         if a == 203 && c == 0 && d == 113 { return false }
         return true
-    }
-}
-
-enum LeakPolicy {
-    /// Single Swift-side source of truth for the display freshness window.
-    /// Mirrors watch-core receipts.rs (`DNS_DISPLAY_TTL` / `STUN_RECEIPT_TTL`,
-    /// both 300s): a recorded receipt stays valid for backend audits for five
-    /// minutes. Every local "expired" judgment must reference this constant so
-    /// the windows cannot drift apart again.
-    static let receiptDisplayTTL: TimeInterval = 300
-
-    static func expectedAddresses(_ text: String) throws -> Set<String> {
-        guard text.utf8.count <= 4096 else { throw PolicyError.invalid }
-        let tokens = text.components(separatedBy: CharacterSet.whitespacesAndNewlines.union(CharacterSet(charactersIn: ",，;；"))).filter { !$0.isEmpty }
-        guard tokens.count <= 32 else { throw PolicyError.invalid }
-        var result = Set<String>()
-        for token in tokens {
-            guard let address = LeakIPAddress(token), address.isPublic else { throw PolicyError.invalid }
-            result.insert(address.canonical)
-        }
-        return result
-    }
-    enum PolicyError: Error { case invalid }
-    static let invalidInput = "请输入公网 IP（IPv4 或 IPv6），以逗号分隔；不接受域名、端口或本地代理地址。"
-
-    static func evaluate(_ result: LeakProbeResult, kind: LeakKind, expected: String, now: Double) -> LeakVerdict {
-        func incomplete(_ detail: String) -> LeakVerdict { .init(state: .incomplete, title: "检测未完成", detail: detail) }
-        // DNS leak detection has no user-maintained IP allow-list.  Its reference
-        // is the HTTP egress observed in the same run.  WebRTC keeps its optional
-        // explicit address reference because ICE candidates are compared by address.
-        let allowed: Set<String>
-        if kind == .dns {
-            allowed = []
-        } else {
-            guard let value = try? expectedAddresses(expected) else { return incomplete(invalidInput) }
-            allowed = value
-        }
-        guard result.kind == kind.rawValue, result.startedAt.isFinite, result.finishedAt.isFinite,
-              result.startedAt <= result.finishedAt, result.finishedAt <= now + 5,
-              result.finishedAt - result.startedAt <= 120, result.observations.count <= 128,
-              result.errors.count <= 32 else { return incomplete("采集结果无效，不能用于当前判断。") }
-        guard now - result.finishedAt <= LeakPolicy.receiptDisplayTTL else { return .init(state: .incomplete, title: "结果已过期", detail: "这次采样已超过 5 分钟，请重新检测。") }
-        guard !result.contextChanged else { return incomplete("检测期间或之后网络/代理上下文发生变化，请在网络稳定后重新检测。") }
-        guard !result.errors.contains(where: { $0.stage == "context" && $0.code == "context_unavailable" }) else {
-            return incomplete("检测期间代理上下文未能持续确认，不能使用本次结果判断风险。")
-        }
-        // A partial WebRTC result can contain useful addresses, but never earns a pass.
-        // DNS is handled below: a valid foreign resolver remains a leak-risk
-        // finding even if another DNS round or enrichment request failed.
-        if kind != .dns && (result.status != "complete" || !result.errors.isEmpty) {
-            let message = result.errors.first?.message ?? "本轮结果不完整，请查看检测详情后重试。"
-            return incomplete(result.status == "timeout" ? "检测超时。" + message : message)
-        }
-        var normalized: [(LeakObservation, LeakIPAddress)] = []
-        for row in result.observations {
-            if row.kind == "mdns" { continue }
-            guard let ip = LeakIPAddress(row.address), row.family == nil || row.family == ip.family
-                    || (row.family == 6 && ip.family == 4 && row.address.contains(":")) else {
-                return incomplete("采集中包含无效地址或地址族信息，已保留原始记录供核对。")
-            }
-            guard ["resolver", "http", "srflx", "prflx", "relay", "host"].contains(row.kind) else { return incomplete("采集结果包含未知候选类型。") }
-            if ["resolver", "http", "srflx", "prflx"].contains(row.kind), !ip.isPublic {
-                return incomplete("诊断返回了不可用于公网出口比较的地址，不能据此判断匹配。")
-            }
-            normalized.append((row, ip))
-        }
-        let http = Set(normalized.filter { $0.0.kind == "http" && $0.1.isPublic }.map { $0.1.canonical })
-        guard !http.isEmpty else { return incomplete("未取得本轮 HTTP 出口参考，不能把空参考当成匹配。") }
-        // Geography can reveal an additional inconsistency. It never grants a
-        // pass: address references, completeness and route context still apply.
-        let httpCountries = Set(normalized.filter { $0.0.kind == "http" }.compactMap { CountryIdentity.code($0.0.country, country: $0.0.country) })
-        if httpCountries.count > 1 { return incomplete("同轮 HTTP 出口归属来源不一致，请重新检测。") }
-        let comparedKinds = kind == .dns ? ["resolver"] : ["srflx", "prflx", "host"]
-        let observedCountries = Set(normalized.filter { comparedKinds.contains($0.0.kind) && $0.1.isPublic }
-            .compactMap { CountryIdentity.code($0.0.country, country: $0.0.country) })
-        if kind != .dns, let referenceCountry = httpCountries.first, observedCountries.contains(where: { $0 != referenceCountry }) {
-            return .init(state: .difference, title: "发现出口归属差异", detail: "检测出口与本轮 HTTP 出口的已知国家归属不一致，需核对代理路径。国家相同也不会替代实际出口校验。")
-        }
-        if kind == .dns {
-            let resolvers = Set(normalized.filter { $0.0.kind == "resolver" && $0.1.isPublic }.map { $0.1.canonical })
-            guard !resolvers.isEmpty else { return incomplete("没有取得有效 DNS 递归出口；空结果不能证明 DNS 已加密或没有泄漏。") }
-            guard let httpCountry = httpCountries.first, httpCountries.count == 1 else {
-                // The egress address itself is on screen below; what is missing is
-                // only its attribution.  Saying so keeps a satisfied user from
-                // reading "no country" as "no evidence" — or the reverse.
-                return incomplete("本轮 HTTP 出口的归属地未取得（出口地址已取得，见下方证据）。归属地缺失时本判定刻意不放行：没有它无法判断 DNS 是否随出口代理。请稍后重新检测。")
-            }
-            if observedCountries.contains(where: { $0 != httpCountry }) {
-                return .init(state: .difference, title: "发现 DNS 出口地区差异", detail: "至少一个 DNS 递归出口国家与本轮公网出口 \(httpCountry) 不一致，存在 DNS 泄漏风险。")
-            }
-            // A resolver whose attribution never arrived is not a resolver that
-            // agreed; counting only the enriched ones would let an unverified
-            // server pass silently next to verified ones.
-            let resolverRows = normalized.filter { comparedKinds.contains($0.0.kind) && $0.1.isPublic }
-            let unattributed = resolverRows.filter { CountryIdentity.code($0.0.country, country: $0.0.country) == nil }.count
-            guard observedCountries.count == 1, let dnsCountry = observedCountries.first, unattributed == 0 else {
-                let reason = unattributed > 0 ? "有 \(unattributed) 个 DNS 递归出口未取得归属地" : "未取得 DNS 递归出口的归属地"
-                return incomplete("\(reason)，不能判断是否存在 DNS 泄漏。地址证据已在下方展示；归属地查询失败时本判定刻意不放行。")
-            }
-            guard dnsCountry == httpCountry else {
-                return .init(state: .difference, title: "发现 DNS 出口地区差异", detail: "DNS 递归出口为 \(dnsCountry)，本轮公网出口为 \(httpCountry)。DNS 未随当前出口路径，存在泄漏风险。")
-            }
-            guard result.status == "complete", result.errors.isEmpty else {
-                let message = result.errors.first?.message ?? "本轮 DNS 查询未完整结束。"
-                return incomplete("DNS 出口国家一致，但本轮检测未完整结束：" + message)
-            }
-            return .init(state: .matched, title: "DNS 出口与公网出口一致", detail: "本轮 DNS 递归出口和 HTTP 公网出口均为 \(httpCountry)。范围仅限本轮检测路径。")
-        }
-        let candidates = Set(normalized.filter { ["srflx", "prflx", "host"].contains($0.0.kind) && $0.1.isPublic }.map { $0.1.canonical })
-        guard !candidates.isEmpty else { return incomplete("没有取得可比较的公网 ICE/STUN 候选；仅有本地、mDNS 或 TURN 中继候选也不能判定无泄漏。") }
-        let reference = allowed.isEmpty ? http : allowed
-        let referenceFamilies = Set(reference.compactMap { LeakIPAddress($0)?.family })
-        if allowed.isEmpty && candidates.contains(where: { !referenceFamilies.contains(LeakIPAddress($0)!.family) }) {
-            return incomplete("已取得候选，但缺少对应 IPv4/IPv6 的 HTTP 出口参考；可填写完整的预期出口后重新核对。")
-        }
-        let unexpected = candidates.subtracting(reference)
-        if !unexpected.isEmpty {
-            return .init(state: .difference, title: "发现出口差异", detail: "公网候选与" + (allowed.isEmpty ? "本轮 HTTP 参考" : "预期列表") + "不一致：" + unexpected.sorted().joined(separator: "、") + "。可能涉及 UDP 分流，需核对实际网络策略。")
-        }
-        return .init(state: .matched, title: "本轮出口样本一致", detail: "已观测的公网候选与" + (allowed.isEmpty ? "同轮 HTTP 出口" : "预期出口") + "一致；范围仅限当前检测 WebView，不代表 AI 应用或其他浏览器。")
     }
 }

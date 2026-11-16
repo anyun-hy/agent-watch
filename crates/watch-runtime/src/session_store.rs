@@ -15,6 +15,15 @@ pub struct SessionStore {
     pub storage: StateStore,
     family: &'static str,
 }
+/// Keeps the Store's lock held through the caller's authorization boundary.
+pub(crate) struct LockedSession<'a> {
+    store: &'a SessionStore,
+    _lock: crate::storage::OperationLock,
+}
+impl LockedSession<'_> {
+    pub(crate) fn load(&self, now: f64) -> Result<Option<Session>> { self.store.load(now) }
+    pub(crate) fn persist_recovery(&self, restored: &Session) -> Result<()> { self.store.save(restored) }
+}
 impl SessionStore {
     pub fn new(storage: StateStore) -> Self {
         Self {
@@ -32,12 +41,15 @@ impl SessionStore {
     fn session_path(&self) -> std::path::PathBuf {
         self.storage.paths.session_for(self.family)
     }
-    pub(crate) fn lock_name(&self) -> String {
+    fn lock_name(&self) -> String {
         if self.family == "claude" {
             "session-guard".to_string()
         } else {
             format!("session-guard-{}", self.family)
         }
+    }
+    pub(crate) fn lock(&self) -> Result<LockedSession<'_>> {
+        Ok(LockedSession { store: self, _lock: self.storage.lock(&self.lock_name(), None)? })
     }
     pub fn load(&self, now: f64) -> Result<Option<Session>> {
         let value = self
@@ -510,30 +522,8 @@ impl SessionStore {
         verified.desktop = Some(desktop.clone());
         verified.bound_at = Some(now);
         Self::anchor_probe_baseline(&mut verified, &receipts, now);
-        let lease_path = self
-            .storage
-            .paths
-            .watch()
-            .join(format!("state/sessions/rust-{}.session", desktop.pid));
-        let old_lease = self.storage.read_bytes(&lease_path, 16 * 1024)?;
         crate::lease_store::LeaseStore { storage: self.storage.clone() }
-            .save_desktop(desktop, stamp, now, provider)?;
-        if let Err(error) = self.save(&verified) {
-            let rollback = match old_lease {
-                Some(bytes) => self.storage.atomic_bytes(&lease_path, &bytes, 0o600),
-                None => {
-                    self.storage.guarded(&lease_path)?;
-                    std::fs::remove_file(&lease_path).map_err(|_| {
-                        CoreError::new(
-                            "revalidation_lease_rollback_failed",
-                            "未能撤销重新校验观察记录",
-                        )
-                    })
-                }
-            };
-            rollback?;
-            return Err(error);
-        }
+            .commit_desktops(&[(desktop.clone(), stamp.into())], now, provider, || self.save(&verified))?;
         Ok(Some(verified))
     }
     /// A stale probe may never overwrite or close a newer controlled session.

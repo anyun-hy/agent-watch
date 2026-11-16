@@ -1538,6 +1538,18 @@ pub struct ApprovedDiscoveryManifest {
     pub selection_issues: Vec<String>,
     pub needs_verification_retry: bool,
 }
+/// Publish the daemon's approved revision; readers cannot turn it into authority.
+pub fn publish_runtime_snapshot(store: &StateStore, snapshot: &DiscoverySnapshot,
+    selection_issues: &[String], verification_pending: bool, approval_boot: &str,
+    script_approvals: &[claude_watch_core::controlled_launch::ApprovedScriptCombo]) -> Result<()> {
+    let _lock = store.lock("target-discovery-publication", None)?;
+    store.atomic_json(&store.paths.watch().join("state/target-discovery.json"), &json!({
+        "snapshot":snapshot,"selection_issues":selection_issues,"verification_pending":verification_pending,
+        "approval_executor_boot_id":approval_boot,"script_launch_approvals":script_approvals}))
+}
+pub fn read_runtime_snapshot(store: &StateStore) -> Result<serde_json::Value> {
+    store.read_json(&store.paths.watch().join("state/target-discovery.json"), serde_json::Value::Null)
+}
 impl DiscoveryHandle {
     pub fn new(inputs: DiscoveryInputs) -> Self {
         Self::with_registry(inputs, Arc::new(SystemApplicationRegistry))

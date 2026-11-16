@@ -145,9 +145,20 @@ fn summarize(prepared: &StatusFrame<'_>, producer_current: impl FnOnce(&Value) -
         let missing_sample = matches!(permit.reason_code.as_str(), "vpn_observation_unknown" | "vpn_observation_stale"
             | "egress_evidence_expired" | "channel_inventory_incomplete" | "permit_lease_expired"
             | "authority_evidence_unavailable");
+        // An unused controlled entry can be ready while external processes
+        // remain explicitly uncovered. Require its actual closed-gateway
+        // receipt; this does not grant those processes a permit or protection.
+        let standby = permit.state == ChannelPermitState::PendingVerification
+            && permit.session_id.is_none() && permit.members.is_empty()
+            && matches!(permit.reason_code.as_str(), "idle_no_process" | "unmanaged_existing_processes")
+            && receipt.as_ref().is_some_and(|r| r.sandbox_ready && r.local_proxy_ready
+                && matches!(r.enforcement_state, ChannelEnforcementState::PendingVerification | ChannelEnforcementState::Blocked)
+                && r.new_connections_blocked && r.active_flows_closed && r.active_flows_count == 0
+                && r.coverage_scope.as_ref().is_some_and(|scope| scope.gateway_endpoint_protection_verified));
         let (status, guard_state, execution_state) = match verdict {
+            ChannelSupervisionVerdict::PendingVerification { .. } | ChannelSupervisionVerdict::IsolatedKeepProcess
+                if standby => ("ok", "idle", "blocked"),
             ChannelSupervisionVerdict::ForwardingVerified => ("ok", "safe", "forwarding"),
-            ChannelSupervisionVerdict::PendingVerification { .. } if permit.reason_code == "idle_no_process" => ("ok", "idle", "pending_verification"),
             ChannelSupervisionVerdict::IsolatedKeepProcess if missing_sample => ("unknown", "pending_verification", "blocked"),
             ChannelSupervisionVerdict::IsolatedKeepProcess => ("protection_triggered", "locked", "blocked"),
             ChannelSupervisionVerdict::PendingIsolation { .. } => ("pending", "pending_verification", "disconnecting"),
@@ -675,6 +686,70 @@ mod tests {
                 "policy_sync_state":"applied","applied_policy_version":policy}}}),
             config,
         )
+    }
+    #[test]
+    fn unused_entry_readiness_requires_current_closed_gateway_and_keeps_external_processes_unprotected() {
+        let (mut frame, config) = fixture();
+        for family in ["claude", "openai"] {
+            let mut permit = frame["authoritative_permits"]["claude"].clone();
+            permit["family"] = json!(family);
+            permit["session_id"] = Value::Null;
+            permit["state"] = json!("pending_verification");
+            permit["reason_code"] = json!(if family == "claude" { "idle_no_process" } else { "unmanaged_existing_processes" });
+            let mut receipt = frame["enforcement_receipts"]["claude"].clone();
+            receipt["family"] = json!(family);
+            receipt["session_id"] = Value::Null;
+            receipt["permit_state"] = json!("pending_verification");
+            receipt["enforcement_state"] = json!("pending_verification");
+            receipt["coverage_scope"] = json!({"backend":"seatbelt", "gateway_endpoint_protection_verified":true,
+                "protected_pids":[], "unprotected_pids":if family == "openai" { vec![123] } else { vec![] }});
+            frame["authoritative_permits"][family] = permit;
+            frame["enforcement_receipts"][family] = receipt;
+            frame["families"][family] = frame["families"]["claude"].clone();
+        }
+        let project = |value: &Value| summarize(&StatusFrame::new(value, &config, 103.0), |_| true);
+        let ready = project(&frame);
+        assert_eq!(ready["status"], "ok");
+        assert_eq!(ready["session_guard"]["state"], "idle");
+        let openai = ready["families"].as_array().unwrap().iter().find(|row| row["family"] == "openai").unwrap();
+        assert_eq!(openai["channel_permit"]["state"], "pending_verification");
+        assert_eq!(openai["session_guard"]["reason"]["code"], "unmanaged_existing_processes");
+        assert_eq!(openai["channel_receipt"]["coverage_scope"]["unprotected_pids"], json!([123]));
+        assert_eq!(openai["channel_receipt"]["coverage_scope"]["protected_pids"], json!([]));
+        assert!(crate::macos::guard_heartbeat_confirmed(&config, true, 103.0, &ready));
+
+        let mut expired = frame.clone();
+        for family in ["claude", "openai"] {
+            expired["authoritative_permits"][family]["valid_until"] = json!(100.5);
+            expired["enforcement_receipts"][family]["enforcement_state"] = json!("blocked");
+            expired["enforcement_receipts"][family]["permit_state"] = json!("revoked");
+        }
+        assert_eq!(project(&expired)["status"], "ok", "fresh blocked standby remains ready after its non-forwarding lease expires");
+        for (path, replacement) in [
+            ("/authoritative_permits/openai/reason_code", json!("channel_inventory_incomplete")),
+            ("/authoritative_permits/openai/reason_code", json!("vpn_observation_unknown")),
+            ("/authoritative_permits/openai/reason_code", json!("vpn_mismatch")),
+            ("/enforcement_receipts/openai/executor_boot_id", json!("old")),
+            ("/enforcement_receipts/openai/observed_at", json!(90.0)),
+            ("/enforcement_receipts/openai/active_flows_count", json!(1)),
+            ("/enforcement_receipts/openai/active_flows_closed", json!(false)),
+            ("/enforcement_receipts/openai/new_connections_blocked", json!(false)),
+            ("/enforcement_receipts/openai/interception_active", json!(false)),
+            ("/enforcement_receipts/openai/direct_fallback_blocked", json!(false)),
+            ("/enforcement_receipts/openai/sandbox_ready", json!(false)),
+            ("/enforcement_receipts/openai/local_proxy_ready", json!(false)),
+            ("/enforcement_receipts/openai/coverage_scope/gateway_endpoint_protection_verified", json!(false)),
+            ("/enforcement_receipts/claude/coverage_scope/gateway_endpoint_protection_verified", json!(false)),
+        ] {
+            let mut invalid = frame.clone();
+            *invalid.pointer_mut(path).unwrap() = replacement;
+            assert_ne!(project(&invalid)["status"], "ok", "{path}");
+        }
+        let mut session = frame.clone();
+        session["authoritative_permits"]["openai"]["session_id"] = json!("active-session");
+        session["enforcement_receipts"]["openai"]["session_id"] = json!("active-session");
+        assert_ne!(project(&session)["status"], "ok", "a controlled session still needs its own verification");
+        assert_ne!(summarize(&StatusFrame::new(&frame, &config, 103.0), |_| false)["status"], "ok");
     }
     #[test]
     fn policy_application_requires_current_live_producer_policy_boot_command_and_fresh_receipt() {

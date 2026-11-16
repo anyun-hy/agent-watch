@@ -12,6 +12,75 @@ pub struct ReceiptStore {
     pub storage: StateStore,
 }
 impl ReceiptStore {
+    pub(crate) fn lock_observations(&self) -> Result<crate::storage::OperationLock> {
+        self.storage.lock("observations", None)
+    }
+    /// Collection reuse is checked against the persisted sample and its original time.
+    pub fn probe_is_fresh(&self, kind: claude_watch_core::evidence::ProbeKind, context: &str,
+        current_ip: Option<&str>, now: f64, since: Option<f64>) -> bool {
+        use claude_watch_core::evidence::ProbeKind;
+        let (file, stamp, context_key) = match kind {
+            ProbeKind::Dns => ("dns-leak-receipt.json", "finished_at", "context"),
+            ProbeKind::WebRtc => ("webrtc-risk-receipt.json", "sampled_at", "context_id"),
+        };
+        self.storage.read_json(&self.storage.paths.base().join(file), Value::Null).ok().is_some_and(|v| {
+            let status = match kind {
+                ProbeKind::Dns => self.dns_status_for_network(context, current_ip, false, now, |t| format!("{t:.0}")),
+                ProbeKind::WebRtc => self.webrtc_status_for_network(context, current_ip, now),
+            };
+            matches!(status["state"].as_str(), Some("ok" | "fail")) && v["status"] == "complete"
+                && v[context_key] == context && v[stamp].as_f64().is_some_and(|t|
+                    ((0.0..kind.refresh_age()).contains(&(now - t)) || receipts::network_reusable(&v, context, current_ip))
+                        && since.is_none_or(|s| t >= s))
+        })
+    }
+    /// A UI projection of the same persisted evidence used by audits. Historical
+    /// addresses are explicitly separate from the current verdict and expiry.
+    pub fn evidence_item(&self, kind: claude_watch_core::evidence::ProbeKind,
+        context: &str, purpose: claude_watch_core::evidence::EvidencePurpose,
+        expected_ip: Option<&str>, current_ip: Option<&str>, now: f64) -> Result<Value> {
+        use claude_watch_core::evidence::{EvidencePurpose, ProbeKind};
+        let (dns, rtc) = self.probe_receipts();
+        let receipt = if kind == ProbeKind::Dns { dns } else { rtc };
+        let stored = receipt["schema"] == 1 && receipt["context_id"].as_str() == Some(context);
+        let status = match kind {
+            ProbeKind::Dns => self.dns_status_for_network(context, current_ip, purpose == EvidencePurpose::Launch, now, |t| format!("{t:.0}")),
+            ProbeKind::WebRtc => receipts::webrtc_status_for_network(&receipt, context, current_ip, now),
+        };
+        let receipt = if stored { receipt } else { Value::Null };
+        let sampled = receipt[if kind == ProbeKind::Dns { "finished_at" } else { "sampled_at" }].as_f64();
+        let reusable = status["state"] == "ok" && receipts::network_reusable(&receipt, context, current_ip);
+        let valid_until = if reusable { None } else { sampled.map(|v| v + purpose.max_age(kind)) };
+        let within_age = reusable || sampled.is_some_and(|v| (0.0..=purpose.max_age(kind)).contains(&(now-v)));
+        let state = if within_age { status["state"].as_str().unwrap_or("unknown") } else { "unknown" };
+        let timeout = receipt["status"] == "timeout" || receipt["errors"].as_array().is_some_and(|v|
+            v.iter().any(|e| matches!(e["code"].as_str(), Some("timeout" | "evidence_timeout"))));
+        let code = if timeout { "timeout" } else if !within_age { "evidence_expired" }
+            else { receipt.pointer("/comparison/reason").and_then(Value::as_str).unwrap_or(state) };
+        let detail = if timeout { "本轮检测超时；历史结果仅供参考，不能代替本轮检测" }
+            else if !within_age { "检测结果缺失或已过期，请重新检测" }
+            else { status["detail"].as_str().unwrap_or("检测尚未完成") };
+        let probe = Self::display_probe(kind, &receipt);
+        let historical = if status["display_cached"] == true {
+            Self::display_probe(kind, &status["display_receipt"])
+        } else { Value::Null };
+        let diagnostic = if kind == ProbeKind::WebRtc {
+            receipts::expected_ip_diagnostic(&receipt["observations"], expected_ip.unwrap_or(""))?
+        } else { Value::Null };
+        Ok(json!({"state":state,"code":code,"detail":detail,"valid_until":valid_until,"validity":if reusable {"network"} else {"time"},
+            "stored":stored,"receipt":receipt,"probe":probe,
+            "display_probe":historical,"diagnostic":diagnostic}))
+    }
+    fn display_probe(kind: claude_watch_core::evidence::ProbeKind, receipt: &Value) -> Value {
+        use claude_watch_core::evidence::ProbeKind;
+        let Some(finished) = receipt[if kind == ProbeKind::Dns { "finished_at" } else { "sampled_at" }].as_f64() else { return Value::Null };
+        json!({"kind":kind.label(),"status":receipt["status"],
+            "startedAt":receipt["started_at"].as_f64().unwrap_or(finished),"finishedAt":finished,
+            "scope":receipt["scope"].as_str().unwrap_or("后台 WebKit 检测；仅覆盖本次采样路径"),
+            "observations":receipt["observations"].as_array().cloned().unwrap_or_default(),
+            "errors":receipt["errors"].as_array().cloned().unwrap_or_default(),
+            "contextChanged":receipt.pointer("/comparison/reason").is_some_and(|v| v=="context_changed"),"details":[]})
+    }
     pub fn record_dns(
         &self,
         probe: &Value,
@@ -20,8 +89,9 @@ impl ReceiptStore {
         now: f64,
     ) -> Result<Value> {
         let receipt = receipts::record_dns(probe, local, expected, now)?;
-        let _lock = self.storage.lock("observations", None)?;
+        let _lock = self.lock_observations()?;
         self.require_latest("dns-leak-receipt.json", "finished_at", &receipt)?;
+        if self.retain_success("dns-leak-receipt.json", &receipt, now) { return Ok(receipt); }
         self.storage.atomic_json(
             &self.storage.paths.base().join("dns-leak-receipt.json"),
             &receipt,
@@ -42,17 +112,31 @@ impl ReceiptStore {
         now: f64,
     ) -> Result<Value> {
         let receipt = receipts::record_webrtc(probe, local, expected, now)?;
-        let _lock = self.storage.lock("observations", None)?;
+        let _lock = self.lock_observations()?;
         self.require_latest("webrtc-risk-receipt.json", "sampled_at", &receipt)?;
+        if self.retain_success("webrtc-risk-receipt.json", &receipt, now) { return Ok(receipt); }
         self.storage.atomic_json(
             &self.storage.paths.base().join("webrtc-risk-receipt.json"),
             &receipt,
         )?;
         Ok(receipt)
     }
+    // A failed sampler is not a new network verdict. Preserve the original
+    // successful receipt and its time; callers report the failed attempt separately.
+    fn retain_success(&self, file: &str, next: &Value, now: f64) -> bool {
+        let state = next["comparison"]["state"].as_str().or_else(|| next["risk"]["state"].as_str());
+        if state != Some("unknown") { return false; }
+        let previous = self.storage.read_json(&self.storage.paths.base().join(file), Value::Null).unwrap_or(Value::Null);
+        let context = next["context_id"].as_str().unwrap_or("");
+        let ip = next["network_egress_ip"].as_str();
+        let status = if file.starts_with("dns") {
+            receipts::dns_status_for_network(&previous, &Value::Null, context, ip, false, now, |t| t.to_string())
+        } else { receipts::webrtc_status_for_network(&previous, context, ip, now) };
+        status["state"] == "ok" && receipts::network_reusable(&previous, context, ip)
+    }
     pub fn record_stun(&self, probe: &Value, context: &str, now: f64) -> Result<Value> {
         let receipt = receipts::record_stun(probe, context, now)?;
-        let _lock = self.storage.lock("observations", None)?;
+        let _lock = self.lock_observations()?;
         self.require_latest("stun-receipt.json", "sampled_at", &receipt)?;
         self.storage.atomic_json(
             &self.storage.paths.base().join("stun-receipt.json"),
@@ -120,6 +204,10 @@ impl ReceiptStore {
         now: f64,
         stamp: impl Fn(f64) -> String,
     ) -> Value {
+        self.dns_status_for_network(context, None, launch, now, stamp)
+    }
+    pub fn dns_status_for_network(&self, context: &str, current_ip: Option<&str>, launch: bool,
+        now: f64, stamp: impl Fn(f64) -> String) -> Value {
         let receipt = self
             .storage
             .read_json(
@@ -134,14 +222,24 @@ impl ReceiptStore {
                 json!({}),
             )
             .unwrap_or_else(|_| json!({}));
-        receipts::dns_status(&receipt, &cached, context, launch, now, stamp)
+        let mut status = receipts::dns_status_for_network(&receipt, &cached, context, current_ip, launch, now, stamp);
+        status["network_state"] = json!(receipts::network_state(&receipt, context, current_ip));
+        status
     }
     pub fn webrtc_status(&self, context: &str, now: f64) -> Value {
+        self.webrtc_status_for_network(context, None, now)
+    }
+    pub fn webrtc_status_for_network(&self, context: &str, current_ip: Option<&str>, now: f64) -> Value {
         match self.storage.read_json(
             &self.storage.paths.base().join("webrtc-risk-receipt.json"),
             json!({}),
         ) {
-            Ok(receipt) => receipts::webrtc_status(&receipt, context, now),
+            Ok(receipt) => {
+                let mut status = receipts::webrtc_status_for_network(&receipt, context, current_ip, now);
+                status["network_state"] = json!(receipts::network_state(&receipt, context, current_ip));
+                status["receipt"] = receipt;
+                status
+            },
             Err(_) => json!({"state":"unknown","detail":"WebRTC 回执不可读取"}),
         }
     }
@@ -196,8 +294,8 @@ impl ReceiptStore {
     }
 
     pub fn session_risk(&self, context: &str, current_ip: Option<&str>, now: f64) -> Value {
-        let dns = self.dns_status(context, true, now, |v| format!("{v:.0}"));
-        let webrtc = self.webrtc_status(context, now);
+        let dns = self.dns_status_for_network(context, current_ip, true, now, |v| format!("{v:.0}"));
+        let webrtc = self.webrtc_status_for_network(context, current_ip, now);
         let names = ["last-environment-detection.json", "last-audit.json"];
         let environment: Vec<_> = names
             .iter()

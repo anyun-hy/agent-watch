@@ -94,7 +94,7 @@ struct ResidentWebViewTests {
                    "WebRTC retains and reuses its loaded page")
             expect(rtcEvents.filter { $0 == "navigation_finished" }.count == 1 && rtcEvents.contains("view_reused"),
                    "WebRTC does not reload on each sample")
-            expect(LeakPolicy.evaluate(rtcSecond, kind: .webrtc, expected: "", now: Date().timeIntervalSince1970).state == .matched,
+            expect(rtcSecond.status == "complete" && rtcSecond.errors.isEmpty,
                    "reused WebRTC still passes the normal comparison policy")
             var cancelledRTC = 0
             rtc.start(kind: .webrtc, id: UUID()) { _ in cancelledRTC += 1 }

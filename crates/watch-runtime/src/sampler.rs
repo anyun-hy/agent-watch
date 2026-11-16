@@ -603,6 +603,9 @@ impl<R: ReadRunner> Sampler<R> {
             .as_deref()
             .and_then(|s| tag_config::controller_credentials(s).ok())
             .map(Client::new);
+        // /configs does not expose every DNS/profile setting. Bind the existing
+        // runtime configuration too, without publishing its credential-bearing text.
+        report["runtime_config_revision"] = config.as_ref().map(|s| crate::storage::sha256(s.as_bytes())).into();
         let(mut api,records)=client.as_ref().map(|c|c.snapshot(group)).unwrap_or_else(||(json!({"state":"unavailable","reason":"入口或控制接口配置未验证，未取得控制器证据","rules":{"state":"unavailable","reason":"控制接口未验证","entries":[]}}),Vec::new()));
         report["rules"] = api
             .as_object_mut()

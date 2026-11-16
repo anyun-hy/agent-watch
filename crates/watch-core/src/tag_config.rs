@@ -171,7 +171,7 @@ pub fn is_fake(ip: &str) -> bool {
     }
     .contains(ip)
 }
-pub fn fakeip_dns_config(source: &str) -> Result<(u16, FakeRange)> {
+pub fn fakeip_dns_config(source: &str) -> Result<(u16, FakeRange, String)> {
     if source.len() > CONFIG_LIMIT {
         return Err(CoreError::new("dns_config_oversize", "DNS 配置过大"));
     }
@@ -204,13 +204,17 @@ pub fn fakeip_dns_config(source: &str) -> Result<(u16, FakeRange)> {
             }
         }
     }
+    // The disk profile supplies a candidate DNS endpoint, not the live mode:
+    // TAG can load its running configuration through stdin. The collector must
+    // still prove a fake-IP mapping using this kernel's DNS and current flow.
+    let mode = values.get("enhanced-mode").map(String::as_str);
     if blocks != 1
         || values.get("enable").map(String::as_str) != Some("true")
-        || values.get("enhanced-mode").map(String::as_str) != Some("fake-ip")
+        || !matches!(mode, Some("fake-ip" | "redir-host"))
     {
         return Err(CoreError::new(
             "dns_not_fakeip",
-            "未确认唯一启用的 fake-IP DNS 配置",
+            "未确认唯一启用且模式有效的 DNS 配置",
         ));
     }
     let range = values
@@ -242,7 +246,7 @@ pub fn fakeip_dns_config(source: &str) -> Result<(u16, FakeRange)> {
             "DNS 监听地址不属于本机范围",
         ));
     }
-    Ok((port, range))
+    Ok((port, range, mode.unwrap().to_owned()))
 }
 pub fn normalized_dns_host(value: &str) -> Option<String> {
     let value = value.to_ascii_lowercase().trim_end_matches('.').to_owned();

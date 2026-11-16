@@ -91,15 +91,6 @@ struct InitializationTests {
                "notification destinations resolve to the corresponding Watch pages")
         expect(AppDelegate.notificationPage("unexpected") == nil && AppDelegate.notificationPage(nil) == nil,
                "unknown notification destinations cannot navigate")
-        for (kind, timestamp, verdict) in [(LeakKind.dns, "finished_at", "comparison"), (.webrtc, "sampled_at", "risk")] {
-            let valid: [String: Any] = ["status": "ok", "receipt": ["context_id": "context", timestamp: 123.5, verdict: ["state": "ok"]]]
-            expect(SwitcherStore.initializationReceiptMetadata(valid, kind: kind, sampledAt: 123.5)?.context == "context",
-                   "real backend response binds its context and verdict to the exact probe time")
-            expect(SwitcherStore.initializationReceiptMetadata(valid, kind: kind, sampledAt: 124) == nil,
-                   "backend response for a different probe cannot be accepted")
-            expect(SwitcherStore.initializationReceiptMetadata(["status": "ok", "receipt": [:]], kind: kind, sampledAt: 123.5) == nil,
-                   "a missing backend context or verdict cannot be accepted")
-        }
         if case .failed(let code, let detail) = FirstRunChecks.networkContextFailure(bound: "A", current: nil, timeoutStage: "dns_images") {
             expect(code == "context_unavailable" && detail.contains("超时") && !detail.contains("已变化"),
                    "a sampling gap does not hide the DNS timeout or claim a confirmed change")
@@ -310,18 +301,19 @@ struct InitializationTests {
         leaks.fixtureDelayNanoseconds = 1_000_000
         var context = "fixture-A"
         leaks.contextProvider = { context }; leaks.automaticContextProvider = { context }
-        leaks.onDNSComplete = { _, _ in true }
-        leaks.onWebRTCComplete = { _, _ in false }
-        let dnsAccepted = await leaks.ensureInitializationReceipt(.dns, maximumWait: 1)
+        leaks.evidenceTransport = { request in
+            if request.kinds == ["webrtc"] { throw LeakEvidenceFailure(code: "receipt_rejected", detail: "后台未采纳") }
+            return try leaks.fixtureReply(request)
+        }
+        let dnsAccepted = await leaks.ensureInitializationReceipt(.dns)
         expect(dnsAccepted && leaks.initializationReceiptIsCurrent(.dns), "DNS page and onboarding use the actual same recorded result")
-        let unrecordedRTC = await leaks.ensureInitializationReceipt(.webrtc, maximumWait: 1)
-        expect(!unrecordedRTC && leaks.rtc.verdict.state == .matched, "a locally green WebRTC probe cannot pass without an accepted backend receipt")
-        leaks.onWebRTCComplete = { _, _ in true }
-        let recordedRTC = await leaks.ensureInitializationReceipt(.webrtc, maximumWait: 1)
+        let unrecordedRTC = await leaks.ensureInitializationReceipt(.webrtc)
+        expect(!unrecordedRTC && leaks.rtc.verdict.state == .incomplete, "a rejected backend reply cannot create a local green WebRTC result")
+        leaks.evidenceTransport = nil
+        let recordedRTC = await leaks.ensureInitializationReceipt(.webrtc)
         expect(recordedRTC && leaks.initializationReceiptIsCurrent(.webrtc), "accepted WebRTC receipt completes its mandatory check")
         let dnsSampleTime = leaks.dns.result!.finishedAt
-        leaks.adoptInitializationReceipts()
-        leaks.refreshWebRTCIfNeeded()
+        leaks.now = Date()
         expect(!leaks.rtc.running && leaks.dns.result!.finishedAt == dnsSampleTime, "handoff reuses checked data without immediately starting duplicate probes or renewing timestamps")
         context = "fixture-B"
         expect(!leaks.initializationReceiptIsCurrent(.dns) && !leaks.initializationReceiptIsCurrent(.webrtc), "changed proxy context invalidates both receipts")
@@ -330,7 +322,7 @@ struct InitializationTests {
         expect(leaks.initializationReceiptProblem(.dns, at: Date(timeIntervalSince1970: dnsSampleTime + 301))?.code == "dns_expired",
                "expired evidence identifies the specific failing prerequisite")
         leaks.fixtureScenario = .difference
-        let realRisk = await leaks.ensureInitializationReceipt(.dns, maximumWait: 1)
+        let realRisk = await leaks.ensureInitializationReceipt(.dns)
         // Force a new round rather than reusing the recent passing receipt.
         leaks.start(.dns)
         try await Task.sleep(nanoseconds: 200_000_000)
@@ -491,7 +483,6 @@ struct InitializationTests {
         recovery.beginInitialization(startSnapshotPolling: false)
         recovery.automatic = false
         recovery.leakChecks.fixtureDelayNanoseconds = 1_000_000
-        recovery.leakChecks.onDNSComplete = { _, _ in true }
         let base = Date()
         // The outer snapshot is current; only its independently sampled proxy
         // evidence is nine seconds old. An old whole snapshot (TTL 8s) cannot
@@ -500,7 +491,7 @@ struct InitializationTests {
         expect(recovery.initializationContext == nil, "an expired whole snapshot cannot start a new diagnostic receipt")
         recovery.acceptSnapshot(snapshot(node: "A", at: base.timeIntervalSince1970,
                                          proxyObservedAt: base.timeIntervalSince1970 - 9), receivedAt: base)
-        let acceptedBeforeGap = await recovery.leakChecks.ensureInitializationReceipt(.dns, maximumWait: 1)
+        let acceptedBeforeGap = await recovery.leakChecks.ensureInitializationReceipt(.dns)
         expect(acceptedBeforeGap, "fresh receipt starts in the verified proxy context")
         let afterGap = base.addingTimeInterval(2)
         recovery.monitorTick(at: afterGap)
@@ -554,6 +545,35 @@ struct InitializationTests {
         expect(full.approval?.action == .protection && full.passedCount == 6 &&
                fullLeaks.initializationReceiptIsCurrent(.dns) && fullLeaks.initializationReceiptIsCurrent(.webrtc),
                "full flow carries the actual two accepted fixture receipts into guard confirmation")
+        let retainedDNS = fullLeaks.dns.result!.finishedAt
+        let retainedRTC = fullLeaks.rtc.result!.finishedAt
+        let freshAudit = fullSwitcher.currentEnvironment!.observed_at
+        await full.retry()
+        expect(full.approval?.action == .protection && fullSwitcher.currentEnvironment!.observed_at == freshAudit,
+               "a current backend audit is reused without an unnecessary environment refresh")
+        let expiredApproval = full.approval!
+        fullSwitcher.setInitializationAuditExpiryForFixture(Date().timeIntervalSince1970 - 1)
+        expect(fullSwitcher.currentEnvironment!.expires_at > Date().timeIntervalSince1970,
+               "the display window is still current when the protection audit expires")
+        await full.authorize(expiredApproval)
+        expect(full.rows[6].code == "environment_receipt_unavailable" &&
+               fullSwitcher.settings["guard_enabled"] as? Bool != true,
+               "expiry while awaiting confirmation cannot enable guard using the display deadline")
+        await full.retry()
+        expect(full.approval?.action == .protection && fullSwitcher.currentEnvironment!.observed_at > freshAudit &&
+               fullSwitcher.currentEnvironment!.audit_expires_at! > Date().timeIntervalSince1970,
+               "retry refreshes an expired audit even while its display receipt remains current")
+        expect(fullLeaks.dns.result!.finishedAt == retainedDNS && fullLeaks.rtc.result!.finishedAt == retainedRTC &&
+               fullSwitcher.currentEnvironment!.initialization_receipts?.dns?.sampled_at == retainedDNS &&
+               fullSwitcher.currentEnvironment!.initialization_receipts?.webrtc?.sampled_at == retainedRTC,
+               "same-network audit refresh preserves both accepted probe results and original sample times")
+        let refreshedAudit = fullSwitcher.currentEnvironment!.observed_at
+        fullSwitcher.setInitializationAuditExpiryForFixture(nil)
+        await full.retry()
+        expect(full.approval?.action == .protection && fullSwitcher.currentEnvironment!.observed_at > refreshedAudit,
+               "a legacy receipt without the source deadline is refreshed instead of trusting its display window")
+        expect(fullLeaks.dns.result!.finishedAt == retainedDNS && fullLeaks.rtc.result!.finishedAt == retainedRTC,
+               "refreshing a missing audit deadline does not recollect same-network DNS or WebRTC")
         let mismatchedApproval = full.approval!
         fullSwitcher.setInitializationReceiptForFixture(.webrtc, context: "different-backend-network", state: "ok")
         full.refreshReadiness()
@@ -645,7 +665,7 @@ struct InitializationTests {
         for _ in 0..<300 where full.running { try await Task.sleep(nanoseconds: 10_000_000) }
         expect(full.rows[4].status == .failed && !full.canEnter(at: Date().timeIntervalSince1970),
                "an automatic DNS failure is visible and cannot reuse the previous green")
-        fullSwitcher.receiptCommandFixture = { _, _ in
+        fullLeaks.evidenceTransport = { _ in
             try JSONSerialization.data(withJSONObject: ["status": "error", "code": "invalid_dns_receipt",
                                                         "message": "回执契约测试拒绝"])
         }
@@ -653,7 +673,7 @@ struct InitializationTests {
         for _ in 0..<300 where full.running { try await Task.sleep(nanoseconds: 10_000_000) }
         expect(full.rows[4].status == .failed && full.rows[4].detail.contains("回执契约测试拒绝"),
                "a backend receipt rejection stays visible when the probe also timed out")
-        fullSwitcher.receiptCommandFixture = nil
+        fullLeaks.evidenceTransport = nil
         fullLeaks.fixtureScenario = .matched
         full.refreshReadiness(at: Date().addingTimeInterval(31))
         for _ in 0..<300 where full.running { try await Task.sleep(nanoseconds: 10_000_000) }

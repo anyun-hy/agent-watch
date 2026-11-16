@@ -30,22 +30,10 @@ names = ("watch-leak-worker", "watch-engine", "netcoffee_probe.html", "netcoffee
 value["RuntimeHashes"] = {name: hashlib.sha256((root / name).read_bytes()).hexdigest() for name in names}
 manifest.write_bytes(plistlib.dumps(value))
 PY
-cat > "$CW_TEST_PARENT/LeakPolicyCheck.swift" <<'SWIFT'
-import Foundation
-@main struct LeakPolicyCheck {
-static func main() throws {
-let receipt = try JSONDecoder().decode(LeakProbeResult.self, from: FileHandle.standardInput.readDataToEndOfFile())
-let verdict = LeakPolicy.evaluate(receipt, kind: .dns, expected: "", now: Date().timeIntervalSince1970)
-let output: [String: Any] = ["verdict": verdict.state.rawValue, "http_count": receipt.observations.filter { $0.kind == "http" }.count, "resolver_count": receipt.observations.filter { $0.kind == "resolver" }.count, "error_stages": Array(Set(receipt.errors.map(\.stage))).sorted(), "error_codes": Array(Set(receipt.errors.map(\.code))).sorted()]
-FileHandle.standardOutput.write(try JSONSerialization.data(withJSONObject: output, options: [.sortedKeys]))
-}
-}
-SWIFT
-xcrun swiftc -swift-version 5 -parse-as-library -target "arm64-apple-macosx$CW_MACOS_MINIMUM" -module-cache-path "$CW_TEST_CACHE" "$ROOT/Sources/IdentityPresentation.swift" "$ROOT/Sources/LeakCheckModels.swift" "$CW_TEST_PARENT/LeakPolicyCheck.swift" -o "$CW_TEST_PARENT/leak-policy-check"
-python3 - "$CW_TEST_RUNTIME" "$CW_TEST_HOME" "$CW_TEST_PARENT/leak-policy-check" <<'PY'
+python3 - "$CW_TEST_RUNTIME" "$CW_TEST_HOME" <<'PY'
 import json, os, signal, subprocess, sys, time
 from pathlib import Path
-runtime, home, checker = map(Path, sys.argv[1:])
+runtime, home = map(Path, sys.argv[1:])
 env = dict(os.environ); env["HOME"] = str(home)
 started = time.monotonic()
 child = subprocess.Popen([str(runtime / "watch-leak-worker"), "--dns"], cwd=runtime, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
@@ -61,7 +49,10 @@ lines = stdout.splitlines()
 if child.returncode != 0 or len(lines) != 1: raise SystemExit("live DNS helper did not return one bounded receipt")
 receipt = json.loads(lines[0])
 if receipt.get("kind") != "dns": raise SystemExit("live DNS helper returned the wrong result kind")
-policy = json.loads(subprocess.run([str(checker)], input=lines[0], text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=5, check=True).stdout)
+policy = {"http_count": sum(row.get("kind") == "http" for row in receipt.get("observations", [])),
+          "resolver_count": sum(row.get("kind") == "resolver" for row in receipt.get("observations", [])),
+          "error_stages": sorted({row.get("stage", "") for row in receipt.get("errors", [])}),
+          "error_codes": sorted({row.get("code", "") for row in receipt.get("errors", [])})}
 allowed = {"collector", "http", "dns", "dns_images", "dns_records", "geoip", "ice"}; timeline=[]
 for line in stderr.splitlines():
     try: event=json.loads(line)
@@ -70,7 +61,7 @@ for line in stderr.splitlines():
     if phase in allowed and isinstance(at,(int,float)) and 0 <= at <= 75000:
         timeline.append({"phase":phase,"event":event.get("event") if event.get("event") in ("start", "complete", "failure") else None,"elapsed_ms":int(at)})
 bridge = [line for line in stderr.splitlines() if line in ("IPLeak bridge: navigation allow", "IPLeak bridge: navigation reject", "IPLeak bridge: didFinish", "IPLeak bridge: navigation failed", "IPLeak bridge: provisional navigation failed", "IPLeak bridge: received message")]
-print(json.dumps({"kind":"dns","status":receipt.get("status"),"elapsed_ms":elapsed,"http_count":policy["http_count"],"resolver_count":policy["resolver_count"],"verdict":policy["verdict"],"error_stages":policy["error_stages"],"error_codes":policy["error_codes"],"phase_timeline":timeline,"bridge_events":bridge[:30],"temporary_home_mode":oct(home.stat().st_mode & 0o777)}, ensure_ascii=False, separators=(",",":")))
-if receipt.get("status") != "complete" or policy["verdict"] not in ("matched", "difference"):
+print(json.dumps({"kind":"dns","status":receipt.get("status"),"elapsed_ms":elapsed,"http_count":policy["http_count"],"resolver_count":policy["resolver_count"],"error_stages":policy["error_stages"],"error_codes":policy["error_codes"],"phase_timeline":timeline,"bridge_events":bridge[:30],"temporary_home_mode":oct(home.stat().st_mode & 0o777)}, ensure_ascii=False, separators=(",",":")))
+if receipt.get("status") != "complete" or not policy["http_count"] or not policy["resolver_count"]:
     raise SystemExit("live DNS observation did not complete; see the summary above")
 PY

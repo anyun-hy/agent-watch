@@ -5,226 +5,68 @@ import Combine
 import Darwin
 #endif
 
-struct AIProcessIdentity: Equatable, Sendable {
+/// Native identity binding only; target selection and exit confirmation are Rust services.
+struct AIProcessIdentity: Codable, Equatable, Sendable {
     let pid, parent: Int32
     let uid: UInt32
     let startSeconds, startMicroseconds: UInt64
     let executable: String
-    /// Kernel audit token words (including monotonically increasing pidversion)
-    /// when obtainable via the public Mach task-name port API. Distinguishes
-    /// in-place exec replacements that keep the same PID, start timestamp, and
-    /// executable path on XNU.
     var auditToken: [UInt32]? = nil
-    var rootProduct: MonitoredProduct? = nil
-    var desktopMain = false
+    enum CodingKeys: String, CodingKey {
+        case pid, uid
+        case parent = "ppid", startSeconds = "start_seconds", startMicroseconds = "start_microseconds"
+        case executable = "executable_path", auditToken = "audit_token"
+    }
     func sameProcess(as other: Self) -> Bool {
         pid == other.pid && uid == other.uid && startSeconds == other.startSeconds
             && startMicroseconds == other.startMicroseconds && executable == other.executable
             && auditToken == other.auditToken
     }
 }
+enum AIProcessInventoryFailure: Error {
+    case malformed, engineUnavailable, timeout, outputTooLarge, readFailed, commandFailed
+}
 struct AIProcessClosePlan: Sendable {
     let product: MonitoredProduct
-    let uid: UInt32
     let targets: [AIProcessIdentity]
-    let protected: Set<Int32>
-}
-/// A failed identity read is not proof that a process exited.
-enum AIProcessPresence {
-    case live(AIProcessIdentity)
-    case gone
-    case unavailable
-}
-struct AIProcessExitEvidence {
-    let remaining: [AIProcessIdentity]
-    let unconfirmed: Int
-    var complete: Bool { remaining.isEmpty && unconfirmed == 0 }
-}
-enum AIProcessInventoryFailure: Error {
-    case malformed, incomplete, stale, identityChanged, engineUnavailable
-    case timeout, outputTooLarge, readFailed, commandFailed
-}
-/// Wire decoding and identity binding only. Product classification belongs to Rust's sampler.
-struct AIProcessClassificationBatch: Decodable {
-    struct Identity: Decodable {
-        let pid, parent: Int32
-        let uid: UInt32
-        let executable: String
-        let start_seconds, start_microseconds: UInt64
-        func matches(_ value: AIProcessIdentity) -> Bool {
-            pid == value.pid && uid == value.uid && executable == value.executable
-                && start_seconds == value.startSeconds && start_microseconds == value.startMicroseconds
+    let requestID: String
+    let payload: Data
+    let force: Bool
+
+    private struct Wire: Decodable {
+        struct Target: Decodable { let process: AIProcessIdentity; let desktop_main: Bool }
+        let schema: Int
+        let force: Bool?
+        let request_id, family: String
+        let targets: [Target]
+    }
+    static func decode(_ data: Data, product: MonitoredProduct) throws -> Self {
+        let wire = try JSONDecoder().decode(Wire.self, from: data)
+        guard wire.schema == 1, wire.family == family(product), UUID(uuidString: wire.request_id) != nil else {
+            throw AIProcessInventoryFailure.malformed
         }
+        return .init(product: product, targets: wire.targets.map(\.process), requestID: wire.request_id, payload: data, force: wire.force ?? false)
     }
-    struct Target: Decodable {
-        let identity: Identity
-        let product: String
-        let desktop_main: Bool
-    }
+    static func family(_ product: MonitoredProduct) -> String { product == .claude ? "claude" : "openai" }
+}
+struct AIProcessExitReceipt: Decodable {
     let schema: Int
-    let status, mode, state: String
-    let uid: UInt32
-    let observed_at: TimeInterval
-    let grants_launch_permission, grants_close_permission: Bool
-    let targets: [Target]
-
-    static func apply(_ data: Data, to before: [AIProcessIdentity], uid: UInt32, now: TimeInterval,
-                      lookup: (Int32) -> AIProcessPresence) throws -> [AIProcessIdentity] {
-        let batch = try JSONDecoder().decode(Self.self, from: data)
-        guard batch.schema == 1, batch.status == "ok", batch.mode == "read_only", batch.uid == uid,
-              !batch.grants_launch_permission, !batch.grants_close_permission,
-              batch.targets.count <= 65_536 else { throw AIProcessInventoryFailure.malformed }
-        guard batch.state == "ok" else { throw AIProcessInventoryFailure.incomplete }
-        guard batch.observed_at.isFinite, batch.observed_at > 0,
-              batch.observed_at <= now + 2, now - batch.observed_at <= 20 else {
-            throw AIProcessInventoryFailure.stale
-        }
-        var inventory = before
-        var indices: [Int32: Int] = [:]
-        for index in inventory.indices {
-            guard indices.updateValue(index, forKey: inventory[index].pid) == nil else {
-                throw AIProcessInventoryFailure.malformed
-            }
-            inventory[index].rootProduct = nil; inventory[index].desktopMain = false
-        }
-        var seen = Set<Int32>()
-        for target in batch.targets {
-            let expected = target.identity
-            guard expected.pid > 1, expected.uid == uid, expected.start_seconds > 0,
-                  expected.start_microseconds < 1_000_000, expected.executable.hasPrefix("/"),
-                  seen.insert(expected.pid).inserted else { throw AIProcessInventoryFailure.malformed }
-            let product: MonitoredProduct
-            switch target.product {
-            case "claude": product = .claude
-            case "openai": product = .openAI
-            default: throw AIProcessInventoryFailure.malformed
-            }
-            guard let index = indices[expected.pid],
-                  expected.matches(before[index]) else { throw AIProcessInventoryFailure.identityChanged }
-            switch lookup(expected.pid) {
-            case .gone: continue
-            case .unavailable: throw AIProcessInventoryFailure.identityChanged
-            case .live(let current):
-                // The native audit token brackets the entire Rust classification batch.
-                guard before[index].sameProcess(as: current) else { throw AIProcessInventoryFailure.identityChanged }
-                inventory[index] = current
-                inventory[index].rootProduct = product
-                inventory[index].desktopMain = target.desktop_main
-            }
-        }
-        return inventory
+    let request_id, family, code, message: String
+    let complete: Bool
+    static func decode(_ data: Data, plan: AIProcessClosePlan) throws -> Self {
+        let receipt = try JSONDecoder().decode(Self.self, from: data)
+        guard receipt.schema == 1, receipt.request_id == plan.requestID,
+              receipt.family == AIProcessClosePlan.family(plan.product) else { throw AIProcessInventoryFailure.malformed }
+        return receipt
     }
 }
-enum AIProcessCloseScope: Equatable, Sendable {
-    case desktopBundleOnly
-    case allProductProcesses
-}
-enum AIProcessClosePolicy {
-    static func automaticDesktopScope(for product: MonitoredProduct) -> AIProcessCloseScope {
-        switch product {
-        // A bare binary named like Claude is not a Claude desktop install;
-        // automatic desktop supervision scopes Claude to its .app bundle tree.
-        case .claude: return .desktopBundleOnly
-        // ChatGPT / Codex also runs as an independent CLI or daemon without an
-        // .app bundle, so automatic OpenAI family supervision covers all
-        // attributed OpenAI processes.
-        case .openAI: return .allProductProcesses
-        }
-    }
-    static func manualCloseScope(for product: MonitoredProduct) -> AIProcessCloseScope {
-        .allProductProcesses
-    }
-    static func scopedInventory(_ inventory: [AIProcessIdentity], for product: MonitoredProduct,
-                                scope: AIProcessCloseScope) -> [AIProcessIdentity] {
-        guard scope == .desktopBundleOnly else { return inventory }
-        var scoped = inventory
-        for index in scoped.indices {
-            if scoped[index].rootProduct == product && !scoped[index].executable.contains(".app/Contents/") {
-                scoped[index].rootProduct = nil
-                scoped[index].desktopMain = false
-            }
-        }
-        return scoped
-    }
-    static func plan(_ product: MonitoredProduct, inventory: [AIProcessIdentity], uid: UInt32,
-                     protected: Set<Int32>) -> AIProcessClosePlan {
-        let owned = inventory.filter { $0.uid == uid && $0.pid > 1 && !protected.contains($0.pid) }
-        var ids = Set(owned.filter { $0.rootProduct == product }.map(\.pid))
-        while true {
-            let next = ids.union(owned.filter { ids.contains($0.parent) && ($0.rootProduct == nil || $0.rootProduct == product) }.map(\.pid))
-            if next == ids { break }; ids = next
-        }
-        return .init(product: product, uid: uid,
-                     targets: owned.filter { ids.contains($0.pid) }.sorted { $0.pid < $1.pid }, protected: protected)
-    }
-    /// Read-only completion evidence; this never creates new signal authority.
-    /// Retain the original identities even after reparenting, and include newly
-    /// observed family members only in the report, not in forceRemaining().
-    static func exitEvidence(_ original: AIProcessClosePlan, inventory: [AIProcessIdentity],
-                             lookup: (Int32) -> AIProcessPresence) -> AIProcessExitEvidence {
-        let fresh = plan(original.product, inventory: inventory, uid: original.uid,
-                         protected: original.protected)
-        var samples: [Int32: AIProcessPresence] = [:]
-        var live: [Int32: AIProcessIdentity] = [:]
-        var unknown = Set<Int32>()
-        for expected in original.targets + fresh.targets {
-            guard expected.pid > 1, expected.uid == original.uid,
-                  !original.protected.contains(expected.pid) else { continue }
-            let sample: AIProcessPresence
-            if let cached = samples[expected.pid] { sample = cached }
-            else { sample = lookup(expected.pid); samples[expected.pid] = sample }
-            switch sample {
-            case .live(let actual):
-                if expected.sameProcess(as: actual) { live[actual.pid] = actual }
-            case .gone: break
-            case .unavailable: unknown.insert(expected.pid)
-            }
-        }
-        return .init(remaining: live.values.sorted { $0.pid < $1.pid }, unconfirmed: unknown.count)
-    }
-    static func execute(_ plan: AIProcessClosePlan, lookup: (Int32) -> AIProcessIdentity?,
-                        quitApplication: (AIProcessIdentity) -> Bool, terminate: (AIProcessIdentity) -> Bool) -> (requested: Int, skipped: Int, failed: Int) {
-        var requested = 0, skipped = 0, failed = 0
-        // Roots are asked to quit normally. No SIGKILL or privileged helper is used.
-        for target in plan.targets.sorted(by: { $0.desktopMain && !$1.desktopMain }) {
-            guard target.uid == plan.uid, !plan.protected.contains(target.pid), target.pid > 1,
-                  let live = lookup(target.pid), target.sameProcess(as: live),
-                  // A second immediate read narrows the PID-reuse interval
-                  // between plan validation and the side effect. It cannot
-                  // make a PID-only Darwin signal an atomic identity operation.
-                  let latest = lookup(target.pid), target.sameProcess(as: latest) else { skipped += 1; continue }
-            let accepted = target.desktopMain ? quitApplication(target) : terminate(target)
-            if accepted { requested += 1 } else { failed += 1 }
-        }
-        return (requested, skipped, failed)
-    }
-    /// The effect adapter is given the originally authorised identity, not
-    /// only its PID. Recheck at the actual side-effect boundary so a changed
-    /// process is never accepted merely because it passed an earlier poll.
-    /// No macOS PID-based signal is an atomic identity-conditional syscall.
+/// Immediate recheck at the AppKit effect boundary; no selection, waiting or fallback.
+enum AIProcessNativeAction {
     static func applyToMatchingIdentity(_ expected: AIProcessIdentity,
-                                        lookup: (Int32) -> AIProcessIdentity?,
-                                        effect: (Int32) -> Bool) -> Bool {
-        guard expected.pid > 1, let current = lookup(expected.pid),
-              expected.sameProcess(as: current) else { return false }
+        lookup: (Int32) -> AIProcessIdentity?, effect: (Int32) -> Bool) -> Bool {
+        guard expected.pid > 1, expected.auditToken?.count == 8,
+              let current = lookup(expected.pid), expected.sameProcess(as: current) else { return false }
         return effect(expected.pid)
-    }
-
-    /// Only the exact identities from the original, verified plan are eligible.
-    /// Observed PID reuse and new processes are skipped; the final identity
-    /// read narrows but cannot eliminate the non-atomic Darwin signal window.
-    /// Whether force is allowed at all is decided upstream by the policy
-    /// table; this routine only verifies identity, for any product.
-    static func forceRemaining(_ plan: AIProcessClosePlan, lookup: (Int32) -> AIProcessIdentity?,
-                               force: (AIProcessIdentity) -> Bool) -> (requested: Int, skipped: Int, failed: Int) {
-        var requested = 0, skipped = 0, failed = 0
-        for target in plan.targets {
-            guard target.uid == plan.uid, !plan.protected.contains(target.pid), target.pid > 1,
-                  let live = lookup(target.pid), target.sameProcess(as: live),
-                  let latest = lookup(target.pid), target.sameProcess(as: latest) else { skipped += 1; continue }
-            if force(target) { requested += 1 } else { failed += 1 }
-        }
-        return (requested, skipped, failed)
     }
 }
 
@@ -274,74 +116,15 @@ enum AIProcessInventory {
                      startSeconds: confirm.pbi_start_tvsec, startMicroseconds: confirm.pbi_start_tvusec,
                      executable: String(cString: path), auditToken: beforeWords)
     }
-    static func presence(_ pid: Int32) -> AIProcessPresence {
-        if let live = identity(pid) { return .live(live) }
-        // Signal 0 checks existence only; no signal is delivered. Permission
-        // and metadata failures stay unknown rather than becoming a false exit.
-        if pid > 1, Darwin.kill(pid, 0) == -1, errno == ESRCH { return .gone }
-        return .unavailable
-    }
-    static let maximumReadSeconds: TimeInterval = 8
-    static func read(engine explicitEngine: URL? = nil, timeout: TimeInterval = maximumReadSeconds) throws -> [AIProcessIdentity] {
-        let deadline = ProcessInfo.processInfo.systemUptime + timeout
-        let listing = try command(URL(fileURLWithPath: "/bin/ps"), arguments: ["-axo", "pid="], deadline: deadline)
-        let before = String(decoding: listing, as: UTF8.self).split(whereSeparator: \.isWhitespace)
-            .compactMap { Int32($0) }.compactMap(identity)
-        let engine = try classificationEngine(explicitEngine)
-        let data = try command(engine, arguments: ["observe", "--processes-only", "--home",
-            FileManager.default.homeDirectoryForCurrentUser.path], deadline: deadline)
-        return try AIProcessClassificationBatch.apply(data, to: before, uid: getuid(),
-                                                      now: Date().timeIntervalSince1970, lookup: presence)
-    }
-    private static func classificationEngine(_ explicit: URL?) throws -> URL {
-        #if PROCESS_HELPER
-        guard let own = Bundle.main.executableURL else { throw AIProcessInventoryFailure.engineUnavailable }
-        let packaged = own.deletingLastPathComponent().appendingPathComponent("watch-engine").standardizedFileURL
-        let candidate = explicit?.standardizedFileURL ?? packaged
-        if let explicit {
-            guard explicit.path.hasPrefix("/"),
-                  let parent = identity(getppid()), parent.uid == getuid(),
-                  parent.executable == candidate.path,
-                  let latest = identity(parent.pid), parent.sameProcess(as: latest) else {
-                throw AIProcessInventoryFailure.engineUnavailable
-            }
-        }
-        if candidate != packaged {
-            #if PROCESS_HELPER_DEVELOPMENT
-            guard explicit != nil, candidate.path == ProcessHelperDevelopment.enginePath else {
-                throw AIProcessInventoryFailure.engineUnavailable
-            }
-            #else
-            throw AIProcessInventoryFailure.engineUnavailable
-            #endif
-        }
-        #else
-        guard explicit == nil, let candidate = Bundle.main.url(forResource: "watch-engine", withExtension: nil) else {
-            throw AIProcessInventoryFailure.engineUnavailable
-        }
-        #endif
-        guard FileManager.default.isExecutableFile(atPath: candidate.path) else {
-            throw AIProcessInventoryFailure.engineUnavailable
-        }
-        return candidate
-    }
-    static func protectedIDs(in inventory: [AIProcessIdentity], backendPID: Int?) -> Set<Int32> {
-        var result: Set<Int32> = [1, getpid()]
-        var current = getpid()
-        for _ in 0..<64 {
-            guard let parent = inventory.first(where: { $0.pid == current })?.parent, parent > 0,
-                  result.insert(parent).inserted else { break }; current = parent
-        }
-        if let pid = backendPID, pid > 1, pid <= Int(Int32.max) { result.insert(Int32(pid)) }
-        return result
-    }
-    /// One bounded synchronous boundary for both inventory commands. No reader or timer thread survives it.
+    /// One bounded subprocess boundary. No reader or timer thread survives it.
     static func command(_ executable: URL, arguments: [String], deadline: TimeInterval,
-                        maxBytes: Int = 4_000_000) throws -> Data {
+                        maxBytes: Int = 4_000_000, input: Data? = nil) throws -> Data {
         let task = Process(), pipe = Pipe()
         task.executableURL = executable; task.arguments = arguments
         task.environment = ["PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "LC_ALL": "C"]
-        task.standardInput = FileHandle.nullDevice
+        let inputPipe = input.map { _ in Pipe() }
+        if let inputPipe { task.standardInput = inputPipe }
+        else { task.standardInput = FileHandle.nullDevice }
         task.standardOutput = pipe; task.standardError = FileHandle.nullDevice
         let handle = pipe.fileHandleForReading
         let descriptor = handle.fileDescriptor
@@ -356,6 +139,23 @@ enum AIProcessInventory {
             if task.isRunning { _ = Darwin.kill(task.processIdentifier, SIGKILL) }
             task.waitUntilExit()
             try? handle.close()
+        }
+        if let input, let inputPipe {
+            let writer = inputPipe.fileHandleForWriting
+            defer { try? writer.close() }
+            let fd = writer.fileDescriptor
+            guard fcntl(fd, F_SETFL, O_NONBLOCK) >= 0, fcntl(fd, F_SETNOSIGPIPE, 1) >= 0 else {
+                throw AIProcessInventoryFailure.readFailed
+            }
+            var sent = 0
+            while sent < input.count {
+                guard ProcessInfo.processInfo.systemUptime < deadline else { throw AIProcessInventoryFailure.timeout }
+                let count = input.withUnsafeBytes { Darwin.write(fd, $0.baseAddress!.advanced(by: sent), input.count - sent) }
+                if count > 0 { sent += count; continue }
+                guard count < 0 && (errno == EAGAIN || errno == EINTR) else { throw AIProcessInventoryFailure.readFailed }
+                var writable = pollfd(fd: fd, events: Int16(POLLOUT), revents: 0)
+                _ = poll(&writable, 1, 20)
+            }
         }
         var data = Data(), buffer = [UInt8](repeating: 0, count: 65_536)
         var eof = false
@@ -385,72 +185,59 @@ enum AIProcessInventory {
         return data
     }
 
+    static func runEngine(_ args: [String], input: Data? = nil, timeout: TimeInterval) throws -> Data {
+        guard let engine = Bundle.main.url(forResource: "watch-engine", withExtension: nil),
+              FileManager.default.isExecutableFile(atPath: engine.path) else { throw AIProcessInventoryFailure.engineUnavailable }
+        return try command(engine, arguments: args, deadline: ProcessInfo.processInfo.systemUptime + timeout, input: input)
+    }
 }
 
 #if !PROCESS_HELPER
 @MainActor
 final class AIProcessControl: ObservableObject {
+    typealias Command = @Sendable ([String], Data?, TimeInterval) throws -> Data
     @Published private(set) var busy = false
     let isFixture: Bool
-    init(isFixture: Bool = false) {
+    private let command: Command
+    init(isFixture: Bool = false, command: @escaping Command = { args, input, timeout in
+        try AIProcessInventory.runEngine(args, input: input, timeout: timeout)
+    }) {
         #if UI_REVIEW
         self.isFixture = true
         #else
         self.isFixture = isFixture
         #endif
+        self.command = command
     }
     func prepare(_ product: MonitoredProduct, sampled: [WatchedProcess], backendPID: Int?) async throws -> AIProcessClosePlan {
         guard !busy else { throw CancellationError() }
         busy = true; defer { busy = false }
         if isFixture {
-            return .init(product: product, uid: getuid(), targets: sampled.filter { $0.product == product }.map {
+            return .init(product: product, targets: sampled.filter { $0.product == product }.map {
                 .init(pid: Int32($0.pid), parent: 1, uid: getuid(), startSeconds: 1, startMicroseconds: 0, executable: "/mock/" + $0.name)
-            }, protected: [])
+            }, requestID: UUID().uuidString, payload: Data(), force: true)
         }
-        return try await Task.detached(priority: .userInitiated) {
-            let inventory = AIProcessClosePolicy.scopedInventory(
-                try AIProcessInventory.read(),
-                for: product,
-                scope: AIProcessClosePolicy.manualCloseScope(for: product)
-            )
-            return AIProcessClosePolicy.plan(product, inventory: inventory, uid: getuid(),
-                protected: AIProcessInventory.protectedIDs(in: inventory, backendPID: backendPID))
-        }.value
+        var args = ["process-exit", "prepare", "--force", "--family", AIProcessClosePlan.family(product)]
+        if let pid = backendPID, pid > 1 { args += ["--protect-pid", String(pid)] }
+        let run = command, arguments = args
+        let data = try await Task.detached(priority: .userInitiated) { try run(arguments, nil, 20) }.value
+        let plan = try AIProcessClosePlan.decode(data, product: product)
+        guard plan.force else { throw AIProcessInventoryFailure.malformed }
+        return plan
     }
     func execute(_ plan: AIProcessClosePlan) async -> String {
+        guard plan.force else { return "退出方式未确认：此按钮需要后台生成的强制结束计划。" }
         guard !busy else { return "已有关闭操作正在进行。" }
         busy = true; defer { busy = false }
-        if isFixture { return "模拟关闭 \(plan.targets.count) 个 \(plan.product.title) 进程；未向任何系统进程发送退出请求。" }
-        let outcome = await Task.detached(priority: .userInitiated) {
-            AIProcessClosePolicy.execute(plan, lookup: AIProcessInventory.identity,
-                quitApplication: { expected in
-                    AIProcessClosePolicy.applyToMatchingIdentity(expected, lookup: AIProcessInventory.identity) {
-                        NSRunningApplication(processIdentifier: $0)?.terminate() ?? false
-                    }
-                },
-                terminate: { expected in
-                    AIProcessClosePolicy.applyToMatchingIdentity(expected, lookup: AIProcessInventory.identity) {
-                        Darwin.kill($0, SIGTERM) == 0
-                    }
-                })
-        }.value
-        try? await Task.sleep(nanoseconds: 1_200_000_000)
+        if isFixture { return "模拟强制结束 \(plan.targets.count) 个 \(plan.product.title) 进程；未向任何系统进程发送信号。" }
         do {
-            let evidence = try await Task.detached {
-                let inventory = AIProcessClosePolicy.scopedInventory(
-                    try AIProcessInventory.read(),
-                    for: plan.product,
-                    scope: AIProcessClosePolicy.manualCloseScope(for: plan.product)
-                )
-                return AIProcessClosePolicy.exitEvidence(plan, inventory: inventory,
-                                                         lookup: AIProcessInventory.presence)
+            let run = command
+            let data = try await Task.detached(priority: .userInitiated) {
+                try run(["process-exit", "apply", "--apply", "--force"], plan.payload, 45)
             }.value
-            return evidence.complete
-                ? "当前未检测到 \(plan.product.title) 相关进程。退出请求 \(outcome.requested) 项，身份变化跳过 \(outcome.skipped) 项。"
-                : "仍有 \(evidence.remaining.count) 个 \(plan.product.title) 进程，另有 \(evidence.unconfirmed) 项身份无法复核。退出请求 \(outcome.requested) 项，失败 \(outcome.failed) 项；未确认全部退出。"
-        } catch { return "已发送 \(outcome.requested) 项退出请求，但无法复核是否全部退出。" }
+            return try AIProcessExitReceipt.decode(data, plan: plan).message
+        } catch { return "退出结果未确认：\(error.localizedDescription)" }
     }
 }
 #endif
-
-#endif // !PROCESS_POLICY_TESTS
+#endif

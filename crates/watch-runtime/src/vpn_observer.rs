@@ -425,7 +425,12 @@ impl HttpControllerVpnReader {
         self
     }
 
-    pub fn with_listener_snapshot_probe(mut self, probe: ListenerSnapshotProbe) -> Self {
+    pub fn with_listener_snapshot_probe(self, probe: Box<dyn Fn(Duration) -> Option<KernelListenerSnapshot> + Send + Sync>) -> Self {
+        self.with_listener_snapshot_result(Box::new(move |timeout| probe(timeout)
+            .ok_or_else(|| CoreError::new("vpn_listener_unavailable", "系统监听采样不可用"))))
+    }
+
+    pub fn with_listener_snapshot_result(mut self, probe: ListenerSnapshotProbe) -> Self {
         self.listener_snapshot_probe = Some(probe);
         self
     }
@@ -572,7 +577,7 @@ fn is_loopback_host(host: &str) -> bool {
 /// Lazily resolves the single owner PID of a loopback TCP listener port.
 pub type ListenerOwnerProbe = Box<dyn Fn(u16, Duration) -> Option<u32> + Send + Sync>;
 
-pub type ListenerSnapshotProbe = Box<dyn Fn(Duration) -> Option<KernelListenerSnapshot> + Send + Sync>;
+pub type ListenerSnapshotProbe = Box<dyn Fn(Duration) -> Result<KernelListenerSnapshot> + Send + Sync>;
 
 /// One kernel table, with its original capture time when supplied by the
 /// authenticated native collector. Re-reading one frame does not renew it.
@@ -585,21 +590,28 @@ pub struct KernelListenerSnapshot {
 }
 
 pub fn read_vpn_kernel_snapshot<R: ReadRunner + ?Sized>(runner: &R, timeout: Duration) -> Option<KernelListenerSnapshot> {
+    read_vpn_kernel_snapshot_checked(runner, timeout).ok()
+}
+
+pub fn read_vpn_kernel_snapshot_checked<R: ReadRunner + ?Sized>(runner: &R, timeout: Duration) -> Result<KernelListenerSnapshot> {
+    let invalid = || CoreError::new("vpn_listener_snapshot_invalid", "系统监听采样元数据无效");
     let started = crate::native::now();
-    let evidence = read_kernel_listeners_with_timeout(runner, timeout)?;
-    if evidence.status != 0 || !evidence.stderr.trim().is_empty() { return None; }
+    let evidence = read_kernel_listeners_checked(runner, timeout)?;
+    if evidence.status != 0 || !evidence.stderr.trim().is_empty() {
+        return Err(CoreError::new("vpn_listener_read_failed", "系统监听采样命令失败"));
+    }
     let metadata = evidence.stdout.lines().find_map(|line| line.strip_prefix(crate::native_listener::FRAME_META_PREFIX));
     let (captured_at, origin_id, sequence) = if let Some(metadata) = metadata {
-        let value = crate::storage::strict_json(metadata.as_bytes()).ok()?;
-        let captured_at = value["captured_at"].as_f64().filter(|time| time.is_finite() && *time > 0.0)?;
-        let origin = value["origin_id"].as_str().filter(|id| !id.is_empty() && id.len() <= 256)?.to_owned();
-        let sequence = value["sequence"].as_u64().filter(|seq| *seq > 0)?;
+        let value = crate::storage::strict_json(metadata.as_bytes()).map_err(|_| invalid())?;
+        let captured_at = value["captured_at"].as_f64().filter(|time| time.is_finite() && *time > 0.0).ok_or_else(invalid)?;
+        let origin = value["origin_id"].as_str().filter(|id| !id.is_empty() && id.len() <= 256).ok_or_else(invalid)?.to_owned();
+        let sequence = value["sequence"].as_u64().filter(|seq| *seq > 0).ok_or_else(invalid)?;
         (captured_at, Some(origin), Some(sequence))
     } else {
         // Plain netstat is a new bounded command, not a cached collector frame.
         (started, None, None)
     };
-    Some(KernelListenerSnapshot { evidence, captured_at, origin_id, sequence })
+    Ok(KernelListenerSnapshot { evidence, captured_at, origin_id, sequence })
 }
 
 /// Single unambiguous owner PID of a loopback/wildcard TCP listener on `port`,
@@ -660,14 +672,17 @@ pub fn read_kernel_listeners_with_timeout<R: ReadRunner + ?Sized>(
     runner: &R,
     timeout: Duration,
 ) -> Option<CommandEvidence> {
-    if timeout.is_zero() { return None; }
+    read_kernel_listeners_checked(runner, timeout).ok()
+}
+
+fn read_kernel_listeners_checked<R: ReadRunner + ?Sized>(runner: &R, timeout: Duration) -> Result<CommandEvidence> {
+    if timeout.is_zero() { return Err(CoreError::new("command_timeout", "系统监听采样超时")); }
     let out = runner
-        .run(ReadCommand::Listeners, &[], timeout.min(Duration::from_secs(3)), 4 * 1024 * 1024)
-        .ok()?;
-    Some(CommandEvidence {
+        .run(ReadCommand::Listeners, &[], timeout.min(Duration::from_secs(3)), 4 * 1024 * 1024)?;
+    Ok(CommandEvidence {
         status: out.status,
-        stdout: out.text().ok()?.into(),
-        stderr: out.error_text().ok()?.into(),
+        stdout: out.text()?.into(),
+        stderr: out.error_text()?.into(),
         source: "netstat".into(),
     })
 }
@@ -839,7 +854,7 @@ impl VpnSourceReader for HttpControllerVpnReader {
         self.read_observation_with_probes(
             expectation, include_rules, sample_seq, epoch, now,
             self.listener_owner_probe.as_deref().map(|probe| probe as &dyn Fn(u16, Duration) -> Option<u32>),
-            self.listener_snapshot_probe.as_deref().map(|probe| probe as &dyn Fn(Duration) -> Option<KernelListenerSnapshot>),
+            self.listener_snapshot_probe.as_deref().map(|probe| probe as &dyn Fn(Duration) -> Result<KernelListenerSnapshot>),
         )
     }
 }
@@ -851,7 +866,8 @@ impl HttpControllerVpnReader {
         &self, expectation: &VpnExpectation, include_rules: bool, sample_seq: u64,
         epoch: VpnEpoch, now: f64, probe: &dyn Fn(Duration) -> Option<KernelListenerSnapshot>,
     ) -> VpnObservation {
-        self.read_observation_with_probes(expectation, include_rules, sample_seq, epoch, now, None, Some(probe))
+        self.read_observation_with_probes(expectation, include_rules, sample_seq, epoch, now, None,
+            Some(&|timeout| probe(timeout).ok_or_else(|| CoreError::new("vpn_listener_unavailable", "系统监听采样不可用"))))
     }
 
     fn read_observation_with_probes(
@@ -862,7 +878,7 @@ impl HttpControllerVpnReader {
         epoch: VpnEpoch,
         now: f64,
         probe: Option<&dyn Fn(u16, Duration) -> Option<u32>>,
-        snapshot_probe: Option<&dyn Fn(Duration) -> Option<KernelListenerSnapshot>>,
+        snapshot_probe: Option<&dyn Fn(Duration) -> Result<KernelListenerSnapshot>>,
     ) -> VpnObservation {
         let started = Instant::now();
         let deadline = started + VPN_OBSERVATION_BUDGET;
@@ -874,7 +890,8 @@ impl HttpControllerVpnReader {
             .unwrap_or_else(|| "127.0.0.1".into());
         let expected_port = parsed_proxy.as_ref().and_then(Url::port);
 
-        let before_listener = snapshot_probe.and_then(|probe| probe(deadline.saturating_duration_since(Instant::now())));
+        let before_result = snapshot_probe.map(|probe| probe(deadline.saturating_duration_since(Instant::now())));
+        let before_listener = before_result.as_ref().and_then(|result| result.as_ref().ok());
         let before_owner = before_listener.as_ref().and_then(|snapshot| {
             self.bind_snapshot_owner(snapshot, Some(&expectation.proxy_url))
         });
@@ -901,9 +918,16 @@ impl HttpControllerVpnReader {
             Ok((snap, mut consistency)) => {
                 let (verified_instance, source_valid_until, listener_error) = if let Some(snapshot_probe) = snapshot_probe {
                     let remaining = deadline.saturating_duration_since(Instant::now());
-                    let after = (!remaining.is_zero()).then(|| snapshot_probe(remaining)).flatten();
-                    match self.verify_snapshot_pair(before_listener.as_ref(), before_owner,
-                        after.as_ref(), snap.upstream_endpoint.as_deref(), now + started.elapsed().as_secs_f64()) {
+                    let after = (!remaining.is_zero()).then(|| snapshot_probe(remaining));
+                    let failure = before_result.as_ref().and_then(|result| result.as_ref().err())
+                        .or_else(|| after.as_ref().and_then(|result| result.as_ref().err()));
+                    let verified = match failure {
+                        Some(error) => Err(error.code.clone()),
+                        None => self.verify_snapshot_pair(before_listener, before_owner,
+                            after.as_ref().and_then(|result| result.as_ref().ok()), snap.upstream_endpoint.as_deref(),
+                            now + started.elapsed().as_secs_f64()),
+                    };
+                    match verified {
                         Ok((identity, valid_until)) => (Some(identity), Some(valid_until), None),
                         Err(reason) => (None, None, Some(reason)),
                     }
@@ -958,7 +982,15 @@ impl HttpControllerVpnReader {
                 }
             }
             Err(err) => {
-                let reason = format!("controller_error:{err}");
+                let reason = match err {
+                    crate::local_http::Error::Path => "controller_path_rejected".into(),
+                    crate::local_http::Error::Timeout => "controller_timeout".into(),
+                    crate::local_http::Error::Transport => "controller_transport_failed".into(),
+                    crate::local_http::Error::Protocol => "controller_protocol_invalid".into(),
+                    crate::local_http::Error::TooLarge => "controller_response_too_large".into(),
+                    crate::local_http::Error::Json => "controller_json_invalid".into(),
+                    crate::local_http::Error::Status(status) => format!("controller_http_status:{status}"),
+                };
                 VpnObservation {
                     source: self.source_name.clone(),
                     source_instance: None,

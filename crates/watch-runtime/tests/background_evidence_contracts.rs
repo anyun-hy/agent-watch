@@ -18,6 +18,49 @@ struct Fixture {
 }
 
 #[test]
+fn worker_children_do_not_inherit_daemon_listener_environment() {
+    use claude_watch_runtime::{
+        background_evidence::{ProbeExecutor, WORKER},
+        release_native::{FixedCommand, FixedCommandExecutor},
+    };
+    use std::{
+        os::unix::fs::PermissionsExt,
+        process::Command,
+        sync::{atomic::AtomicBool, Arc},
+        time::Duration,
+    };
+    // Supply the daemon environment in a separate test process, without
+    // changing the environment of concurrently running tests.
+    if std::env::var("CW_NATIVE_LISTENER_STREAM").as_deref() != Ok("1")
+        || std::env::var_os("CW_NATIVE_LISTENER_SUPERVISOR_PID").is_none()
+    {
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "worker_children_do_not_inherit_daemon_listener_environment", "--nocapture"])
+            .env("CW_NATIVE_LISTENER_STREAM", "1")
+            .env("CW_NATIVE_LISTENER_SUPERVISOR_PID", std::process::id().to_string())
+            .output().unwrap();
+        assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        return;
+    }
+    let f = Fixture::new();
+    let script = f.root.join(WORKER);
+    fs::write(&script, r#"#!/usr/bin/python3
+import json,subprocess,sys
+print(json.dumps({'schema':1,'ready':True}),flush=True)
+for line in sys.stdin:
+ r=json.loads(line)
+ child=subprocess.check_output([sys.executable,'-c',"import json,os; print(json.dumps([os.getenv('CW_NATIVE_LISTENER_STREAM'),os.getenv('CW_NATIVE_LISTENER_SUPERVISOR_PID')]))"])
+ print(json.dumps({'schema':1,'id':r['id'],'kind':r['kind'],'result':{'kind':r['kind'],'status':'complete','errors':[],'listener_environment':json.loads(child)}}),flush=True)
+"#).unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+    let output = ProbeExecutor::new(Arc::new(AtomicBool::new(false)))
+        .run(FixedCommand { program: script, args: vec!["--webrtc".into()], timeout: Duration::from_secs(3) })
+        .unwrap();
+    let result: Value = serde_json::from_str(&output.stdout).unwrap();
+    assert_eq!(result["listener_environment"], json!([null, null]), "collector children must not enter the daemon-only listener path");
+}
+
+#[test]
 fn failed_worker_persists_only_validated_lifecycle_diagnostics() {
     use claude_watch_runtime::{
         background_evidence::{ProbeExecutor, WORKER},
@@ -220,6 +263,7 @@ struct Fake {
     running: bool,
     country: &'static str,
     mutate: Option<StateStore>,
+    network_bound: bool,
 }
 impl Default for Fake {
     fn default() -> Self {
@@ -233,6 +277,7 @@ impl Default for Fake {
             running: true,
             country: "JP",
             mutate: None,
+            network_bound: false,
         }
     }
 }
@@ -242,11 +287,13 @@ impl EvidenceSystem for Fake {
     }
     fn local(&mut self, _: &Config) -> Result<Value> {
         self.local_calls += 1;
-        Ok(local(if self.change_after && self.calls > 0 {
+        let mut value = local(if self.change_after && self.calls > 0 {
             "different"
         } else {
             "ctx"
-        }))
+        });
+        if self.network_bound { value["evidence_network_bound"] = json!(true); value["evidence_egress_ip"] = json!("1.1.1.1"); }
+        Ok(value)
     }
     fn desktop_matches(&mut self, _: &Desktop) -> Result<bool> {
         Ok(self.running)
@@ -810,6 +857,18 @@ fn gui_fresh_receipts_are_reused_without_duplicate_requests_or_renewing_timestam
 }
 
 #[test]
+fn background_reuses_network_bound_success_without_periodic_probe_refresh() {
+    let f = Fixture::new(); f.active(1000.);
+    let mut system = Fake { now:1065., network_bound:true, ..Default::default() };
+    assert_eq!(background_evidence::refresh_active_session(&f.store, &mut system).unwrap()["count"], 2);
+    let path = f.store.paths.base().join("dns-leak-receipt.json");
+    let original = fs::read(&path).unwrap();
+    system.now += 86400.;
+    assert_eq!(background_evidence::refresh_active_session(&f.store, &mut system).unwrap()["count"], 0);
+    assert_eq!(system.calls, 2); assert_eq!(fs::read(&path).unwrap(), original);
+}
+
+#[test]
 fn channel_sessions_refresh_probes_for_cli_and_desktop_without_a_window_identity() {
     use claude_watch_core::{channel::BoundProcessToken, processes::ProcessRole};
     for role in [ProcessRole::Cli, ProcessRole::DesktopMain] {
@@ -1054,4 +1113,78 @@ fn collector_failure_never_refreshes_old_safe_time_and_real_dns_risk_still_block
         .unwrap();
     assert_eq!(risk.state, "risk");
     assert!(risk.reason.unwrap().code.contains("dns"));
+}
+
+fn request(purpose: claude_watch_core::evidence::EvidencePurpose, force: bool) -> claude_watch_core::evidence::EvidenceRequest {
+    use claude_watch_core::evidence::*;
+    EvidenceRequest { schema:1,id:"contract".into(),action:EvidenceAction::Refresh,purpose,
+        kinds:vec![ProbeKind::Dns,ProbeKind::WebRtc],expected_context:Some("ctx".into()),expected_ip:None,force }
+}
+#[test]
+fn standalone_cold_start_uses_receipt_store_without_operation_lock_and_rejects_changed_context() {
+    use claude_watch_core::evidence::EvidencePurpose;
+    let f = Fixture::new();
+    let mut system = Fake { now:1000., ..Default::default() };
+    assert_eq!(background_evidence::refresh_active_session(&f.store,&mut system).unwrap()["status"], "idle");
+    let _lock = f.store.lock("operation",None).unwrap();
+    let outcome = background_evidence::serve_evidence_request(&f.store,&mut system,&request(EvidencePurpose::Launch,true)).unwrap();
+    assert_eq!(outcome["status"],"ok");
+    assert_eq!(outcome["count"],2);
+    assert_eq!(outcome["items"]["dns"]["state"],"ok");
+    assert_eq!(outcome["items"]["webrtc"]["receipt"]["context_id"],"ctx");
+    let receipts = ReceiptStore {storage:f.store.clone()};
+    assert_eq!(receipts.dns_status("ctx",true,1002.,|t|t.to_string())["state"],"ok");
+    let original = receipts.probe_receipts();
+    let mut changed = Fake { now:1010., change_after:true,..Default::default() };
+    assert_eq!(background_evidence::serve_evidence_request(&f.store,&mut changed,&request(EvidencePurpose::Launch,true)).unwrap_err().code,"evidence_context_changed");
+    assert_eq!(receipts.probe_receipts(),original);
+}
+#[test]
+fn current_timeout_replaces_success_but_retains_display_only_history() {
+    use claude_watch_core::evidence::EvidencePurpose;
+    let f=Fixture::new();
+    let mut system=Fake::default();
+    background_evidence::serve_evidence_request(&f.store,&mut system,&request(EvidencePurpose::Display,true)).unwrap();
+    system.now+=2.;system.fail=true;
+    let result=background_evidence::serve_evidence_request(&f.store,&mut system,&request(EvidencePurpose::Display,true)).unwrap();
+    assert_eq!(result["status"],"incomplete");
+    assert_eq!(result["items"]["dns"]["code"],"timeout");
+    assert_eq!(result["items"]["dns"]["state"],"unknown");
+    assert_eq!(result["items"]["dns"]["display_probe"]["status"],"complete");
+    let receipts=ReceiptStore{storage:f.store.clone()};
+    assert_eq!(receipts.dns_status("ctx",true,system.now,|t|t.to_string())["state"],"unknown");
+}
+#[test]
+fn display_and_launch_expiry_use_identical_persisted_receipt_and_original_clock() {
+    use claude_watch_core::evidence::{EvidenceAction,EvidencePurpose};
+    let f=Fixture::new();let mut system=Fake::default();
+    background_evidence::serve_evidence_request(&f.store,&mut system,&request(EvidencePurpose::Display,true)).unwrap();
+    let mut query=request(EvidencePurpose::Display,false);query.action=EvidenceAction::Inspect;
+    let receipts=ReceiptStore{storage:f.store.clone()};let original=receipts.probe_receipts();
+    for age in [31.,45.,299.] {
+        system.now=original.0["finished_at"].as_f64().unwrap()+age;
+        assert_eq!(background_evidence::serve_evidence_request(&f.store,&mut system,&query).unwrap()["items"]["dns"]["state"],"ok");
+        query.purpose=EvidencePurpose::Launch;
+        assert_eq!(background_evidence::serve_evidence_request(&f.store,&mut system,&query).unwrap()["items"]["dns"]["state"],"unknown");
+        assert_eq!(receipts.dns_status("ctx",true,system.now,|t|t.to_string())["state"],"unknown");
+        query.purpose=EvidencePurpose::Display;
+    }
+    assert_eq!(receipts.probe_receipts(),original);
+    assert_eq!(system.calls,2,"inspect never schedules probes");
+}
+#[test]
+fn user_expected_ips_are_diagnostic_and_cannot_replace_context_or_protection_rules() {
+    use claude_watch_core::evidence::EvidencePurpose;
+    let f=Fixture::new();let mut system=Fake::default();
+    let mut req=request(EvidencePurpose::Display,true);req.expected_ip=Some("8.8.8.8, 9.9.9.9".into());
+    let output=background_evidence::serve_evidence_request(&f.store,&mut system,&req).unwrap();
+    assert_eq!(output["items"]["webrtc"]["state"],"ok");
+    assert_eq!(output["items"]["webrtc"]["diagnostic"]["state"],"fail");
+    assert_eq!(output["context_id"],"ctx");
+    req.expected_ip=Some("1.1.1.1".into());req.force=false;
+    let matched=background_evidence::serve_evidence_request(&f.store,&mut system,&req).unwrap();
+    assert_eq!(matched["items"]["webrtc"]["diagnostic"]["state"],"ok");
+    assert_eq!(matched["count"],0,"changing the diagnostic reference reuses facts");
+    req.expected_ip=Some("127.0.0.1:7890|rule|node|global".into());
+    assert_eq!(background_evidence::serve_evidence_request(&f.store,&mut system,&req).unwrap_err().code,"invalid_expected_ip");
 }

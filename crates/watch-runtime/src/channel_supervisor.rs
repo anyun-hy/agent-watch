@@ -2,9 +2,9 @@
 //! independent slow-audit worker, and sequenced monitor state publisher.
 //!
 //! All environment, process, policy, lease-expiry, and enforcer-receipt events
-//! enter one non-blocking event pipeline. Default disposition is cutting off
-//! the target application's network channel while preserving its processes
-//! (`断流保进程`). Slow probes and `full_audit()` run asynchronously on a
+//! enter one non-blocking event pipeline. Network evidence controls revocation;
+//! confirmed process risks use configured normal exit (`close`) or force
+//! termination (`force`). Slow probes and `full_audit()` run asynchronously on a
 //! background worker; stale async results are discarded if the policy version,
 //! session, or risk state changed while the audit was in flight.
 use crate::{
@@ -120,6 +120,56 @@ mod logging_tests {
     }
 
     #[test]
+    fn external_inventory_is_supervised_without_granting_gateway_permission() {
+        let now = 1_800_000_000.0;
+        let (mut supervisor, _) = blocked_supervisor(now);
+        let external = BoundProcessToken::with_system_identity(7201, 501, 900, 1, ProcessRole::Cli)
+            .with_audit_token([501, 501, 20, 501, 20, 7201, 0, 9]);
+        let scope: BackendCoverageScope = serde_json::from_value(json!({
+            "backend":"seatbelt", "configured_entries":["openai"], "protected_pids":[],
+            "unprotected_pids":[7201], "uncovered_boundaries":["direct_launch_outside_controlled_entry"],
+            "server_identity_verified":true, "gateway_endpoint_protection_verified":true,
+            "gateway_endpoint_protection_method":"fixture"
+        })).unwrap();
+        supervisor.set_family_coverage_scope("openai", Some(scope.clone()), now);
+        supervisor.handle_event(SupervisionEvent::ProcessInventoryUpdated {
+            family: "openai".into(), desktops: vec![], processes: vec![external.clone()], observed_at: now,
+        }).unwrap();
+        assert_eq!(supervisor.snapshot(now).families["openai"].active_members, vec![external.clone()]);
+        let (tx, rx) = mpsc::channel();
+        supervisor.audit_tx = Some(tx);
+        supervisor.request_async_audit_if_needed("openai", None, None, now);
+        assert_eq!(rx.try_recv().expect("external Codex enters the existing audit path").target, LaunchTarget::CodexCli);
+        supervisor.issue_family_command("openai", None, ChannelPermitState::Revoked, "fixture_risk", now).unwrap();
+        assert!(supervisor.tracks["openai"].commanded_processes.is_empty());
+
+        let managed = BoundProcessToken::with_system_identity(7200, 501, 900, 1, ProcessRole::DesktopMain)
+            .with_audit_token([501, 501, 20, 501, 20, 7200, 0, 9]);
+        let mut mixed_scope = scope;
+        mixed_scope.protected_pids = vec![7200];
+        supervisor.set_family_coverage_scope("openai", Some(mixed_scope), now + 0.1);
+        supervisor.handle_event(SupervisionEvent::ProcessInventoryUpdated {
+            family: "openai".into(),
+            desktops: vec![(Desktop { pid: 7200, start_seconds: 900, start_microseconds: 1 }, true, "fixture".into())],
+            processes: vec![managed.clone(), external], observed_at: now + 0.1,
+        }).unwrap();
+        supervisor.issue_family_command("openai", None, ChannelPermitState::Revoked, "fixture_risk", now + 0.1).unwrap();
+        assert_eq!(supervisor.tracks["openai"].processes.len(), 2);
+        assert_eq!(supervisor.tracks["openai"].commanded_processes, vec![managed]);
+        let permit = supervisor.tracks["openai"].current_permit.clone().unwrap();
+        assert_eq!(permit.members.iter().map(|d| d.pid).collect::<Vec<_>>(), vec![7200]);
+        supervisor.issue_family_command("openai", None, ChannelPermitState::Revoked, "fixture_risk", now + 0.2).unwrap();
+        assert_eq!(supervisor.tracks["openai"].current_permit.as_ref().unwrap().command_seq, permit.command_seq,
+            "external members must not cause identical gateway commands to churn");
+        supervisor.handle_event(SupervisionEvent::ProcessInventoryUnavailable {
+            family: "openai".into(), observed_at: now + 0.3,
+        }).unwrap();
+        assert!(supervisor.tracks["openai"].audit_in_flight.is_none());
+        assert_eq!(supervisor.tracks["openai"].processes.len(), 2, "a failed sample retains the verified inventory");
+        assert_eq!(supervisor.tracks["openai"].current_permit.as_ref().unwrap().state, ChannelPermitState::Revoked);
+    }
+
+    #[test]
     fn cancelled_queued_audit_never_invokes_runner() {
         let stop = Arc::new(AtomicBool::new(false));
         let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -211,7 +261,9 @@ mod logging_tests {
         failed.observed_at = now + 1.0;
         failed.enforcement_state = ChannelEnforcementState::Failed;
         failed.error_code = Some("fixture_apply_denied".into());
-        supervisor.ingest_receipt(failed, now + 1.0).unwrap();
+        assert!(!supervisor.ingest_receipt(failed.clone(), now + 1.0).unwrap(), "replayed receipt sequence stays rejected");
+        failed.receipt_seq += 1;
+        assert!(supervisor.ingest_receipt(failed, now + 1.0).unwrap());
         let events = EventStore::new(supervisor.storage.clone());
         let deadline = Instant::now() + Duration::from_secs(5);
         let rows = loop {
@@ -230,6 +282,41 @@ mod logging_tests {
         assert_eq!(failed.fields.channel_diagnostic.as_ref().unwrap().failure.as_ref().unwrap().code,
             "fixture_apply_denied");
         assert_eq!(supervisor.tracks["claude"].policy_sync_state, PolicySyncState::ApplyFailed);
+    }
+
+    #[test]
+    fn vpn_unknown_history_keeps_specific_causes_without_duplicate_or_sensitive_details() {
+        let now = 1_800_000_000.0;
+        let (mut supervisor, _) = blocked_supervisor(now);
+        let mut expectation = VpnExpectation::unconfigured();
+        expectation.configured = true;
+        expectation.proxy_mode = "tag".into();
+        expectation.proxy_url = "http://127.0.0.1:7890".into();
+        expectation.proxy_group = "AI".into();
+        supervisor.config.vpn_expectation = Some(expectation.clone());
+        let logger = ChannelDiagnostics::new(supervisor.storage.clone());
+        supervisor.set_diagnostics(logger.clone());
+        let mut observer = crate::vpn_observer::VpnObserver::new("diagnostic-fixture", None);
+        for (index, reason) in ["native_listener_origin_changed", "native_listener_origin_changed",
+            "vpn_observation_budget_exceeded", "controller_timeout", "http://secret.example/token"].iter().enumerate() {
+            let at = now + index as f64;
+            let observation = observer.handle_invalidation_event(*reason, &expectation, at).observation;
+            supervisor.handle_queued_event(SupervisionEvent::VpnObservationUpdated { observation, observed_at: at }, at).unwrap();
+        }
+        let events = EventStore::new(supervisor.storage.clone());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut rows = loop {
+            let rows: Vec<_> = events.history().unwrap().events.into_iter().filter_map(|event| event.fields.channel_diagnostic)
+                .filter(|d| d.stage == "vpn_observation_unavailable").collect();
+            if rows.len() == 4 { break rows; }
+            assert!(Instant::now() < deadline); thread::sleep(Duration::from_millis(10));
+        };
+        rows.sort_by(|a, b| a.source_observed_at.partial_cmp(&b.source_observed_at).unwrap());
+        assert_eq!(rows.iter().map(|d| d.failure.as_ref().unwrap().code.as_str()).collect::<Vec<_>>(),
+            ["native_listener_origin_changed", "vpn_observation_budget_exceeded", "controller_timeout", "invalid_error_code"]);
+        assert_eq!(rows[0].source_observed_at, Some(now));
+        assert!(rows.iter().all(|d| d.reason_code.as_deref() == Some("vpn_observation_unknown")));
+        assert!(!serde_json::to_string(&rows).unwrap().contains("secret"));
     }
 
     #[test]
@@ -832,6 +919,22 @@ impl ChannelSupervisor {
         }
     }
 
+    fn record_vpn_observation_failure(&self, previous: Option<VpnMatch>, now: f64) {
+        let current = self.compute_vpn_match(now);
+        if current == previous { return; }
+        if let (Some(logger), Some(VpnMatch::Unknown { reasons })) = (&self.diagnostics, current) {
+            for reason in reasons {
+                let mut diagnostic = self.diagnostic(None, "vpn_observation_unavailable");
+                diagnostic.state = Some("unknown".into());
+                diagnostic.reason_code = Some("vpn_observation_unknown".into());
+                diagnostic.source_observed_at = self.latest_vpn_observation.as_ref().map(|o| o.observed_at);
+                diagnostic.failure = Some(crate::channel_diagnostics::DiagnosticFailure::from_error(
+                    &CoreError::new(&reason, "VPN 采样无法确认")));
+                logger.record(diagnostic, now);
+            }
+        }
+    }
+
     fn publish(&self, snapshot: &ChannelMonitorSnapshot) {
         let now = snapshot.captured_at;
         let mut value = json!(snapshot);
@@ -1001,8 +1104,9 @@ impl ChannelSupervisor {
         let (Some(dispatcher), Some(registry), Some(executor), Some(permit)) = (
             self.process_dispatcher.as_ref(), self.process_registry.as_ref(), self.expected_executor_boot_id.as_ref(), track.current_permit.as_ref(),
         ) else { return; };
+        let action = self.config.close_action(risk, provider);
         if !self.config.enabled || !self.config.guard_enabled || self.config_blocking_reason.is_some()
-            || self.config.close_action(risk, provider) != "force"
+            || !matches!(action.as_str(), "close" | "force")
             || permit.state != ChannelPermitState::Revoked || permit.session_id.as_deref() != Some(session.session_id.as_str())
             || permit.policy_version != self.saved_policy_version || permit.permit_generation != track.permit_generation
             || permit.command_seq != track.command_seq || executor.is_empty()
@@ -1031,16 +1135,20 @@ impl ChannelSupervisor {
         let mut target_identities = Vec::new();
         let mut target_executables = BTreeMap::new();
         let mut target_instances = BTreeMap::new();
-        let mut targets: Vec<_> = scoped.iter().filter(|token| verified.contains(token) && track.processes.contains(token)).collect();
-        // Descendants first, so terminating a parent does not make any
-        // not-yet-checked descendant depend on a reparenting race.
-        targets.sort_by_key(|token| (token.role != claude_watch_core::processes::ProcessRole::Child, token.pid));
+        let mut targets: Vec<_> = scoped.iter().filter(|token| track.processes.contains(token)).collect();
+        targets.sort_by_key(|token| (if action == "force" {
+            token.role != claude_watch_core::processes::ProcessRole::Child
+        } else { token.role == claude_watch_core::processes::ProcessRole::Child }, token.pid));
         for token in targets {
             if !token.has_verified_audit_token() || target_executables.contains_key(&token.pid) { continue; }
             let Some(actual) = claude_watch_system::inspect_process_identity(token.pid) else { continue; };
             if !token.matches_process(actual.pid, actual.uid, actual.start_seconds, actual.start_microseconds, Some(&actual.audit_token)) { continue; }
-            let Some(instance) = registry.disposition_instance_id(family, token) else { continue; };
-            target_instances.insert(token.pid, instance);
+            if let Some(instance) = registry.disposition_instance_id(family, token) {
+                if !verified.contains(token) { continue; }
+                target_instances.insert(token.pid, instance);
+            } else if !registry.external_disposition_target_current(token, &actual) {
+                continue;
+            }
             target_executables.insert(token.pid, actual.executable_path);
             target_identities.push(token.clone());
         }
@@ -1049,7 +1157,7 @@ impl ChannelSupervisor {
         let instance_id = target_instances.values().next().filter(|first|
             target_instances.values().all(|id| id == *first)).cloned();
         let intent = ProcessDispositionIntent {
-            intent_id: uuid::Uuid::new_v4().to_string(), family: family.into(), risk_code: risk.into(), action: "force".into(),
+            intent_id: uuid::Uuid::new_v4().to_string(), family: family.into(), risk_code: risk.into(), action,
             instance_id, session_id: session.session_id.clone(), policy_version: self.saved_policy_version.clone(),
             producer_boot_id: self.producer_boot_id.clone(), executor_boot_id: executor.clone(),
             permit_generation: track.permit_generation, command_seq: track.command_seq, target_identities, target_executables, target_instances,
@@ -1262,6 +1370,7 @@ impl ChannelSupervisor {
                         return Ok(self.snapshot(now));
                     }
                 }
+                let previous_match = self.compute_vpn_match(now);
                 let epoch_changed = match self.latest_vpn_observation.as_ref() {
                     Some(prev) => {
                         prev.epoch != observation.epoch
@@ -1286,6 +1395,7 @@ impl ChannelSupervisor {
                 }
                 self.latest_vpn_observation = Some(observation);
                 self.latest_vpn_unavailable_reason = None;
+                self.record_vpn_observation_failure(previous_match, now);
                 let family_ids: Vec<String> = self.tracks.keys().cloned().collect();
                 for family in family_ids {
                     if let Some(track) = self.tracks.get_mut(&family) {
@@ -1301,9 +1411,11 @@ impl ChannelSupervisor {
                 }
             }
             SupervisionEvent::VpnObservationUnavailable { reason, .. } => {
+                let previous_match = self.compute_vpn_match(now);
                 let newly_unavailable = self.latest_vpn_observation.take().is_some()
                     || self.latest_vpn_unavailable_reason.is_none();
                 self.latest_vpn_unavailable_reason = Some(reason);
+                self.record_vpn_observation_failure(previous_match, now);
                 let family_ids: Vec<String> = self.tracks.keys().cloned().collect();
                 for family in family_ids {
                     if let Some(track) = self.tracks.get_mut(&family) {
@@ -1383,6 +1495,11 @@ impl ChannelSupervisor {
                         track.cancel_audit();
                     }
                 } else if let Some(track) = self.tracks.get_mut(&family) {
+                    if processes.iter().any(|token| !track.processes.contains(token)) {
+                        // A newly verified lifetime must receive the current policy
+                        // even while the same risk episode is still active.
+                        track.process_episode = None;
+                    }
                     if !track.processes.iter().any(|p| processes.contains(p)) && track.processes != processes {
                         // An audit of a replaced/execed process cannot authorize
                         // the new instance, even if its PID was reused.
@@ -1928,10 +2045,8 @@ impl ChannelSupervisor {
         let Some(track) = self.tracks.get_mut(family) else {
             return;
         };
-        // Observation alone cannot become controlled membership. Do not start
-        // expensive verification which can only fail adoption after completion.
-        // Known members are retained on incomplete inventory, so their existing
-        // fail-closed and recovery path is unchanged.
+        // A verified live inventory is required, independent of launch source.
+        // Incomplete inventory retains known members and the existing revocation path.
         if track.processes.is_empty() {
             track.cancel_audit();
             return;
@@ -2244,17 +2359,17 @@ impl ChannelSupervisor {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn checked_session_authorization_lock(
+    fn checked_session_authorization_lock<'a>(
         &mut self,
         family: &str,
-        sessions: &SessionStore,
+        sessions: &'a SessionStore,
         expected: &session::Session,
         requested_at: Option<f64>,
         now: f64,
         busy_code: &str,
         changed_code: &str,
-    ) -> Result<Option<crate::storage::OperationLock>> {
-        let session_lock = match self.storage.lock(&sessions.lock_name(), None) {
+    ) -> Result<Option<crate::session_store::LockedSession<'a>>> {
+        let session_lock = match sessions.lock() {
             Ok(lock) => lock,
             Err(error) if error.code == "busy" => {
                 // The session may already be Active after adoption. Establish
@@ -2265,7 +2380,7 @@ impl ChannelSupervisor {
             }
             Err(error) => return Err(error),
         };
-        let current = sessions.load(now)?;
+        let current = session_lock.load(now)?;
         let risk_after_request = requested_at.is_some_and(|requested_at| current.as_ref().is_some_and(|s| {
             s.locked_at.is_some_and(|at| at > requested_at)
                 || s.reason.as_ref().is_some_and(|reason| reason.observed_at > requested_at)
@@ -2306,12 +2421,10 @@ impl ChannelSupervisor {
         requested_at: f64,
         now: f64,
     ) -> Result<()> {
-        let Some(_session_lock) = self.checked_session_authorization_lock(
+        let Some(session_lock) = self.checked_session_authorization_lock(
             family, sessions, expected, Some(requested_at), now, "recovery_session_busy", "recovery_session_changed",
         )? else { return Ok(()); };
-        let persist = || self.storage.atomic_json(
-            &self.storage.paths.session_for(family), &json!(restored),
-        );
+        let persist = || session_lock.persist_recovery(restored);
         #[cfg(test)]
         let persisted = self.recovery_persist_failure.clone().map_or_else(persist, Err);
         #[cfg(not(test))]
@@ -2386,13 +2499,16 @@ impl ChannelSupervisor {
         reason_code: &str,
         now: f64,
     ) -> Result<()> {
+        let allowed_processes = self.enforcement_processes(family);
         let members = self
                 .tracks
                 .get(family)
                 .map(|t| {
                     t.desktops
                         .iter()
-                        .filter(|(_, main, _)| *main)
+                        .filter(|(desktop, main, _)| *main && allowed_processes.iter().any(|token|
+                            token.pid == desktop.pid && token.start_seconds == desktop.start_seconds
+                                && token.start_microseconds == desktop.start_microseconds))
                         .map(|(d, _, _)| d.clone())
                         .collect()
                 })
@@ -2452,7 +2568,7 @@ impl ChannelSupervisor {
                     && p.command_seq == track.command_seq && p.permit_generation == track.permit_generation
                     && p.session_id == session_id && p.policy_version == self.saved_policy_version
                     && p.context_id == context_id && p.baseline_ip == baseline_ip
-                    && p.members == members && track.processes == track.commanded_processes
+                    && p.members == members && allowed_processes == track.commanded_processes
                     && p.backend == backend && p.coverage_scope == coverage_scope
                     && (p.state != ChannelPermitState::Permitted || p.vpn_epoch == vpn_epoch)
                     && now >= p.issued_at && (p.state != ChannelPermitState::Permitted
@@ -2505,17 +2621,22 @@ impl ChannelSupervisor {
         self.apply_permit_to_enforcer(family, permit, now)
     }
 
+    /// Supervision includes external launches; network permission still requires
+    /// the existing verified gateway coverage from the same inventory.
+    fn enforcement_processes(&self, family: &str) -> Vec<BoundProcessToken> {
+        self.tracks.get(family).into_iter().flat_map(|track| &track.processes)
+            .filter(|token| self.coverage_scopes.get(family).is_none_or(|scope|
+                scope.protected_pids.contains(&token.pid) && !scope.unprotected_pids.contains(&token.pid)))
+            .cloned().collect()
+    }
+
     fn apply_permit_to_enforcer(
         &mut self,
         family: &str,
         permit: ChannelPermit,
         now: f64,
     ) -> Result<()> {
-        let allowed_processes = self
-            .tracks
-            .get(family)
-            .map(|t| t.processes.clone())
-            .unwrap_or_default();
+        let allowed_processes = self.enforcement_processes(family);
         let command = ChannelEnforcementCommand {
             family: family.into(),
             session_id: permit.session_id.clone(),
@@ -2702,15 +2823,16 @@ impl ChannelSupervisor {
                 receiver_now <= *expires && fence.is_claimed(authority))
             || authority.session_id != receipt.session_id || authority.family != family || authority.intent_id != receipt.intent_id
             || authority.producer_boot_id != self.producer_boot_id
-            || authority.action != receipt.action || receipt.action != "force"
+            || authority.action != receipt.action || !matches!(receipt.action.as_str(), "close" | "force")
             || !(receipt.observed_at >= authority.created_at && receipt.observed_at <= authority.valid_until + RESULT_COMPLETION_GRACE
                 && (0.0..=RECEIPT_TTL).contains(&(receiver_now - receipt.observed_at)))
             || targets != completed || completed.len() != receipt.target_results.len()
             || receipt.process_execution_state != result_state(&receipt.target_results) || receipt.process_preserved
             || receipt.target_results.iter().any(|r| {
-                r.requested_action != "force_quit" || !(authority.created_at..=receipt.observed_at).contains(&r.timestamp)
-                    || r.terminated != (r.process_state == "terminated")
-                    || matches!(r.process_state.as_str(), "terminated" | "timeout" | "exit_unconfirmed") != r.signal_sent_at.is_some()
+                r.requested_action != (if receipt.action == "force" { "force_quit" } else { "quit" })
+                    || !(authority.created_at..=receipt.observed_at).contains(&r.timestamp)
+                    || r.terminated != (r.process_state == "confirmed_exit_after_request")
+                    || matches!(r.process_state.as_str(), "confirmed_exit_after_request" | "timeout" | "exit_unconfirmed") != r.signal_sent_at.is_some()
                     || r.signal_sent_at.is_some_and(|at| !(authority.created_at..=r.timestamp.min(authority.valid_until)).contains(&at))
             })
         { return Ok(()); }

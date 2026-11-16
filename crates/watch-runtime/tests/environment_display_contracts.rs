@@ -69,6 +69,7 @@ fn receipt_keeps_same_round_display_window_without_mutating_launch_audit() {
     assert_eq!(launch_audit["expires_at"], json!(NOW + 17.0));
     assert_eq!(out["observed_at"], json!(NOW));
     assert_eq!(out["expires_at"], json!(NOW + 300.0));
+    assert_eq!(out["audit_expires_at"], launch_audit["expires_at"]);
     assert_eq!(out["policy_evaluation"]["observed_at"], json!(NOW));
     assert_eq!(out["policy_evaluation"]["expires_at"], json!(NOW + 300.0));
     assert_eq!(out["policy_evaluation"]["grants_launch_permission"], false);

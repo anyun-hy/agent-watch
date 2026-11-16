@@ -28,7 +28,6 @@ import Foundation
         let old=LeakProbeResult(kind:"dns",status:"complete",startedAt:1,finishedAt:2,scope:"old",observations:[.init(address:"8.8.8.8",kind:"resolver",source:"old")],errors:[],contextChanged:false,details:[])
         let oldRoundtrip=try JSONDecoder().decode(LeakProbeResult.self,from:JSONEncoder().encode(old)); check(oldRoundtrip.externalJSON == nil,"old receipt compatible")
         let empty=LeakProbeResult(kind:"dns",status:"complete",startedAt:1,finishedAt:2,scope:"coffee",observations:[.init(address:"1.1.1.1",kind:"http",source:"ref")],errors:[],contextChanged:false,details:[])
-        check(LeakPolicy.evaluate(empty,kind:.dns,expected:"",now:3).state == .incomplete,"DNS empty never safe")
         print("NetCoffeeTests: \(count) assertions passed")
     }
 }

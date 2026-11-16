@@ -49,18 +49,10 @@
       ],
       "dependencies": [],
       "fixture_only": true,
-      "safety_notes": "Default invocation mocks monitored-app exit requests; bounded command tests run echo and terminate/reap only their own sleeping fixture child. AIProcessControl(isFixture: true) never signals monitored apps.",
-      "unselected_modes": {
-        "--classification-smoke": "Read-only host inventory bridge check requires an isolated test bundle explicitly wired to the current candidate engine and observer; it never closes targets.",
-        "--owned-force-child": "Excluded from automatic execution: this optional mode has cleanup signals by PID without a fresh identity check. Default policy fixtures and owned-child identity-checked TERM remain included.",
-        "--inspect": "Read-only host inventory mode is not an assertion suite and is not selected."
-      },
+      "safety_notes": "Rust command responses are injected; stdin/deadline checks use only owned cat/sleep children. The additional run verifies the macOS audit token across an owned shell exec without signalling monitored apps.",
       "additional_runs": [
         [
           "--owned-exec-identity"
-        ],
-        [
-          "--owned-child"
         ]
       ]
     },
@@ -82,7 +74,7 @@
       ],
       "dependencies": [],
       "fixture_only": true,
-      "safety_notes": "Synthetic identities and action closures only. PROCESS_POLICY_TESTS excludes live inventory/AppKit implementation and avoids the test's MonitoredProduct type conflict."
+      "safety_notes": "Native identity boundary and receipt decoding only. CW_PHASE3_EVIDENCE_DIR optionally supplies production Rust receipts from isolated process-exit tests."
     },
     {
       "id": "swift.BackendCoverageScopeTests",
@@ -341,28 +333,6 @@
       "dependencies": [],
       "fixture_only": true,
       "safety_notes": "In-memory process/flow fixtures only."
-    },
-    {
-      "id": "swift.DNSRefreshBridgeTests",
-      "kind": "swift",
-      "test_files": [
-        "monitor/tests/DNSRefreshBridgeTests.swift"
-      ],
-      "sources": [
-        "monitor/Sources/*.swift"
-      ],
-      "defines": [
-        "UI_REVIEW"
-      ],
-      "args": [],
-      "frameworks": [
-        "SwiftUI",
-        "AppKit",
-        "WebKit"
-      ],
-      "dependencies": [],
-      "fixture_only": true,
-      "safety_notes": "Creates and removes one owned temporary bridge directory; no installed bridge or service."
     },
     {
       "id": "swift.EnvironmentDetailPresentationTests",
@@ -691,41 +661,6 @@
       "recipe_ref": "monitor/tests/run_ipleak_bridge_test.sh"
     },
     {
-      "id": "swift.LeakBridgeTests",
-      "kind": "script",
-      "test_files": [
-        "monitor/tests/LeakBridgeTests.swift"
-      ],
-      "sources": [
-        "monitor/Sources/*.swift"
-      ],
-      "defines": [
-        "UI_REVIEW",
-        "LEAK_BRIDGE_TEST"
-      ],
-      "args": [
-        "--run"
-      ],
-      "frameworks": [
-        "SwiftUI",
-        "AppKit",
-        "WebKit"
-      ],
-      "dependencies": [
-        "macos.gui_session"
-      ],
-      "fixture_only": true,
-      "script": "monitor/tests/run_leak_bridge_test.sh",
-      "environment": {
-        "LEAK_BRIDGE_APP": "{work_dir}/Leak Bridge Tests.app"
-      },
-      "success_markers": [
-        "LeakBridgeTests: local resource + CSP + JavaScript collector + native receipt passed; fetch and RTC mocked"
-      ],
-      "safety_notes": "Runs the real local page/Swift bridge with fetch and RTCPeerConnection replaced by fixtures. App bundle is in work_dir. Existing script's ignored monitor/build/test-module-cache is the sole repository build-cache output; no install or production configuration.",
-      "recipe_ref": "monitor/tests/run_leak_bridge_test.sh"
-    },
-    {
       "id": "swift.LeakCheckTests",
       "kind": "swift",
       "test_files": [
@@ -745,7 +680,7 @@
       ],
       "dependencies": [],
       "fixture_only": true,
-      "safety_notes": "Every LeakCheckStore is fixture-backed; no optional historical/live receipt argument selected."
+      "safety_notes": "Injects backend response bytes into the production UI request/decoder path. No WebKit or network collection."
     },
     {
       "id": "swift.LeakReceiptRoundTripTests",
@@ -765,8 +700,8 @@
         "WebKit"
       ],
       "dependencies": [],
-      "fixture_only": false,
-      "safety_notes": "Compiles the real Swift submission bridge; the automatic fixture suite never runs it. Explicit execution accepts only original WebKit probes and current local proxy context. The --production-home flag additionally acknowledges writes of these real diagnostic receipts to Watch state; no synthetic input is supported."
+      "fixture_only": true,
+      "safety_notes": "Builds only a standalone Swift test executable. Explicit Rust evidence_commands::swift_production_receiver_roundtrip runs it with owned temporary daemon services; actual CLI/UDS/ReceiptStore/UI path with network facts injected. Production HOME mode retired."
     },
     {
       "id": "swift.LeakDiagnosticTraceTests",

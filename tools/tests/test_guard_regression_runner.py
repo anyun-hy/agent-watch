@@ -148,7 +148,7 @@ class GuardRunnerTests(unittest.TestCase):
         self.assertEqual(len(calls), 4)
         self.assertEqual(calls[0]["args"], ["check", "--locked", "-p", "claude-watch-runtime", "-p", "claude-watch-engine"])
         self.assertIn("controlled::guard_regressions", calls[1]["args"])
-        self.assertIn("desktop_native::close_receipt::tests", calls[2]["args"])
+        self.assertIn("process_exit::tests::normal_exit_selection_preserves_manual_cli_and_account_desktop_scope", calls[2]["args"])
         self.assertIn("supervised_evidence_regressions", calls[3]["args"])
         self.assertEqual(self.calls("swiftc"), [])
         self.assertEqual(self.calls("xcrun"), [])

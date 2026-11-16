@@ -14,6 +14,14 @@ use serde_json::{json, Value};
 pub const UPDATE_LABEL: &str = "io.local.claudewatch.update";
 pub const TIMEZONE_LABEL: &str = "io.local.claudewatch.timezone";
 const UPDATE_INTERVAL: u64 = 43_200;
+pub fn record_guard_heartbeat(store: &StateStore, producer: &claude_watch_core::processes::Identity, now: f64) -> Result<()> {
+    let _lock = store.lock("guard-service-heartbeat", None)?;
+    store.atomic_json(&store.paths.watch().join("state/guard-service-heartbeat.json"),
+        &json!({"schema":1,"pid":producer.pid,"start_stamp":producer.start_stamp,"time":now}))
+}
+pub fn read_guard_heartbeat(store: &StateStore) -> Result<Value> {
+    store.read_json(&store.paths.watch().join("state/guard-service-heartbeat.json"), Value::Null)
+}
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BackendHealthSnapshot {
     pub sampling_healthy: bool,

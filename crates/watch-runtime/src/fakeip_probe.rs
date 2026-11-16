@@ -80,8 +80,8 @@ pub fn collect(source: &mut impl Source, input: Input<'_>) -> Collected {
         result.reason = "未能读取同一内核的 DNS 配置";
         return result;
     };
-    let Ok((port, range)) = tag_config::fakeip_dns_config(&config) else {
-        result.reason = "未能确认唯一的本机 fake-IP DNS 监听配置";
+    let Ok((port, range, mode)) = tag_config::fakeip_dns_config(&config) else {
+        result.reason = "未能确认唯一的本机 DNS 监听配置";
         return result;
     };
     let (kernel, captured) = if let Some((snapshot, captured)) = listener_snapshot {
@@ -184,7 +184,7 @@ pub fn collect(source: &mut impl Source, input: Input<'_>) -> Collected {
         .config()
         .and_then(|v| tag_config::fakeip_dns_config(&v));
     if !fresh_listener(source.now())
-        || current_config.as_ref().ok() != Some(&(port, range))
+        || current_config.as_ref().ok() != Some(&(port, range, mode))
         || !tag_flow::dns_listener_matches(&current_kernel, port, owner, &current_processes, uid)
     {
         result.reason = "DNS 查询期间内核、监听配置或进程身份变化";

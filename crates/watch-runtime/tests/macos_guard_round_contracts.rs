@@ -135,7 +135,7 @@ impl Fixture {
     }
     fn sample(&self,round:&ProcessRound)->(BTreeMap<String,Value>,Value) {
         let network=NetworkClient::new(self.http.clone(),None).unwrap();
-        let mut host=Macos { runner:self.source.clone(),network:network.clone(),storage:self.store.clone(),authority:Authority::ReadOnly,
+        let mut host=Macos { request_evidence: true, runner:self.source.clone(),network:network.clone(),storage:self.store.clone(),authority:Authority::ReadOnly,
             mutator:NoWrites,probes:Arc::new(||panic!("guard must not run full audit probes")) };
         let mut desktop=NativeDesktop::new(self.source.clone(),self.store.paths.watch().join("runtime/watch-process-control"),Authority::ReadOnly).unwrap();
         DesktopRuntime { desktop:&mut desktop,system:&mut host,network,storage:self.store.clone(),started:Instant::now(),cli:None }

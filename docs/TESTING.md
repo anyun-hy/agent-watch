@@ -1,15 +1,38 @@
-# Unified local test suite
+# 分层测试入口
 
 For installed-app runtime logs and safe diagnostic exports, see
 [运行问题排查](DIAGNOSTICS.md). Test output and production runtime evidence are separate.
 
-From the logged-in user's macOS Terminal, run:
+默认只执行 `watch-core` 的纯内存规则/契约测试：
 
 ```bash
-bash /Users/anyun/Desktop/bash/tools/test-all.sh
+cargo test
+# 同一默认层，额外保留运行报告：
+bash tools/test-all.sh
 ```
 
-Run without `sudo`. The current native desktop fixtures require Apple Silicon,
+| 层级 | 入口 | 范围与证据 |
+|---|---|---|
+| Level 1 | `cargo test` 或 `bash tools/test-all.sh --level 1` | 纯规则，测试不创建进程、网络连接或原生系统服务；首次编译耗时另计，不要求 macOS GUI |
+| Level 2 | `bash tools/test-all.sh --level 2` | 两个已有原生用例：真实内核归属及 HTTP/WS/CONNECT 网关转发；Seatbelt 子进程拒绝直连 TCP、VPN 端口、UDP/DNS 和 Unix relay，同时允许指定网关。只使用临时目录、自有进程及 loopback，无 root、launchd 或 `.app` 构建 |
+| Level 3 | `bash tools/test-all.sh --level 3 --list` | 只列实机验收范围；真实 launchd/root Broker、安装版生命周期和真实账号操作需当次单独授权。该层不自动执行，不把排除项报告为通过 |
+
+Level 1 的默认选择由根 `Cargo.toml` 的 `default-members` 定义。它也影响不带包参数的
+`cargo build`：需要后台二进制时使用 `cargo build -p claude-watch-engine`；需要整个工作区时
+显式加 `--workspace`。`cargo test --workspace` 仍是混合原生/GUI 夹具集，**不是 Level 1**。
+包内或 `-p` 指定测试也属于显式选择，不受根目录默认成员范围限制。
+
+Level 2 的权限或内核采集失败照实报失败，不跳过断言、不降级成模拟通过。其他已有定向
+测试继续使用 `--only ID`；可用 `--level 2 --only rust.native_seatbelt` 单独复测本层用例。
+Level 3 验收前须逐项核对目标服务、临时 root 夹具目录、1022 端口、清理范围及普通用户身份；
+所用测试名称通过 `--level 3 --list` 查看。重装仍遵循 [重装流程](REINSTALL_WORKFLOW.md)，
+agent 不构建 `.app`、DMG 或安装包，用户重装成功也不等于真实保护验收通过。
+
+原混合夹具清单保留为显式入口：`bash tools/test-all.sh --all-fixtures --list`。
+完整执行 `--all-fixtures` 会构建临时应用夹具，**agent 不得执行**；不因测试分层降低项目打包禁令。
+以下原生环境要求和混合清单说明只适用于所选原生/GUI 项，不是 Level 1 的前置条件。
+
+Run native fixtures without `sudo`. The current native desktop fixtures require Apple Silicon,
 macOS 26+, Xcode's macOS SDK, the repository's Rust toolchain, Python 3 and Node.
 The runner does not install missing tools. It opens temporary fixture windows,
 uses local sockets and Seatbelt, and may stop processes created by the tests.
@@ -65,7 +88,7 @@ acceptance scenarios.
 
 ## Coverage and exclusions
 
-The plan builds all Rust workspace binaries before running the workspace tests
+The explicit `--all-fixtures` plan builds all Rust workspace binaries before running the workspace tests
 once. It also covers Python contracts, both routing checks, generated policy
 parity, JavaScript probe fixtures, production Swift typechecking, and every
 `monitor/tests/*Tests.swift` file through the reviewed
@@ -113,8 +136,10 @@ not claim TAG authentication, connection reachability or gateway protection.
 ## Inspect or rerun a narrow selection
 
 ```bash
-# Read-only: list all steps, commands and mapped Swift files.
+# Read-only: list the default level, native level, or original mixed inventory.
 bash tools/test-all.sh --list
+bash tools/test-all.sh --level 2 --list
+bash tools/test-all.sh --all-fixtures --list
 
 # Preserve this rerun separately; existing output directories are refused.
 bash tools/test-all.sh --only swift.VpnSettingsSaveTests

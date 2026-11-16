@@ -250,30 +250,13 @@ struct SwitcherStoreTests {
         expect(claudeLaunch.blockReason(store: review, at: Date()) != nil,
                "a failed refresh cannot keep the previous green launch state")
         review.loadReviewScenario(.normal)
-        review.awaitFreshDNSReceipt = { _ in false }
-        await review.perform(chatgptLaunch.arguments)
-        expect(review.failure && review.message.contains("ChatGPT") && !review.message.contains("启动 Claude"),
-               "a failed DNS prerequisite reports the correct selected target without launching it")
-        expect(review.currentPolicyEvaluation == nil && review.currentEnvironmentIsHistorical && review.detectionError.contains("DNS") &&
-               chatgptLaunch.blockReason(store: review, at: Date()) != nil,
-               "a failed launch DNS refresh invalidates the prior green environment preview")
-        expect(SwitcherStore.webRTCSubmissionError(backendMessage: nil, hasContext: false, contextStillMatches: false).contains("上下文未稳定") &&
-               SwitcherStore.webRTCSubmissionError(backendMessage: "后端拒绝", hasContext: true, contextStillMatches: true).contains("后端拒绝") &&
-               SwitcherStore.webRTCSubmissionError(backendMessage: nil, hasContext: true, contextStillMatches: false).contains("上下文已变化"),
-               "WebRTC submission failures distinguish context and backend causes")
-        review.setWebRTCReceiptErrorForFixture("本地检测已完成，但未提交当前保护判定：fixture")
-        _ = await review.recordWebRTCRisk(.failure(.webrtc, code: "fixture", message: "fixture"))
-        expect(review.webRTCReceiptError.isEmpty, "new accepted WebRTC submission clears prior submission error")
+        review.acceptEvidenceFailure(.webrtc, detail: "后台检测不可用")
+        expect(review.webRTCReceiptError == "后台检测不可用" && review.initializationWebRTCReceipt == nil,
+               "unavailable daemon invalidates the initialization receipt and preserves its reason")
         await store.load()
         let coordinated = SwitcherStore(isFixture: true)
         await coordinated.load()
         coordinated.fixtureEnvironmentReadDelayNanoseconds = 150_000_000
-        var freshCalls = 0
-        coordinated.awaitFreshDNSReceipt = { _ in
-            freshCalls += 1
-            try? await Task.sleep(nanoseconds: 100_000_000)
-            return true
-        }
         let readTask = Task { await coordinated.detectCurrentEnvironment() }
         try await Task.sleep(nanoseconds: 20_000_000)
         let firstAction = Task { await coordinated.perform(["account", "switch", "B", "--apply", "--ack-unverified-version"]) }
@@ -281,8 +264,8 @@ struct SwitcherStoreTests {
         _ = await firstAction.value
         _ = await secondAction.value
         _ = await readTask.value
-        expect(coordinated.accounts?.current == "B" && freshCalls == 1 && !coordinated.busy,
-               "user action cancels a read, runs fresh gate once, and blocks overlapping mutation")
+        expect(coordinated.accounts?.current == "B" && !coordinated.busy,
+               "user action cancels a read and blocks overlapping mutation; evidence collection belongs to Rust")
         let timeout = SwitcherStore(isFixture: true)
         await timeout.load()
         timeout.fixtureEnvironmentReadDelayNanoseconds = 300_000_000
@@ -577,6 +560,12 @@ struct SwitcherStoreTests {
         let mutatingCategory = SwitcherCommandRunner.CommandCategory.classify(args: ["account", "switch", "--apply", "slot-b"])
         expect(mutatingCategory == .mutatingTransaction && mutatingCategory.timeoutSeconds == 120.0,
                "mutating transaction command has 120.0s journal protection timeout")
+        expect(SwitcherCommandRunner.CommandCategory.timeoutSeconds(args: ["evidence", "refresh", "--apply"]) > 180,
+               "evidence requests outlive the backend's two bounded native probes")
+        for arguments in [["checkdetail", "--online"], ["launch", "--apply"], ["account", "switch", "--apply", "slot-b"]] {
+            expect(SwitcherCommandRunner.CommandCategory.timeoutSeconds(args: arguments) > 190,
+                   "preflight callers allow collection plus remaining audit work")
+        }
 
         let state = SwitcherCommandRunner.SafeExecutionState()
         expect(!state.isTimedOut, "initial execution state is not timed out")

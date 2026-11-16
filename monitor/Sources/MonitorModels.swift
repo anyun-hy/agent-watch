@@ -73,7 +73,7 @@ struct WatchedProcess: Decodable, Identifiable, Sendable {
             // Rust bounds this proof by the fresh cutoff receipt and registry,
             // not by the old revoke command's lease. Keep that evidence expiry.
             guard proof.reason_code == "blocked_verified", state.isConfirmedFlowBlocked else { return pending }
-            if state.process_disposition_action == "force" {
+            if ["close", "force"].contains(state.process_disposition_action ?? "") {
                 return "已确认断流；此进程仍运行，退出处置单独核实"
             }
         default:
@@ -424,8 +424,8 @@ struct ProcessDispositionTargetModel: Codable, Equatable, Sendable {
 
     var statusLabel: String {
         switch process_state {
-        case "terminated": return "已确认退出"
-        case "already_exited": return "发信号前已退出"
+        case "confirmed_exit_after_request", "terminated": return "已确认退出"
+        case "already_exited": return "请求前已退出"
         case "timeout": return "等待超时，进程仍运行"
         case "exit_unconfirmed": return "已发信号，退出未确认"
         case "cancelled": return "未发信号，处置已取消"
@@ -507,7 +507,7 @@ struct FamilyChannelMonitorState: Codable, Equatable, Sendable {
     var sandbox_ready: Bool? = nil
 
     func processDispositionLabel(now: Double) -> String {
-        guard process_disposition_action == "force" else {
+        guard ["close", "force"].contains(process_disposition_action ?? "") else {
             return isConfirmedFlowBlocked && process_preserved ? "进程保留" : "进程处置未确认"
         }
         guard let receipt = process_disposition_receipt, let authority = receipt.authority,
@@ -527,7 +527,7 @@ struct FamilyChannelMonitorState: Codable, Equatable, Sendable {
     func previousProcessDispositionLabel(now: Double) -> String? {
         guard let receipt = previous_process_disposition_receipts?.last(where: { receipt in
             guard let authority = receipt.authority else { return false }
-            return !producer_boot_id.isEmpty && receipt.family == family && receipt.action == "force"
+            return !producer_boot_id.isEmpty && receipt.family == family && ["close", "force"].contains(receipt.action)
                 && authority.intent_id == receipt.intent_id && authority.producer_boot_id == producer_boot_id
                 && now.isFinite && receipt.observed_at.isFinite
                 && now >= receipt.observed_at - 1 && now - receipt.observed_at <= 15
@@ -560,7 +560,8 @@ struct FamilyChannelMonitorState: Codable, Equatable, Sendable {
     var protectionScopeLabel: String {
         if hasExpiredSubscription { return "受控范围与通道状态待核验" }
         guard managedMemberCount > 0 else {
-            if !active_members.isEmpty || session_id?.isEmpty == false { return "接管范围待核验" }
+            if supervisedMemberCount > 0 { return "已纳入监管 · 保护待核验" }
+            if session_id?.isEmpty == false { return "接管范围待核验" }
             return hasUnmanagedMembers ? "发现但未接管" : "受控网关待命"
         }
         if display_state == .blocked && !isConfirmedFlowBlocked { return "受控通道待核验" }
@@ -576,10 +577,14 @@ struct FamilyChannelMonitorState: Codable, Equatable, Sendable {
         reason_code == "subscription_stale_or_disconnected"
     }
 
+    var supervisedMemberCount: Int {
+        Set(active_members.filter { $0.auditIdentityDigest != nil }.map(\.pid)).count
+    }
+
     var scopeSummary: String {
         hasExpiredSubscription
-            ? "上次受控成员 \(managedMemberCount) 个 · 上次未接管 \(unmanagedPids.count) 个"
-            : "已核验受控成员 \(managedMemberCount) 个 · 未接管 \(unmanagedPids.count) 个"
+            ? "上次监管 \(supervisedMemberCount) 个 · 网关受控 \(managedMemberCount) 个 · 未覆盖 \(unmanagedPids.count) 个"
+            : "已监管 \(supervisedMemberCount) 个 · 网关受控 \(managedMemberCount) 个 · 未覆盖 \(unmanagedPids.count) 个"
     }
 
     var gatewayCountsLabel: String {

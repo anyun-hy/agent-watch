@@ -44,7 +44,7 @@ impl<R: ReadRunner, T: Transport, S: AuditSystem + ServiceSystem> AccountOs
             .map(str::to_owned))
     }
     fn quit_claude(&mut self) -> Result<()> {
-        self.desktop.quit()
+        self.desktop.quit(&self.storage.paths)?.confirm()
     }
     fn claude_running(&mut self) -> Result<bool> {
         Ok(!self.desktop.desktops()?.is_empty())

@@ -1212,14 +1212,13 @@ impl LocalTunnelEnforcer {
         self.start_proxy_on_listener(listener, None, stop, now)
     }
 
-    /// Production Seatbelt ingress accepts only a listener transferred by the
-    /// authenticated, system-installed launchd broker. There is deliberately
-    /// no local bind fallback when that service is absent or untrusted.
-    pub fn start_launchd_proxy_listener(
-        self: &Arc<Self>, stop: Arc<AtomicBool>, now: f64,
+    /// The engine hands off an authenticated listener; the enforcer owns only
+    /// relay execution and retains the endpoint's protection for its lifetime.
+    pub fn start_verified_proxy_listener(
+        self: &Arc<Self>,
+        verified: claude_watch_system::launchd_gateway::VerifiedGatewayListener,
+        stop: Arc<AtomicBool>, now: f64,
     ) -> Result<(SocketAddr, thread::JoinHandle<()>)> {
-        let verified = claude_watch_system::launchd_gateway::acquire_gateway_listener()
-            .map_err(|error| CoreError::new("gateway_endpoint_unverified_i03", &format!("系统托管网关不可用：{error}")))?;
         let (listener, protection) = verified.into_parts();
         self.start_proxy_on_listener(listener, Some(protection), stop, now)
     }
@@ -3354,6 +3353,10 @@ pub fn unregister_production_enforcer(watch_dir: &std::path::Path) {
 
 impl LocalTunnelEnforcer {
     /// Reports only the controlled-instance network boundary; no system-wide capture is claimed.
+    pub fn publish_protocol_coverage(&self, store: &crate::storage::StateStore) -> Result<()> {
+        let _lock = store.lock("channel-protocol-coverage", None)?;
+        store.atomic_json(&store.paths.watch().join("state/channel-protocol-coverage.json"), &self.protocol_coverage_boundaries())
+    }
     pub fn protocol_coverage_boundaries(&self) -> serde_json::Value {
         let ready = self.is_ready().unwrap_or(false);
         let local_proxy_ready = self.local_proxy_ready().unwrap_or(false);

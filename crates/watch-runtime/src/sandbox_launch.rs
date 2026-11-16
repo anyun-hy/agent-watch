@@ -242,7 +242,24 @@ pub struct SandboxLaunchRegistry {
     storage: Option<StateStore>,
 }
 
+pub fn read_runtime_state(store: &StateStore) -> Result<serde_json::Value> {
+    store.read_json(&store.paths.watch().join("state/seatbelt-runtime.json"), serde_json::Value::Null)
+}
+
 impl SandboxLaunchRegistry {
+    /// Registration metadata remains persisted separately from execution receipts.
+    pub fn publish_runtime_state(&self, configured_policy: &PolicyVersion, gateway_port: Option<u16>,
+        components_ready: bool, sandbox_ready: bool, report: &SandboxGatewayIdentityReport, now: f64) -> Result<()> {
+        let store = self.storage.as_ref().ok_or_else(|| CoreError::new("runtime_storage_missing", "缺少后台状态存储"))?;
+        let boot = self.inner.lock().map_err(|_| CoreError::new("registry_poisoned", "注册表不可用"))?.executor_boot_id.clone();
+        let _lock = store.lock("seatbelt-runtime", None)?;
+        store.atomic_json(&store.paths.watch().join("state/seatbelt-runtime.json"), &serde_json::json!({
+            "backend":"seatbelt","executor_boot_id":boot,"configured_policy_version":configured_policy,
+            "gateway_endpoint":gateway_port.map(|p|format!("127.0.0.1:{p}")).unwrap_or_default(),
+            "registration_socket":default_registration_socket_path(&store.paths.watch()),
+            "components_ready":components_ready,"sandbox_ready":sandbox_ready,
+            "identity_report":report,"updated_at":now}))
+    }
     pub fn new(
         executor_boot_id: impl Into<String>,
         policy_version: PolicyVersion,
@@ -1371,6 +1388,9 @@ impl SandboxLaunchRegistry {
         if guard.executor_boot_id != intent.executor_boot_id || guard.policy_version != intent.policy_version {
             return false;
         }
+        if !intent.target_instances.contains_key(&token.pid) {
+            return Self::external_disposition_target(&mut guard, token, process);
+        }
         let Some(inst) = guard.pid_to_instance.get(&token.pid).and_then(|id| guard.instances.get(id)).cloned()
         else { return false; };
         if inst.family != intent.family || intent.target_instances.get(&token.pid) != Some(&inst.instance_id)
@@ -1386,6 +1406,31 @@ impl SandboxLaunchRegistry {
             && inst.controlled_subtree_pids.contains(&token.pid)
             && guard.child_identities.get(&token.pid).is_some_and(|(exe, stored)| stored == token && exe == &process.executable_path)
             && Self::verify_approved_child_executable_fingerprint(&mut guard, &process.executable_path, token, &inst, process)
+    }
+
+    /// Process disposition does not require a sandbox launch, but still binds
+    /// the kernel lifetime and the same approved executable image. This grants
+    /// no gateway membership or network permission.
+    pub(crate) fn external_disposition_target_current(
+        &self, token: &BoundProcessToken, process: &claude_watch_system::ProcessKernelIdentity,
+    ) -> bool {
+        let Ok(mut guard) = self.inner.lock() else { return false; };
+        Self::external_disposition_target(&mut guard, token, process)
+    }
+
+    fn external_disposition_target(
+        guard: &mut RegistryInner, token: &BoundProcessToken,
+        process: &claude_watch_system::ProcessKernelIdentity,
+    ) -> bool {
+        if !token.has_verified_audit_token() || guard.pid_to_instance.contains_key(&token.pid) || token.pid <= 1
+            || token.pid == std::process::id() || token.uid != guard.verifier.expected_uid
+            || !token.matches_process(process.pid, process.uid, process.start_seconds,
+                process.start_microseconds, Some(&process.audit_token)) {
+            return false;
+        }
+        let sha = guard.approved_targets.get(&process.executable_path)
+            .or_else(|| guard.approved_child_executables.get(&process.executable_path)).cloned();
+        sha.is_some_and(|sha| Self::image_status(guard, &process.executable_path, &sha) == ImageStatus::Verified)
     }
 
     /// Live TCP socket attribution (`I02`) using `AcceptedConnectionContext`.

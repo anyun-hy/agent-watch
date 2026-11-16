@@ -64,32 +64,10 @@ pub fn extra_files(manifest: &Value) -> Result<&'static [&'static str]> {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ProbeKind {
-    Dns,
-    WebRtc,
-}
-impl ProbeKind {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Dns => "dns",
-            Self::WebRtc => "webrtc",
-        }
-    }
-    fn argument(self) -> &'static str {
-        match self {
-            Self::Dns => "--dns",
-            Self::WebRtc => "--webrtc",
-        }
-    }
-    fn refresh_age(self) -> f64 {
-        match self {
-            // Start early enough for the complete, bounded IPLeak round to
-            // finish before the existing launch evidence expires.
-            Self::Dns => 10.0,
-            Self::WebRtc => 60.0,
-        }
-    }
+pub use claude_watch_core::evidence::ProbeKind;
+use claude_watch_core::evidence::{EvidenceAction, EvidenceRequest};
+fn probe_argument(kind: ProbeKind) -> &'static str {
+    match kind { ProbeKind::Dns => "--dns", ProbeKind::WebRtc => "--webrtc" }
 }
 pub trait EvidenceSystem {
     fn now(&self) -> f64;
@@ -148,29 +126,8 @@ fn context(local: &Value) -> Option<&str> {
         .as_str()
         .filter(|s| !s.is_empty())
 }
-fn fresh(store: &StateStore, kind: ProbeKind, ctx: &str, now: f64, since: Option<f64>) -> bool {
-    let (name, stamp, ctx_key) = match kind {
-        ProbeKind::Dns => ("dns-leak-receipt.json", "finished_at", "context"),
-        ProbeKind::WebRtc => ("webrtc-risk-receipt.json", "sampled_at", "context_id"),
-    };
-    store
-        .read_json(&store.paths.base().join(name), Value::Null)
-        .ok()
-        .is_some_and(|v| {
-            let receipts = ReceiptStore {
-                storage: store.clone(),
-            };
-            let verified = match kind {
-                ProbeKind::Dns => receipts.dns_status(ctx, false, now, |t| format!("{t:.0}")),
-                ProbeKind::WebRtc => receipts.webrtc_status(ctx, now),
-            };
-            matches!(verified["state"].as_str(), Some("ok" | "fail"))
-                && v["status"] == "complete"
-                && v[ctx_key] == ctx
-                && v[stamp].as_f64().is_some_and(|t| {
-                    (0.0..kind.refresh_age()).contains(&(now - t)) && since.is_none_or(|s| t >= s)
-                })
-        })
+fn fresh(store: &StateStore, kind: ProbeKind, ctx: &str, current_ip: Option<&str>, now: f64, since: Option<f64>) -> bool {
+    ReceiptStore { storage: store.clone() }.probe_is_fresh(kind, ctx, current_ip, now, since)
 }
 
 /// A notice does not stop supervision. Only warn-only locks may refresh;
@@ -278,10 +235,14 @@ pub fn refresh_active_session<S: EvidenceSystem>(
     if grouped && !matching_desktops(system, &session)? {
         return Ok(json!({"status":"idle","count":0}));
     }
-    if !rechecking
+    let current_local = system.local(&config)?;
+    if context(&current_local).is_none() {
+        return Err(err("evidence_context_unconfirmed", "网络采样未确认；已通过检测记录保留"));
+    }
+    if !rechecking && context(&current_local) == Some(session.context_id.as_str())
         && [ProbeKind::Dns, ProbeKind::WebRtc]
             .iter()
-            .all(|kind| fresh(store, *kind, &session.context_id, system.now(), None))
+            .all(|kind| fresh(store, *kind, &session.context_id, current_local["evidence_egress_ip"].as_str(), system.now(), None))
     {
         return Ok(json!({"status":"ok","count":0,"failed_probes":[]}));
     }
@@ -314,7 +275,7 @@ pub fn refresh_active_session<S: EvidenceSystem>(
             break;
         }
         let since = rechecking.then_some(session.created_at);
-        if fresh(store, kind, &evidence_context, system.now(), since) {
+        if fresh(store, kind, &evidence_context, current_local["evidence_egress_ip"].as_str(), system.now(), since) {
             continue;
         }
         let before = system.local(&config)?;
@@ -353,7 +314,10 @@ pub fn refresh_active_session<S: EvidenceSystem>(
             ));
         }
         let after = system.local(&current)?;
-        if context(&after) != context(&before) {
+        if context(&after).is_none() {
+            return Err(err("evidence_context_unconfirmed", "采样暂不可用；已通过检测记录保留"));
+        }
+        if context(&after) != context(&before) || after["evidence_egress_ip"] != before["evidence_egress_ip"] {
             return Err(err(
                 "evidence_context_changed",
                 "采集前后网络身份未持续确认，未覆盖回执",
@@ -439,6 +403,92 @@ pub fn refresh_active_session<S: EvidenceSystem>(
     )
 }
 
+/// On-demand and read-only requests share the resident probe executor and
+/// ReceiptStore used by supervision. No operation/session lock is acquired.
+pub fn serve_evidence_request<S: EvidenceSystem>(
+    store: &StateStore, system: &mut S, request: &EvidenceRequest,
+) -> Result<Value> {
+    request.validate()?;
+    let config = ConfigStore { storage: store.clone() }.load()?;
+    if system.cancelled() { return Err(err("evidence_cancelled", "检测已取消")); }
+    let before = system.local(&config)?;
+    let ctx = context(&before).ok_or_else(|| err("evidence_context_unconfirmed", "当前网络上下文未确认"))?.to_owned();
+    if request.expected_context.as_deref().is_some_and(|v|
+        v != ctx && v != claude_watch_core::receipts::tag_signature(&before)) {
+        return Err(err("evidence_context_changed", "请求所属网络与当前网络不一致"));
+    }
+    let policy = guard_policy_digest(&config)?;
+    let receipts = ReceiptStore { storage: store.clone() };
+    let mut items = serde_json::Map::new();
+    let mut count = 0;
+    // DNS has the shorter launch window. Collect it last so a slow WebRTC
+    // probe cannot age a just-collected DNS receipt out of the launch gate.
+    let mut kinds = request.kinds.clone();
+    if request.purpose == claude_watch_core::evidence::EvidencePurpose::Launch {
+        kinds.sort_by_key(|kind| *kind == ProbeKind::Dns);
+    }
+    for &kind in &kinds {
+        let mut item = receipts.evidence_item(kind, &ctx, request.purpose, request.expected_ip.as_deref(), before["evidence_egress_ip"].as_str(), system.now())?;
+        let fresh = matches!(item["state"].as_str(), Some("ok" | "fail"))
+            && item["probe"]["status"] == "complete";
+        if request.action == EvidenceAction::Refresh && (request.force || !fresh) {
+            let round_before = system.local(&config)?;
+            if context(&round_before).is_none() {
+                return Err(err("evidence_context_unconfirmed", "采样暂不可用；已通过检测记录保留"));
+            }
+            if context(&round_before) != Some(ctx.as_str()) || round_before["evidence_egress_ip"] != before["evidence_egress_ip"] {
+                return Err(err("evidence_context_changed", "检测开始前网络上下文已变化"));
+            }
+            let started = system.now();
+            let collected = system.collect(kind);
+            let current = ConfigStore { storage: store.clone() }.load()?;
+            if system.cancelled() { return Err(err("evidence_cancelled", "检测已取消")); }
+            if guard_policy_digest(&current)? != policy {
+                return Err(err("evidence_policy_changed", "检测期间策略已变化，未覆盖回执"));
+            }
+            let after = system.local(&current)?;
+            if context(&after).is_none() {
+                return Err(err("evidence_context_unconfirmed", "采样暂不可用；已通过检测记录保留"));
+            }
+            if context(&after) != Some(ctx.as_str()) || after["evidence_egress_ip"] != before["evidence_egress_ip"] {
+                return Err(err("evidence_context_changed", "检测期间网络上下文已变化，未覆盖回执"));
+            }
+            // A failed current attempt is evidence of incompleteness. Persist it
+            // without renewing any old success; last-valid remains display-only.
+            let probe = collected.unwrap_or_else(|e| json!({
+                "kind":kind.label(),"status":if e.code.contains("timeout") {"timeout"} else {"error"},
+                "startedAt":started,"finishedAt":system.now(),"scope":"后台 WebKit 检测",
+                "observations":[],"errors":[{"stage":"collector","code":e.code,"message":e.message}],
+                "contextChanged":false,"details":[]
+            }));
+            let result = match kind {
+                ProbeKind::Dns => receipts.record_dns(&probe, &after, Some(&ctx), system.now()),
+                ProbeKind::WebRtc => receipts.record_webrtc(&probe, &after, Some(&ctx), system.now()),
+            };
+            match result {
+                Ok(recorded) => {
+                    count += 1;
+                    item = receipts.evidence_item(kind, &ctx, request.purpose, request.expected_ip.as_deref(), after["evidence_egress_ip"].as_str(), system.now())?;
+                    if recorded["comparison"]["state"] == "unknown" || recorded["risk"]["state"] == "unknown" {
+                        item["sampling_error"] = json!("本次采样未完成；沿用同一网络已通过的结果，原采样时间不变");
+                    }
+                }
+                Err(e) => {
+                    // A rejected attempt cannot present a previous receipt as its result.
+                    item = json!({"state":"unknown","code":e.code,"detail":e.message,
+                        "stored":false,"receipt":null,"probe":null,"display_probe":null,"valid_until":null,"diagnostic":null});
+                }
+            }
+        }
+        items.insert(kind.label().into(), item);
+    }
+    let state = if items.values().any(|v| v["state"] == "fail") { "risk" }
+        else if items.values().all(|v| v["state"] == "ok") { "ok" } else { "incomplete" };
+    Ok(json!({"schema":1,"id":request.id,"status":state,"count":count,
+        "context_id":ctx,"context_key":claude_watch_core::receipts::tag_signature(&before),
+        "evaluated_at":system.now(),"items":items}))
+}
+
 /// One resident helper, owned only by the evidence thread. Requests remain
 /// bounded and correlated; a timeout or damaged channel discards the helper.
 pub struct ProbeExecutor {
@@ -509,6 +559,10 @@ impl ResidentProbe {
             .args(["--serve"])
             .setpgid()
             .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+            // These select the daemon's listener transport, not the worker's
+            // nested `watch-engine coffee` requests.
+            .env_remove("CW_NATIVE_LISTENER_STREAM")
+            .env_remove("CW_NATIVE_LISTENER_SUPERVISOR_PID")
             .stdin(Redirection::Pipe)
             .stdout(Redirection::Pipe)
             .stderr(Redirection::Pipe)
@@ -768,7 +822,7 @@ pub fn collect_native<R: ReadRunner, E: FixedCommandExecutor>(
     }
     let output = executor.run(FixedCommand {
         program: runtime.join(WORKER),
-        args: vec![kind.argument().into()],
+        args: vec![probe_argument(kind).into()],
         timeout: Duration::from_secs(80),
     })?;
     if output.status != 0 || output.stdout.len() > 1_048_576 {

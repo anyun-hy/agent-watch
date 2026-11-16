@@ -74,7 +74,7 @@ struct GraphLaunchButton: View {
             }
             .buttonStyle(.plain)
             .disabled(reason != nil)
-            .help(reason ?? "环境预览已通过；启动时会重新执行完整检查。")
+            .help(reason ?? "启动时会重新执行完整检查，通过后建立受控会话。")
             .accessibilityHint(reason ?? "启动前将重新检查当前环境。")
             if switcher.busy {
                 launchProgress
@@ -86,9 +86,7 @@ struct GraphLaunchButton: View {
             }
             Button("取消", role: .cancel) { pending = nil }
         } message: {
-            Text(pending == .chatgpt
-                 ? "将重新执行 ChatGPT 桌面应用的启动检查。Claude 会话出口保护不覆盖 ChatGPT。"
-                 : "将重新执行 Claude 的完整启动检查，通过后建立受控会话。")
+            Text("将重新执行 \(pending?.title ?? "应用") 的完整启动检查，通过后建立该应用的受控会话。")
         }
         .alert(resultTitle, isPresented: $showingResult) {
             Button("知道了", role: .cancel) {}
@@ -126,11 +124,7 @@ struct GraphLaunchButton: View {
         // snapshot. When the backend is absent or stale (e.g. during first-run),
         // fall back to the snapshot's desktop-main processes.
         let product: MonitoredProduct = target == .claude ? .claude : .openAI
-        let unmanaged = monitor.unmanagedPids(for: product)
         if monitor.desktopRunning[product] == true {
-            if !unmanaged.isEmpty {
-                return "\(target.title) 已在运行（检测到未受控实例 running_unprotected，未受保护）。"
-            }
             return "\(target.title) 已在运行。"
         }
         let sampleTime = switcher.isFixture ? monitor.now.timeIntervalSince1970 : now.timeIntervalSince1970
@@ -138,9 +132,6 @@ struct GraphLaunchButton: View {
            snapshot.health.state == "running",
            MonitorSnapshotTiming.isCurrent(capturedAt: snapshot.capturedAt, now: sampleTime),
            target.hasRunningDesktop(in: snapshot.processes) {
-            if !unmanaged.isEmpty {
-                return "\(target.title) 已在运行（检测到未受控实例 running_unprotected，未受保护）。"
-            }
             return "\(target.title) 已在运行。"
         }
         return nil

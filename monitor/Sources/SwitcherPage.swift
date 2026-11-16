@@ -536,7 +536,7 @@ struct SwitcherPage: View {
             .labelsHidden()
             .frame(maxWidth: .infinity)
             .disabled(policy.actions.count < 2)
-            .help(policy.actions.count < 2 ? "该服务当前只能配置为提示" : "选择偏离时的处置动作")
+            .help(policy.actions.count < 2 ? "该服务当前只能配置为提示" : "正常关闭发送退出请求，不自动强杀；强制关闭直接结束进程，可能丢失未保存内容。")
         }
     }
     private var protectionContent: some View {
@@ -868,7 +868,7 @@ struct EnvironmentCheckTile: View {
     /// Only live, current samples carry the diff; a historical badge already
     /// tells the whole "not current" story without mixing in a change marker.
     private var changeNote: String? {
-        guard !stale, let previous, previous.current != row.current || previous.state != row.state else { return nil }
+        guard row.id != "guard", !stale, let previous, previous.current != row.current || previous.state != row.state else { return nil }
         if let old = previous.current, !old.isEmpty, old != row.current { return "上一轮：" + old }
         return "上一轮：" + previous.statusLabel
     }

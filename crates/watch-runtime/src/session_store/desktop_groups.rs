@@ -107,8 +107,8 @@ impl SessionStore {
             || audit["observed_at"].as_f64().is_none_or(|at| !at.is_finite() || at < current.created_at)
             || audit["egress_reference"]["checked_at"].as_f64().is_none_or(|at| !at.is_finite() || at < current.created_at)
         { return Err(CoreError::new("egress_unconfirmed", "集合复核需要成员变化之后的新采样")); }
-        let _observations = self.storage.lock("observations", None)?;
         let receipts = ReceiptStore { storage: self.storage.clone() };
+        let _observations = receipts.lock_observations()?;
         let risk = receipts.session_risk(audit["context_id"].as_str().unwrap_or(""), Some(&measured.ip), now);
         if ["dns", "webrtc"].iter().any(|kind| risk["sources"][*kind]["observed_at"].as_f64()
             .is_none_or(|at| !at.is_finite() || at < current.created_at))
@@ -134,36 +134,8 @@ impl SessionStore {
             verified.last_reason = current.last_reason.clone();
             verified.locked_at = current.locked_at;
         }
-        // Leases are observation records, not stop permissions. Roll back all
-        // writes if either a later lease or the authoritative session fails.
-        let mut previous = Vec::new();
-        for (desktop, _) in bindings {
-            let path = self.storage.paths.watch().join(format!("state/sessions/rust-{}.session", desktop.pid));
-            previous.push((path.clone(), self.storage.read_bytes(&path, 16 * 1024)?));
-        }
-        let result = (|| {
-            let leases = crate::lease_store::LeaseStore { storage: self.storage.clone() };
-            for (desktop, stamp) in bindings { leases.save_desktop(desktop, stamp, now, provider)?; }
-            self.save(&verified)
-        })();
-        if let Err(error) = result {
-            let mut failed = false;
-            for (path, old) in previous {
-                let restored = match old {
-                    Some(bytes) => self.storage.atomic_bytes(&path, &bytes, 0o600),
-                    None => self.storage.guarded(&path).and_then(|path| {
-                        match std::fs::remove_file(&path) {
-                            Ok(()) => Ok(()),
-                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                            Err(_) => Err(CoreError::new("revalidation_lease_rollback_failed", "观察记录撤销失败")),
-                        }
-                    }),
-                };
-                failed |= restored.is_err();
-            }
-            if failed { return Err(CoreError::new("revalidation_lease_rollback_failed", "集合观察记录未全部恢复")); }
-            return Err(error);
-        }
+        crate::lease_store::LeaseStore { storage: self.storage.clone() }
+            .commit_desktops(bindings, now, provider, || self.save(&verified))?;
         Ok(Some(verified))
     }
 }

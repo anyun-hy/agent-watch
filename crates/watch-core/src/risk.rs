@@ -115,6 +115,7 @@ pub fn session_risk(input: &SessionRiskInput<'_>) -> Value {
     let mut times = Vec::<f64>::new();
     let mut dns_valid = false;
     let mut rtc_valid = false;
+    let mut network_validated = 0;
     let current_ip = input.current_ip.filter(|v| !v.is_empty());
     for (key, value) in [("dns", input.dns), ("webrtc", input.webrtc)] {
         let receipt = &value["receipt"];
@@ -127,7 +128,9 @@ pub fn session_risk(input: &SessionRiskInput<'_>) -> Value {
             .cloned()
             .unwrap_or(Value::Null);
         let sampled = sampled_raw.as_f64();
-        let fresh = sampled.is_some_and(|v| v.is_finite() && (0.0..=300.0).contains(&(now - v)));
+        let reused = value["state"] == "ok"
+            && crate::receipts::network_reusable(receipt, input.context_id, current_ip);
+        let fresh = reused || sampled.is_some_and(|v| v.is_finite() && (0.0..=300.0).contains(&(now - v)));
         let addresses = if key == "dns" {
             receipt
                 .pointer("/http/egress_ips")
@@ -146,7 +149,7 @@ pub fn session_risk(input: &SessionRiskInput<'_>) -> Value {
                 })
                 .unwrap_or_default()
         };
-        let bound = current_ip.is_none_or(|ip| addresses == vec![Value::String(ip.into())]);
+        let bound = reused || current_ip.is_none_or(|ip| addresses == vec![Value::String(ip.into())]);
         let state = if fresh && bound {
             text(value, "state").unwrap_or("unknown")
         } else {
@@ -162,6 +165,7 @@ pub fn session_risk(input: &SessionRiskInput<'_>) -> Value {
             reasons.push(json!({"code":format!("{key}_risk"),"detail":detail,"source":key,"observed_at":sampled_raw}));
         }
         if state == "ok" {
+            if reused { network_validated += 1; }
             if let Some(sampled) = sampled {
                 times.push(sampled);
             }
@@ -224,7 +228,9 @@ pub fn session_risk(input: &SessionRiskInput<'_>) -> Value {
     }
     let observed = times.iter().copied().min_by(f64::total_cmp);
     if times.len() == 2 {
-        return json!({"state":"safe","observed_at":observed,"sources":sources});
+        let mut result = json!({"state":"safe","observed_at":observed,"sources":sources});
+        if network_validated == 2 { result["validated_at"] = json!(now); }
+        return result;
     }
     json!({"state":"unknown","observed_at":observed,"sources":sources,"reason":{"code":"risk_evidence_unavailable","detail":"DNS/WebRTC 当前有效证据尚未齐全","source":"自动检测","observed_at":now}})
 }

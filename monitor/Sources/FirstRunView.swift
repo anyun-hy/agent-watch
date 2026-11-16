@@ -159,11 +159,6 @@ struct FirstRunView: View {
                     Text("DNS 需要多轮查询，请等待本轮完成。")
                         .font(WatchTypography.caption).foregroundStyle(p.secondary)
                 }
-                if row.status == .running, row.step == .dns || row.step == .webrtc,
-                   let browser = leakChecks.browserViews[row.step == .dns ? .dns : .webrtc] {
-                    CoffeeCollectorView(browser: browser, onDetach: row.step == .dns ? { store.leakChecks.reattachDNSBrowser($0) } : nil).frame(height: 72)
-                        .clipShape(RoundedRectangle(cornerRadius: 10))
-                }
                 if row.status == .authorization, let request = initialization.approval {
                     HStack(spacing: 12) {
                         Button(request.action == .accessibility ? "查看并授权…" : "查看并确认…") { showingApproval = request }.frame(minHeight: 36)

@@ -210,7 +210,7 @@ impl Home {
         route: Option<&'static str>,
         backend_executable: Option<std::path::PathBuf>,
     ) -> Macos<Fixture, NoNetwork, NoWrites> {
-        Macos {
+        Macos { request_evidence: true,
             runner: Fixture {
                 mode,
                 route,

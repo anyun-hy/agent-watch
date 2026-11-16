@@ -25,9 +25,10 @@ class DeploymentContract(unittest.TestCase):
 
     def test_process_identity_race_is_not_claimed_atomic(self):
         control = (ROOT / "monitor/Sources/AIProcessControl.swift").read_text(encoding="utf-8")
-        self.assertIn("let latest = lookup(target.pid)", control)
-        self.assertIn("cannot", control)
-        self.assertIn("atomic", control)
+        self.assertIn("expected.sameProcess(as: current)", control)
+        system = (ROOT / "crates/watch-system/src/lib.rs").read_text(encoding="utf-8")
+        self.assertIn("fn send_bound_signal", system)
+        self.assertIn("actual.audit_token == expected.audit_token", system)
 
 
 if __name__ == "__main__":

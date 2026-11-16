@@ -141,6 +141,41 @@ def changed_file(before: dict, after: dict) -> bool | None:
             or not after.get("stable_during_capture") or any(before.get(key) != after.get(key) for key in keys))
 
 
+def build_level_plan(level: int) -> tuple[list[Step], dict]:
+    """Bounded entry points; the existing mixed inventory remains explicit."""
+    toolchain = Step("rust.toolchain", "prerequisite", prepare=[{"kind": "installed_rust_toolchain"}])
+    if level == 1:
+        steps = [toolchain, Step("rust.contracts", "test",
+            [["cargo", "test", "--locked", "--message-format=json"]], dependencies=["rust.toolchain"],
+            notes=["Workspace default-members selects watch-core only; no native helper, GUI or service fixtures."])]
+        scope = "Level 1: pure in-memory Rust policy contracts only"
+    elif level == 2:
+        cases = [
+            ("rust.native_gateway", "i02_and_p01_live_loopback_tcp_socket_attribution_and_protocol_relay"),
+            ("rust.native_seatbelt", "p01_child_process_seatbelt_profile_blocks_direct_tcp_vpn_udp_and_unix_relays_while_allowing_gateway"),
+        ]
+        steps = [toolchain] + [Step(sid, "test",
+            [["cargo", "test", "--locked", "--message-format=json", "-p", "claude-watch-runtime",
+              "--test", "sandbox_gateway_contracts", case, "--", "--exact", "--nocapture", "--test-threads=1"]],
+            dependencies=["rust.toolchain"], test_files=["crates/watch-runtime/tests/sandbox_gateway_contracts.rs"],
+            success_markers=["test result: ok. 1 passed; 0 failed"], timeout_seconds=300,
+            notes=["Owned loopback sockets, temporary files and standalone test children only; no app bundle, root or launchd.",
+                   "Kernel/Seatbelt unavailability is a failure, not a pass or automatic fallback."])
+            for sid, case in cases]
+        scope = "Level 2: selected unprivileged native gateway/Seatbelt boundaries; not installed-service acceptance"
+    elif level == 3:
+        steps = [Step("acceptance.root_gateway", "excluded", excluded_reason="Requires separate authorization for temporary root launchd setup and cleanup.",
+            notes=["Existing tests: launchd_gateway::tests::gateway_launchd_activation_diagnostic and gateway_cross_uid_server_fixture / gateway_cross_uid_client_fixture.",
+                   "Review reserved fixture port 1022, private /Library/PrivilegedHelperTools fixture paths, signed test executables and matching ordinary-user identity before setup; never stop another service."]),
+            Step("acceptance.installed_runtime", "excluded", excluded_reason="Requires the installed product and separately authorized real-account/AppKit and service lifecycle acceptance.",
+            notes=["Verify initialization, daemon restart/recovery, real exit confirmation and account switching separately; local fixtures are not those results.",
+                   "Agents must not build application bundles. Reinstallation follows docs/REINSTALL_WORKFLOW.md and is performed by the user."])]
+        scope = "Level 3: acceptance inventory only; no execution or pass claimed"
+    else:
+        raise ValueError(f"Unknown test level: {level}")
+    return steps, {"level": level, "scope": scope}
+
+
 def build_plan(run_dir: Path) -> tuple[list[Step], dict]:
     manifest = json.loads(MANIFEST.read_text())
     entries = manifest["entries"]
@@ -164,7 +199,7 @@ def build_plan(run_dir: Path) -> tuple[list[Step], dict]:
         Step("rust.workspace", "test", [["cargo", "test", "--workspace", "--locked", "--no-fail-fast", "--message-format=json",
               "--", "--test-threads=1", "--nocapture"]], dependencies=["rust.build", "macos.gui_session"],
              environment=cargo_env, timeout_seconds=7200,
-             notes=["Default Cargo tests; automatic opt-in cases have separate entries; the root launchd diagnostic requires separate authorization and is excluded.",
+             notes=["Explicit full workspace fixtures, not the default Level 1; root launchd diagnostics require separate authorization and are excluded.",
                     "May open owned fixture windows and terminate owned child processes."]),
         Step("rust.engine", "prerequisite", [[variables["engine"], "--component-paths"]], dependencies=["rust.build"], prepare=[
             {"kind": "require_file", "path": "{engine}"}]),
@@ -719,11 +754,18 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, help="New output directory; existing directories are never overwritten")
     parser.add_argument("--list", action="store_true", help="Read-only inventory; do not compile or run anything")
+    selection = parser.add_mutually_exclusive_group()
+    selection.add_argument("--level", type=int, choices=(1, 2, 3), help="1: pure contracts (default); 2: native gateway; 3: acceptance inventory only")
+    selection.add_argument("--all-fixtures", action="store_true", help="Explicit legacy mixed suite; includes GUI and application-building fixtures")
     parser.add_argument("--only", action="append", default=[], metavar="ID", help="Run a named step and its dependencies (repeatable)")
     args = parser.parse_args(argv)
     output = (args.output or ROOT / ".agent/test-runs" /
               (dt.datetime.now().strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:8])).absolute()
-    steps, coverage = build_plan(output)
+    if args.all_fixtures or (args.only and args.level is None):
+        # Preserve explicit named reruns without pulling them into the default.
+        steps, coverage = build_plan(output)
+    else:
+        steps, coverage = build_level_plan(args.level or 1)
     if args.only:
         selected = set(args.only)
         lookup = {s.id: s for s in steps}
@@ -741,6 +783,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.list:
         print(json.dumps({"coverage": coverage, "steps": [asdict(step) for step in steps]}, ensure_ascii=False, indent=2))
         return 0
+    if args.level == 3:
+        parser.error("Level 3 requires a separately authorized host acceptance session; use --level 3 --list to review its scope. No tests were run.")
     if output.exists():
         parser.error(f"Output directory already exists: {output}")
     env = clean_environment(dict(os.environ), ROOT, output)
@@ -755,7 +799,9 @@ def main(argv: list[str] | None = None) -> int:
     (output / "run-info.json").write_text(json.dumps(metadata, indent=2) + "\n")
     print(f"Results and logs: {output}", flush=True)
     error = None
-    if platform.system() != "Darwin" or platform.machine() != "arm64":
+    if coverage.get("level") == 1:
+        pass  # Pure rules do not require a macOS GUI session or native helpers.
+    elif platform.system() != "Darwin" or platform.machine() != "arm64":
         error = "The native fixture suite requires Apple Silicon macOS; no tests were run"
     elif os.geteuid() == 0:
         error = "Run as the logged-in user, without sudo; UID rejection tests require an unprivileged process"

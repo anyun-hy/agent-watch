@@ -52,6 +52,8 @@ impl Request {
             "protection" => (&["preview", "apply"], &["apply"], &["plan-id"]),
             "environment" => (&[], &["online", "record"], &["mode"]),
             "dns-leak-record" | "webrtc-risk-record" => (&[], &["apply"], &[]),
+            "evidence" => (&["refresh", "inspect"], &["apply"], &[]),
+            "process-exit" => (&["prepare", "apply"], &["apply", "force"], &["family", "protect-pid"]),
             "launch" => (&[], &["apply"], &["target", "target-bundle"]),
             "setup" => (
                 &["inspect", "detect", "preview", "apply", "recover"],
@@ -369,6 +371,16 @@ impl Request {
 #[cfg(test)]
 mod cli_target_contracts {
     use super::*;
+    #[test]
+    fn process_exit_requires_explicit_apply_and_has_no_force_fallback() {
+        let prepare = Request::parse(&["process-exit", "prepare", "--family", "claude"].map(str::to_owned)).unwrap();
+        assert_eq!(prepare.value("family"), Some("claude"));
+        assert!(!prepare.flag("apply"));
+        let apply = Request::parse(&["process-exit", "apply"].map(str::to_owned)).unwrap();
+        assert_eq!(apply.require_apply().unwrap_err().code, "explicit_apply_required");
+        Request::parse(&["process-exit", "apply", "--apply"].map(str::to_owned)).unwrap().require_apply().unwrap();
+        assert!(Request::parse(&["process-exit", "apply", "--force"].map(str::to_owned)).unwrap().require_apply().is_err());
+    }
     #[test]
     fn opaque_tail_keeps_parent_authorization_and_debug_separate() {
         let request = Request::parse(

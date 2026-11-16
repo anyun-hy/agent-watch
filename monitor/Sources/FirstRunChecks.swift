@@ -218,7 +218,7 @@ final class FirstRunChecks: InitializationChecking {
             // into a full multi-minute restart of the network checks.
             let kind: LeakKind = step == .dns ? .dns : .webrtc
             if store.leakChecks.initializationReceiptIsCurrent(kind) { continue }
-            let result = await checkNetwork(step, forceNew: true)
+            let result = await checkNetwork(step, forceNew: false)
             guard !Task.isCancelled else { return .failed(step: step, code: "cancelled", detail: "自动刷新已取消，请重新检查。") }
             if case .failed(let code, let detail) = result {
                 let failingStep: InitializationStep = ["context_unavailable", "context_changed"].contains(code) ? .connection : step
@@ -269,7 +269,8 @@ final class FirstRunChecks: InitializationChecking {
     private var hasCurrentProtectionReadback: Bool {
         let now = Date().timeIntervalSince1970
         guard let audit = store.switcher.currentEnvironment, !store.switcher.currentEnvironmentIsHistorical,
-              audit.observed_at <= now, now < audit.expires_at else { return false }
+              let expiry = audit.audit_expires_at, expiry.isFinite,
+              audit.observed_at.isFinite, audit.observed_at <= now, now < expiry else { return false }
         return [LeakKind.dns, .webrtc].allSatisfy {
             backendReceiptFailure($0, environmentContext: audit.context_id, requireEnvironment: true) == nil
         }
@@ -329,6 +330,9 @@ final class FirstRunChecks: InitializationChecking {
             return .failed(code: "environment_not_ready", detail: "尚未取得启用守护前的环境预检结果。")
         }
         if let failure = receiptFailure(environmentContext: environment.context_id) { return failure }
+        guard hasCurrentProtectionReadback else {
+            return .failed(code: "environment_receipt_unavailable", detail: "启用守护所用的环境回执已过期或尚未确认，请重新检查。")
+        }
         return InitializationEnvironmentGate.evaluate(environment,
             policy: store.switcher.currentPolicyEvaluation, settings: store.switcher.settings,
             historical: store.switcher.currentEnvironmentIsHistorical, unsavedSettings: store.switcher.hasUnsavedSettings,
@@ -350,9 +354,7 @@ final class FirstRunChecks: InitializationChecking {
             historical: store.switcher.currentEnvironmentIsHistorical,
             unsavedSettings: store.switcher.hasUnsavedSettings, now: now)
         if case .failed = environmentResult { return environmentResult }
-        let expiry = [environment.expires_at,
-                      (store.leakChecks.dns.result?.finishedAt ?? 0) + 300,
-                      (store.leakChecks.rtc.result?.finishedAt ?? 0) + 300].min()!
+        let expiry = environment.expires_at
         return .passed("所有检查均已通过，网络、配置及证据时效一致。进入后继续使用这些检测结果。", validUntil: expiry)
     }
     private func backendReceiptFailure(_ kind: LeakKind, environmentContext: String? = nil,
@@ -366,6 +368,11 @@ final class FirstRunChecks: InitializationChecking {
             return .failed(code: kind.rawValue + "_backend_not_passed", detail: label + "：后台对本轮回执的判定未通过，请重新检查。")
         }
         if requireEnvironment {
+            let current = kind == .dns ? store.switcher.currentEnvironment?.initialization_receipts?.dns
+                                      : store.switcher.currentEnvironment?.initialization_receipts?.webrtc
+            // Network observation health is checked by the connection/final
+            // gate. It does not revoke an already completed leak diagnostic.
+            if current?.network_state == "unavailable" { return nil }
             guard let environmentContext, !environmentContext.isEmpty else {
                 return .failed(code: "environment_context_unavailable", detail: "环境回执缺少网络上下文，无法核对检测结果。")
             }
@@ -412,7 +419,8 @@ final class FirstRunChecks: InitializationChecking {
                                                     requireEnvironment: requireBackendContextMatch) {
                 store.leakChecks.invalidateInitializationReceipt(kind)
                 failures[step] = failure
-            } else if let problem = store.leakChecks.initializationReceiptProblem(kind) {
+            } else if let problem = store.leakChecks.initializationReceiptProblem(kind),
+                      !problem.code.hasSuffix("_context_unavailable") {
                 failures[step] = .failed(code: problem.code, detail: problem.detail + " 请重新检查。")
             }
         }

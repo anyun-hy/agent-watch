@@ -253,6 +253,41 @@ fn seatbelt_setup_saves_backend_and_confirmed_vpn_in_one_transaction_without_vpn
 }
 
 #[test]
+fn changed_vpn_node_requires_preview_and_explicit_save() {
+    use claude_watch_core::vpn::{compare_vpn, ObservedField};
+    use claude_watch_runtime::config_store::ConfigStore;
+    let (home, store) = store();
+    let mut f = seatbelt_fake();
+    let mut cfg = Config::default_for_new_install();
+    cfg.proxy_mode = "tag".into();
+    cfg.proxy_url = "http://127.0.0.1:7890".into();
+    cfg.proxy_group = "AI".into();
+    cfg.vpn_expectation = Some(f.vpn.as_ref().unwrap().to_candidate_expectation().unwrap());
+    store.atomic_json(&store.paths.config(), &cfg.value().unwrap()).unwrap();
+    let before = fs::read(store.paths.config()).unwrap();
+    f.local["tag"]["api"]["selected_node"] = json!("JP-2");
+    let observed = f.vpn.as_mut().unwrap();
+    observed.selected_node = ObservedField::Known("JP-2".into());
+    observed.proxy_chain = ObservedField::Known(vec!["AI".into(), "JP-2".into()]);
+
+    let c = onboarding::detect(&store, &f, "auto", true, &claude_watch_runtime::region_catalog::load_system_catalog()).unwrap();
+    assert_eq!(c["vpn_expectation"]["expected_node"], "JP-2");
+    let options = settings_only_options();
+    let p = onboarding::preview(&store, &f, c["id"].as_str().unwrap(), &options, None).unwrap();
+    assert!(p["confirmation_lines"].as_array().unwrap().iter().any(|v| v.as_str().unwrap().contains("JP-2")));
+    assert_eq!(fs::read(store.paths.config()).unwrap(), before, "detection and preview cannot adopt the changed node");
+    let saved = ConfigStore { storage: store.clone() }.load().unwrap();
+    assert!(!compare_vpn(saved.vpn_expectation.as_ref().unwrap(), f.vpn.as_ref().unwrap(), f.now).is_matched(), "protection must still reject the unconfirmed node");
+
+    onboarding::apply(&store, &mut f, c["id"].as_str().unwrap(), &options, p["id"].as_str().unwrap(), None).unwrap();
+    let saved = ConfigStore { storage: store.clone() }.load().unwrap();
+    assert_eq!(saved.vpn_expectation.as_ref().unwrap().expected_node.as_deref(), Some("JP-2"));
+    assert!(compare_vpn(saved.vpn_expectation.as_ref().unwrap(), f.vpn.as_ref().unwrap(), f.now).is_matched());
+    assert!(f.applied.iter().all(|v| matches!(v["id"].as_str(), Some("watchdog" | "updater"))), "confirmation does not change the VPN");
+    fs::remove_dir_all(home).unwrap();
+}
+
+#[test]
 fn seatbelt_setup_rejects_replaced_source_after_candidate_creation() {
     let (home, store) = store(); let mut f = seatbelt_fake();
     let c = onboarding::detect(&store, &f, "auto", true, &claude_watch_runtime::region_catalog::load_system_catalog()).unwrap();

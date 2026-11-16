@@ -51,11 +51,8 @@ pub trait AuditSystem {
     }
     /// A launch may ask the adapter to refresh a bounded DNS/WebRTC probe. A
     /// missing probe is not made safe; persisted current-context receipts decide.
-    fn refresh_dns(&mut self) -> Result<Option<Value>> {
-        Ok(None)
-    }
-    fn refresh_webrtc(&mut self) -> Result<Option<Value>> {
-        Ok(None)
+    fn refresh_leaks(&mut self, _local: &Value, _include_webrtc: bool) -> Result<(Option<Value>, Option<Value>)> {
+        Ok((None, None))
     }
     /// A launch re-probes UDP/STUN so the gate never trusts a cached answer.
     /// The periodic environment view does not call this and reuses the receipt
@@ -241,7 +238,7 @@ impl AuditStore {
                 .unwrap_or("");
             let _ = system.refresh_stun(context);
         }
-        let mut online = if scope == AuditScope::Full
+        let mut online = if (scope == AuditScope::Full || scope == AuditScope::Dns)
             && options.online
             && config.online_enabled
             && transport
@@ -266,23 +263,21 @@ impl AuditStore {
             && transport;
         let mut dns_refresh_error = None;
         if dns_refresh_requested {
-            match system.refresh_dns() {
-                Ok(Some(probe)) => {
-                    if let Err(error) = receipts.record_dns(&probe, &before, None, system.now()) {
-                        dns_refresh_error =
-                            Some(json!({"code":error.code,"message":error.message}));
+            match system.refresh_leaks(&before, scope == AuditScope::Full && options.launch) {
+                Ok((dns, webrtc)) => {
+                    if let Some(probe) = webrtc {
+                        receipts.record_webrtc(&probe, &before, None, system.now())?;
+                    }
+                    if let Some(probe) = dns {
+                        if let Err(error) = receipts.record_dns(&probe, &before, None, system.now()) {
+                            dns_refresh_error = Some(json!({"code":error.code,"message":error.message}));
+                        }
                     }
                 }
-                Ok(None) => {}
                 Err(error) if scope == AuditScope::Dns => {
                     dns_refresh_error = Some(json!({"code":error.code,"message":error.message}))
                 }
                 Err(error) => return Err(error),
-            }
-            if scope == AuditScope::Full && options.launch {
-                if let Some(probe) = system.refresh_webrtc()? {
-                    let _ = receipts.record_webrtc(&probe, &before, None, system.now());
-                }
             }
         }
         let now = system.now();
@@ -327,6 +322,11 @@ impl AuditStore {
             transition["state"] = json!("changed");
         } else if missing && transition["state"] != "changed" {
             transition["state"] = json!("sampling_unavailable");
+            // The rule evaluator needs the missing fact as well as the state;
+            // otherwise an empty reason list can leave the launch rows green.
+            if let Some(reasons) = transition["unavailable"].as_array_mut() {
+                reasons.push(json!("network_identity"));
+            }
         }
         before["context_transition"] = transition.clone();
         before["context_changed"] = json!(transition["state"] == "changed");
@@ -338,10 +338,15 @@ impl AuditStore {
             .to_owned();
         if scope != AuditScope::Proxy {
             online["dns"] =
-                receipts.dns_status(&context, options.launch, now, |v| format!("{v:.0}"));
+                receipts.dns_status_for_network(&context, online["trace"]["ip"].as_str(), options.launch, now, |v| format!("{v:.0}"));
         }
         if scope == AuditScope::Full {
-            online["webrtc"] = receipts.webrtc_status(&context, now);
+            online["webrtc"] = receipts.webrtc_status_for_network(&context, online["trace"]["ip"].as_str(), now);
+        }
+        if matches!(transition["state"].as_str(), Some("sampling_unavailable" | "changed")) {
+            for kind in ["dns", "webrtc"] {
+                if online[kind].is_object() { online[kind]["network_state"] = json!(if transition["state"] == "changed" { "changed" } else { "unavailable" }); }
+            }
         }
         let history = if scope == AuditScope::Full {
             self.storage
@@ -422,7 +427,7 @@ impl AuditStore {
         if !options.persist {
             return Ok(output);
         }
-        let _lock = self.storage.lock("observations", None)?;
+        let _lock = ReceiptStore { storage: self.storage.clone() }.lock_observations()?;
         if policy
             != policy_digest(
                 &ConfigStore {

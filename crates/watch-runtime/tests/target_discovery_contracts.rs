@@ -34,6 +34,46 @@ struct Registry {
 }
 
 #[test]
+fn published_discovery_and_runtime_metadata_survive_store_recreation() {
+    use claude_watch_core::channel::PolicyVersion;
+    use claude_watch_runtime::sandbox_launch::{read_runtime_state, SandboxLaunchRegistry};
+    use claude_watch_system::SandboxPeerVerifier;
+    let fixture = Fixture::new();
+    let store = StateStore::new(Paths::new(&fixture.home).unwrap());
+    let snapshot = DiscoverySnapshot {
+        revision: "revision-1".into(), prior_revision: None, complete: true,
+        targets: vec![], issues: vec![], preferred_sources: BTreeMap::new(),
+    };
+    publish_runtime_snapshot(&store, &snapshot, &["pending-fixture".into()], true, "boot-1", &[]).unwrap();
+    let policy = PolicyVersion { policy_digest: "policy-1".into(), guard_policy_digest: "guard-1".into() };
+    let registry = SandboxLaunchRegistry::new("boot-1", policy.clone(), SandboxPeerVerifier {
+        expected_uid: 501, expected_helper_executable: "/fixture/helper".into(),
+        expected_helper_sha256: "a".repeat(64), expected_helper_cdhash: "b".repeat(40),
+    }, Some(store.clone()));
+    let report = registry.identity_report(false, false, true);
+    registry.publish_runtime_state(&policy, Some(12345), false, false, &report, 1000.0).unwrap();
+    drop(store);
+    let restarted = StateStore::new(Paths::new(&fixture.home).unwrap());
+    let discovery = read_runtime_snapshot(&restarted).unwrap();
+    assert_eq!(discovery["snapshot"], json!(snapshot));
+    assert_eq!(discovery["selection_issues"], json!(["pending-fixture"]));
+    assert_eq!(discovery["verification_pending"], true);
+    assert_eq!(discovery["approval_executor_boot_id"], "boot-1");
+    assert_eq!(discovery["script_launch_approvals"], json!([]));
+    let state = read_runtime_state(&restarted).unwrap();
+    assert_eq!(state["executor_boot_id"], "boot-1");
+    assert_eq!(state["configured_policy_version"], json!(policy));
+    assert_eq!(state["identity_report"], json!(report));
+    assert_eq!(state["gateway_endpoint"], "127.0.0.1:12345");
+    assert_eq!(state["updated_at"], 1000.0);
+    assert_eq!(state["sandbox_ready"], false);
+    let held = restarted.lock("seatbelt-runtime", None).unwrap();
+    assert_eq!(registry.publish_runtime_state(&policy, None, false, false, &report, 1001.0).unwrap_err().code, "busy");
+    assert_eq!(read_runtime_state(&restarted).unwrap(), state);
+    drop(held);
+}
+
+#[test]
 fn shutdown_cancels_cold_discovery_between_reads_without_accepting_partial_success() {
     let fixture = Fixture::new();
     for index in 0..24 {

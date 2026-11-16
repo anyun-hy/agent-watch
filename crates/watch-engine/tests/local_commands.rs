@@ -49,6 +49,22 @@ fn call(home: &Home, args: &[&str], input: Option<Value>) -> (i32, Value) {
     )
 }
 #[test]
+fn process_exit_force_requires_matching_explicit_confirmation() {
+    let home = Home::new();
+    let plan = json!({"schema":1,"force":true,"request_id":uuid::Uuid::new_v4().to_string(),
+        "family":"openai","desktop_only":false,"uid":501,"created_at":1.0,"protected":[],"targets":[]});
+    let (_, denied) = call(&home, &["process-exit", "apply", "--force"], Some(plan.clone()));
+    assert_eq!(denied["code"], "explicit_apply_required");
+    let (_, denied) = call(&home, &["process-exit", "apply", "--apply"], Some(plan.clone()));
+    assert_eq!(denied["code"], "exit_action_mismatch");
+    let mut normal = plan;
+    normal["force"] = json!(false);
+    let (_, denied) = call(&home, &["process-exit", "apply", "--apply", "--force"], Some(normal));
+    assert_eq!(denied["code"], "exit_action_mismatch");
+    assert!(!home.0.join("Library").exists(), "rejected requests cannot create runtime state");
+}
+
+#[test]
 fn event_commands_are_bounded_readonly_or_apply_only_and_keep_sensitive_payloads_out() {
     let home = Home::new();
     let query = json!({"filter":"all","query":"","offset":0});

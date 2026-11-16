@@ -22,6 +22,10 @@ impl LeaseStore {
         now: f64,
         provider: Provider,
     ) -> Result<()> {
+        let _lock = self.storage.lock("leases", None)?;
+        self.write_desktop(desktop, stamp, now, provider)
+    }
+    fn write_desktop(&self, desktop: &Desktop, stamp: &str, now: f64, provider: Provider) -> Result<()> {
         if stamp.contains(['|', '\n', '\r']) || stamp.is_empty() {
             return Err(CoreError::new(
                 "desktop_identity_unavailable",
@@ -34,11 +38,7 @@ impl LeaseStore {
             Provider::Chatgpt => "chatgpt",
             Provider::Openai => "openai",
         };
-        let path = self
-            .storage
-            .paths
-            .watch()
-            .join(format!("state/sessions/rust-{}.session", desktop.pid));
+        let path = self.desktop_path(desktop.pid);
         self.storage.atomic_bytes(
             &path,
             format!(
@@ -50,6 +50,40 @@ impl LeaseStore {
             .as_bytes(),
             0o600,
         )
+    }
+
+    fn desktop_path(&self, pid: u32) -> PathBuf {
+        self.directory().join(format!("rust-{pid}.session"))
+    }
+    /// Keep lease replacement and rollback under one lock through session commit.
+    /// The caller retains its operation/session locks; this Store owns lease files.
+    pub(crate) fn commit_desktops<T>(&self, bindings: &[(Desktop, String)], now: f64, provider: Provider,
+        commit: impl FnOnce() -> Result<T>) -> Result<T> {
+        let _lock = self.storage.lock("leases", None)?;
+        let previous: Vec<_> = bindings.iter().map(|(desktop, _)| {
+            let path = self.desktop_path(desktop.pid);
+            self.storage.read_bytes(&path, 16 * 1024).map(|bytes| (path, bytes))
+        }).collect::<Result<_>>()?;
+        let result = (|| {
+            for (desktop, stamp) in bindings { self.write_desktop(desktop, stamp, now, provider)?; }
+            commit()
+        })();
+        if result.is_err() {
+            let mut failed = false;
+            for (path, old) in previous {
+                let restored = match old {
+                    Some(bytes) => self.storage.atomic_bytes(&path, &bytes, 0o600),
+                    None => self.storage.guarded(&path).and_then(|path| match fs::remove_file(path) {
+                        Ok(()) => Ok(()),
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                        Err(_) => Err(CoreError::new("revalidation_lease_rollback_failed", "观察记录撤销失败")),
+                    }),
+                };
+                failed |= restored.is_err();
+            }
+            if failed { return Err(CoreError::new("revalidation_lease_rollback_failed", "观察记录未全部恢复")); }
+        }
+        result
     }
 
     pub fn save_cli(&self, provider: Provider, owner: &Identity, created: f64) -> Result<CliLease> {
@@ -136,6 +170,7 @@ impl LeaseStore {
             return Err(CoreError::new("invalid_lease", "会话身份无效"));
         }
         let id = uuid::Uuid::new_v4().simple().to_string();
+        let _lock = self.storage.lock("leases", None)?;
         self.storage.atomic_json(
             &self.directory().join(format!("{id}.json")),
             &json!({"schema":1,"lease":lease,"created_at":created}),
@@ -148,6 +183,8 @@ impl LeaseStore {
         uid: u32,
         complete: bool,
     ) -> Result<Vec<Lease>> {
+        // Complete reads may delete stale records. Serialize them with every writer.
+        let _lock = if complete { Some(self.storage.lock("leases", None)?) } else { None };
         let directory = self.directory();
         self.storage.guarded(&directory)?;
         let entries = match fs::read_dir(&directory) {
@@ -225,6 +262,7 @@ impl LeaseStore {
     }
     pub fn save_tracked(&self, targets: &[Target], complete: bool) -> Result<()> {
         if complete {
+            let _lock = self.storage.lock("leases", None)?;
             self.storage.atomic_json(
                 &self.storage.paths.watch().join("state/tracked-rust.json"),
                 &json!({"schema":1,"targets":targets}),
@@ -258,6 +296,66 @@ impl Drop for CliLease {
         let _ = self.clear();
     }
 }
+
+#[cfg(test)]
+mod boundary_tests {
+    use super::*;
+    use crate::storage::Paths;
+
+    #[test]
+    fn desktop_commit_keeps_lock_and_restores_disk_on_failure() {
+        let home = std::env::temp_dir().join(format!("cw-lease-boundary-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&home).unwrap();
+        let storage = StateStore::new(Paths::new(&home).unwrap());
+        let leases = LeaseStore { storage: storage.clone() };
+        let first = Desktop { pid: 3001, start_seconds: 100, start_microseconds: 1 };
+        let second = Desktop { pid: 3002, start_seconds: 100, start_microseconds: 2 };
+        let bindings: Vec<(Desktop, String)> = vec![(first.clone(), "first-start".into()), (second.clone(), "second-start".into())];
+        let inventory: BTreeMap<_, _> = bindings.iter().map(|(desktop, stamp)| {
+            (desktop.pid, Identity {
+                pid: desktop.pid, parent: 1, uid: 501, executable: "/fixture/desktop".into(),
+                start_seconds: desktop.start_seconds, start_microseconds: desktop.start_microseconds,
+                start_stamp: stamp.clone(),
+            })
+        }).collect();
+        leases.save_desktop(&first, "first-start", 1000.0, Provider::Claude).unwrap();
+        let original = fs::read(leases.desktop_path(first.pid)).unwrap();
+        let other = LeaseStore { storage: StateStore::new(Paths::new(&home).unwrap()) };
+        let result = leases.commit_desktops(&bindings, 1001.0, Provider::Claude, || {
+            assert_eq!(other.save_desktop(&first, "first-start", 1002.0, Provider::Claude).unwrap_err().code, "busy");
+            assert_eq!(other.load(&BTreeMap::new(), 501, true).unwrap_err().code, "busy");
+            // A separate process observes the same file lock, including during commit.
+            let code = "import fcntl,sys\nf=open(sys.argv[1],'r+b')\ntry: fcntl.flock(f,fcntl.LOCK_EX|fcntl.LOCK_NB)\nexcept BlockingIOError: sys.exit(3)\nsys.exit(0)";
+            let output = std::process::Command::new("python3").args(["-c", code])
+                .arg(storage.paths.base().join("leases.lock")).output().unwrap();
+            assert_eq!(output.status.code(), Some(3));
+            Err::<(), _>(CoreError::new("fixture_commit_failed", "fixture"))
+        });
+        assert_eq!(result.unwrap_err().code, "fixture_commit_failed");
+        assert_eq!(fs::read(leases.desktop_path(first.pid)).unwrap(), original);
+        assert!(!leases.desktop_path(second.pid).exists());
+        assert_eq!(other.load(&inventory, 501, true).unwrap().len(), 1);
+
+        let mut invalid = bindings.clone();
+        invalid[1].1 = "invalid|stamp".into();
+        assert_eq!(leases.commit_desktops(&invalid, 1002.0, Provider::Claude,
+            || -> Result<()> { panic!("partial lease write cannot commit the session") }).unwrap_err().code, "desktop_identity_unavailable");
+        assert_eq!(fs::read(leases.desktop_path(first.pid)).unwrap(), original);
+        assert!(!leases.desktop_path(second.pid).exists());
+
+        leases.commit_desktops(&bindings, 1003.0, Provider::Claude, || Ok(())).unwrap();
+        drop(leases);
+        let restarted = LeaseStore { storage: StateStore::new(Paths::new(&home).unwrap()) };
+        assert_eq!(restarted.load(&inventory, 501, true).unwrap().len(), 2);
+        assert!(restarted.load(&BTreeMap::new(), 501, false).unwrap().is_empty());
+        assert_eq!(restarted.load(&inventory, 501, true).unwrap().len(), 2,
+            "an incomplete process sample must preserve persisted leases");
+        assert!(restarted.load(&BTreeMap::new(), 501, true).unwrap().is_empty());
+        assert!(!restarted.desktop_path(first.pid).exists());
+        fs::remove_dir_all(home).unwrap();
+    }
+}
+
 fn legacy_lease(text: &str, inventory: &BTreeMap<u32, Identity>, uid: u32) -> Option<Lease> {
     let mut fields = text.trim().split('|').collect::<Vec<_>>();
     if fields.len() == 6 {

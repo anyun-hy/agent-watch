@@ -24,6 +24,9 @@ use std::{path::PathBuf, sync::Arc};
 static LISTENER_STREAM: std::sync::OnceLock<
     Arc<claude_watch_runtime::native_listener::ListenerStream>,
 > = std::sync::OnceLock::new();
+pub(crate) fn listener_stream() -> Option<Arc<claude_watch_runtime::native_listener::ListenerStream>> {
+    LISTENER_STREAM.get().cloned()
+}
 pub type Host = Macos<Arc<SystemRunner>, UreqTransport, NativePlatformMutator>;
 /// Commands which may mutate local or system state always require the parser's
 /// explicit `--apply` acknowledgement before an adapter is invoked.
@@ -92,7 +95,7 @@ pub fn host(paths: Paths, authority: Authority) -> Result<Host> {
         .map_err(|e| CoreError::new(&e.code, &e.detail))?
         .with_state_store(storage.clone());
     let mutator = NativePlatformMutator::new(storage.clone())?;
-    Ok(Macos {
+    Ok(Macos { request_evidence: true,
         runner: Arc::new(
             Arc::try_unwrap(runner()?)
                 .map_err(|_| CoreError::new("runner_shared", "采样器初始化冲突"))?
@@ -377,7 +380,9 @@ pub fn dispatch_read(request: &Request, paths: Paths) -> Result<Option<Value>> {
             let options = AuditOptions {
                 online: request.flag("online"),
                 persist,
-                launch: false,
+                // Previews use the same freshness and collection as launch,
+                // while the response below still grants no launch permission.
+                launch: matches!(request.command.as_str(), "check" | "checkdetail"),
             };
             // The same stage announcements the launch path uses, so a launch
             // requirements preview shows which part of the check is running
@@ -535,6 +540,43 @@ pub fn dispatch_operations(request: &Request, paths: Paths) -> Result<Option<Ope
         desktop_native::DesktopRuntime, receipt_store::ReceiptStore,
     };
     use std::time::Instant;
+    if request.command == "process-exit" {
+        use claude_watch_runtime::process_exit::{self, ExitPlan};
+        let runner = runner()?;
+        if request.action.as_deref() == Some("prepare") {
+            let protected = request.value("protect-pid").map(|value| value.parse::<u32>()
+                .map_err(|_| CoreError::new("invalid_arguments", "保护进程参数无效"))).transpose()?;
+            let mut plan = process_exit::prepare(&runner, &paths, request.value("family").unwrap_or(""), false, protected)?;
+            plan.force = request.flag("force");
+            return Ok(Some(OperationOutcome::Receipt(serde_json::to_value(plan)
+                .map_err(|_| CoreError::new("invalid_exit_plan", "退出计划编码失败"))?)));
+        }
+        request.require_apply()?;
+        let plan: ExitPlan = serde_json::from_value(super::bounded_input(65536)?)
+            .map_err(|_| CoreError::new("invalid_exit_plan", "退出计划格式无效"))?;
+        if plan.force != request.flag("force") {
+            return Err(CoreError::new("exit_action_mismatch", "确认的退出方式与计划不一致"));
+        }
+        let helper = process_component()?;
+        let receipt = process_exit::execute(&runner, &paths, &plan,
+            |process| claude_watch_runtime::desktop_native::request_appkit_quit(&helper, process))?;
+        return Ok(Some(OperationOutcome::Receipt(serde_json::to_value(receipt)
+            .map_err(|_| CoreError::new("invalid_exit_receipt", "退出回执编码失败"))?)));
+    }
+    if request.command == "evidence" {
+        use claude_watch_core::evidence::{EvidenceAction, EvidenceRequest};
+        let input: EvidenceRequest = serde_json::from_value(super::bounded_input(8192)?)
+            .map_err(|_| CoreError::new("invalid_evidence_request", "检测请求格式无效"))?;
+        input.validate()?;
+        let expected_action = if request.action.as_deref() == Some("refresh") {
+            request.require_apply()?;
+            EvidenceAction::Refresh
+        } else { EvidenceAction::Inspect };
+        if input.action != expected_action { return Err(CoreError::new("invalid_evidence_request", "检测动作不一致")); }
+        let result = claude_watch_runtime::evidence_client::request_daemon_evidence(
+            &paths, &input, std::time::Duration::from_secs(claude_watch_core::evidence::REQUEST_TIMEOUT_SECONDS))?;
+        return Ok(Some(OperationOutcome::Receipt(result)));
+    }
     let account_action = request.command == "account"
         && matches!(
             request.action.as_deref(),
@@ -562,6 +604,11 @@ pub fn dispatch_operations(request: &Request, paths: Paths) -> Result<Option<Ope
         let value = super::bounded_input(request.input_limit())?;
         let probe = value.get("probe").unwrap_or(&value);
         let expected = value.get("expected_context").and_then(Value::as_str);
+        let expected_ip = value.get("expected_ip").and_then(Value::as_str);
+        let mut probe_val = probe.clone();
+        if let Some(ip) = expected_ip {
+            probe_val["expected_ip"] = json!(ip);
+        }
         let config = ConfigStore {
             storage: storage.clone(),
         }
@@ -569,7 +616,7 @@ pub fn dispatch_operations(request: &Request, paths: Paths) -> Result<Option<Ope
         let local = AuditSystem::local(&host, &config)?;
         let receipts = ReceiptStore { storage };
         if request.command == "dns-leak-record" {
-            let receipt = receipts.record_dns(probe, &local, expected, native::now())?;
+            let receipt = receipts.record_dns(&probe_val, &local, expected, native::now())?;
             let context = receipt["context"].as_str().unwrap_or("");
             let current =
                 receipts.dns_status(context, false, native::now(), |at| format!("{at:.0}"));
@@ -578,7 +625,7 @@ pub fn dispatch_operations(request: &Request, paths: Paths) -> Result<Option<Ope
             )));
         }
         return Ok(Some(OperationOutcome::Receipt(
-            json!({"status":"ok","receipt":receipts.record_webrtc(probe,&local,expected,native::now())?}),
+            json!({"status":"ok","receipt":receipts.record_webrtc(&probe_val,&local,expected,native::now())?}),
         )));
     }
     let authority = if request.flag("apply") || request.command == "guard-tick" {

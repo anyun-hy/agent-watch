@@ -31,8 +31,6 @@ use std::{
 use subprocess::unix::JobExt;
 use subprocess::{Exec, Job, Redirection};
 
-mod close_receipt;
-
 fn channel_process_tokens(targets: &[Target], provider: Provider) -> Vec<claude_watch_core::channel::BoundProcessToken> {
     use claude_watch_core::{channel::BoundProcessToken, processes::ProcessRole};
     let family = PolicyCatalog::family_for(provider).map(|f| f.id);
@@ -51,20 +49,25 @@ pub fn supervision_inventory(round: &crate::sampler::ProcessRound, provider: Pro
     if !round.complete {
         return Err(CoreError::new("channel_inventory_incomplete", "通道进程归属尚未完整确认"));
     }
-    let mut tokens = channel_process_tokens(&round.targets, provider);
+    let tokens = channel_process_tokens(&round.targets, provider);
+    let mut verified = Vec::new();
     let mut desktops = Vec::new();
-    for token in &mut tokens {
+    for mut token in tokens {
         let target = round.targets.iter().find(|t| t.identity.pid == token.pid)
             .ok_or_else(|| CoreError::new("channel_identity_unavailable", "通道进程身份丢失"))?;
-        token.audit_token = Some(claude_watch_system::process_audit_token(token.pid, token.uid,
-            token.start_seconds, token.start_microseconds, &target.identity.executable)
-            .ok_or_else(|| CoreError::new("channel_identity_unavailable", "未取得当前进程的原始系统身份，通道保持阻断"))?);
+        token.audit_token = match claude_watch_system::process_audit_token(token.pid, token.uid,
+            token.start_seconds, token.start_microseconds, &target.identity.executable) {
+            Some(audit) => Some(audit),
+            None if claude_watch_system::is_process_definitely_dead(token.pid) => continue,
+            None => return Err(CoreError::new("channel_identity_unavailable", "未取得当前进程的原始系统身份，通道保持阻断")),
+        };
         if target.kind.desktop() {
             desktops.push((Desktop { pid:token.pid, start_seconds:token.start_seconds, start_microseconds:token.start_microseconds },
                 token.role == claude_watch_core::processes::ProcessRole::DesktopMain, target.identity.start_stamp.clone()));
         }
+        verified.push(token);
     }
-    Ok((desktops, tokens))
+    Ok((desktops, verified))
 }
 
 fn unknown_guard_egress(family: &str, code: &str) -> Value {
@@ -546,11 +549,10 @@ impl<R: ReadRunner> NativeDesktop<R> {
             // a different interpreter or attempting an unapproved launch.
             // Registration still performs the authoritative recheck.
             let store = StateStore::new(crate::storage::Paths { home: selected.home.clone() });
-            let path = store.paths.watch().join("state/target-discovery.json");
             let deadline = Instant::now() + Duration::from_secs(2);
             let exact = serde_json::json!(combo);
             loop {
-                let state = store.read_json(&path, Value::Null)?;
+                let state = crate::target_discovery::read_runtime_snapshot(&store)?;
                 if state["approval_executor_boot_id"] == executor_boot_id
                     && state["script_launch_approvals"].as_array().is_some_and(|rows| rows.contains(&exact))
                 { break; }
@@ -866,32 +868,27 @@ impl<R: ReadRunner> NativeDesktop<R> {
         }
         Ok(())
     }
-    pub fn quit(&self) -> Result<()> {
-        self.request_quit(false, &mut None)
-    }
-    /// Force remains an explicit upstream decision. Completion covers the
-    /// helper's original identities and newly observed family members.
-    pub fn quit_for_confirmed_ip_risk(&self, forced: &mut Option<u32>) -> Result<()> {
-        self.request_quit(true, forced)
-    }
-    fn request_quit(&self, allow_force: bool, forced: &mut Option<u32>) -> Result<()> {
-        *forced = None;
+    pub fn quit(&self, paths: &crate::storage::Paths) -> Result<crate::process_exit::ExitReceipt> {
         self.require_quit_authority()?;
         let family = PolicyCatalog::family_for(self.target.provider()).ok_or_else(|| {
             CoreError::new("protected_scope_mismatch", "观察目标不属于受监督的服务，不能通过退出入口关闭")
         })?;
-        if allow_force && !family.performable("force") {
-            return Err(CoreError::new("protected_scope_mismatch", "该服务未声明强制退出能力"));
-        }
-        let command = if allow_force { "guard-close-desktop" } else { "close-desktop" };
-        let engine = std::env::current_exe()
-            .map_err(|_| CoreError::new("executable_unavailable", "无法定位运行组件"))?;
-        let engine = engine.to_str()
-            .ok_or_else(|| CoreError::new("invalid_executable", "运行组件路径无效"))?;
-        let request = execute_output(&self.helper, &[command, family.id, "--engine-path", engine], Duration::from_secs(20));
-        close_receipt::finish(request, family.id, allow_force, forced, || self.desktop_tree_running())
+        // Account switching already owns operation. Normal exit never enters
+        // the Supervisor force dispatcher or reacquires that transaction lock.
+        let plan = crate::process_exit::prepare(&self.runner, paths, family.id, family.id == "claude", None)?;
+        crate::process_exit::execute(&self.runner, paths, &plan,
+            |process| request_appkit_quit(&self.helper, process))
     }
 
+}
+pub fn request_appkit_quit(helper: &Path, process: &claude_watch_system::ProcessKernelIdentity) -> Result<bool> {
+    let input = serde_json::to_string(process).map_err(|_| CoreError::new("invalid_exit_identity", "退出身份无效"))?;
+    let bytes = execute_output(helper, &["request-quit", &input], Duration::from_secs(2))?;
+    let value = crate::storage::strict_json(&bytes)?;
+    if value["schema"] != 1 || value["pid"] != process.pid || !value["accepted"].is_boolean() {
+        return Err(CoreError::new("invalid_quit_acknowledgement", "原生退出请求回执无效"));
+    }
+    Ok(value["accepted"] == true)
 }
 pub struct DesktopRuntime<'a, R: ReadRunner, T: Transport, S: AuditSystem + ServiceSystem> {
     pub desktop: &'a mut NativeDesktop<R>,
@@ -1004,12 +1001,7 @@ impl<R: ReadRunner, T: Transport, S: AuditSystem + ServiceSystem> DesktopRuntime
             ));
         }
         let launcher_bin = self.desktop.sandbox_launcher_binary()?;
-        let rt_path = self
-            .storage
-            .paths
-            .watch()
-            .join("state/seatbelt-runtime.json");
-        let rt = self.storage.read_json(&rt_path, Value::Null)?;
+        let rt = crate::sandbox_launch::read_runtime_state(&self.storage)?;
         if rt.is_null() {
             return Err(CoreError::new(
                 "seatbelt_daemon_unavailable",
@@ -1242,6 +1234,31 @@ mod target_contracts {
         assert_eq!(claude[0].start_microseconds, 10);
         assert_eq!(channel_process_tokens(&targets, Provider::Openai).iter().map(|p| p.pid).collect::<Vec<_>>(), [13, 14]);
     }
+    #[test]
+    fn supervision_inventory_skips_only_confirmed_exit_after_sampling() {
+        let mut child = std::process::Command::new("/usr/bin/true").spawn().unwrap();
+        let exited_pid = child.id();
+        assert!(child.wait().unwrap().success());
+        let target = |pid| Target { kind: Kind::CodexCli, identity: ProcessIdentity {
+            pid, parent: 1, uid: claude_watch_system::effective_uid(), executable: "/fixture/exited".into(),
+            start_seconds: 100, start_microseconds: 0, start_stamp: String::new(),
+        }};
+        let mut round = crate::sampler::ProcessRound {
+            id: "exit-after-sampling".into(), uid: claude_watch_system::effective_uid(),
+            targets: vec![target(exited_pid)], identities: Default::default(), roles: serde_json::json!({}),
+            match_evidence: Default::default(), unavailable: vec![], diagnostic_reasons: Default::default(),
+            confirmed_exited_count: 0, complete: true, observed_at: native::now(),
+            discovery: None, system_processes: None,
+        };
+        let (desktops, tokens) = supervision_inventory(&round, Provider::Openai).unwrap();
+        assert!(desktops.is_empty() && tokens.is_empty());
+        // A live PID with a mismatched identity remains an error, not an exit.
+        round.targets = vec![target(std::process::id())];
+        assert_eq!(supervision_inventory(&round, Provider::Openai).unwrap_err().code, "channel_identity_unavailable");
+        round.targets.clear();
+        round.complete = false;
+        assert_eq!(supervision_inventory(&round, Provider::Openai).unwrap_err().code, "channel_inventory_incomplete");
+    }
     struct Reader;
     impl ReadRunner for Reader {
         fn run(&self, command: ReadCommand, _: &[u8], _: Duration, _: usize) -> Result<Output> {
@@ -1297,7 +1314,7 @@ mod target_contracts {
         ).unwrap_err().code, "write_not_authorized");
         // The target belongs to a supervised family, so the exit entry accepts
         // it in principle; only the read-only authority refuses the action.
-        assert_eq!(desktop.quit().unwrap_err().code, "write_not_authorized");
+        assert_eq!(desktop.quit(&crate::storage::Paths::new(&root).unwrap()).unwrap_err().code, "write_not_authorized");
         app(&root, "ChatGPT.app", "com.other.spoof", "ChatGPT");
         assert_eq!(
             desktop

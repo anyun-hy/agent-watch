@@ -95,10 +95,14 @@ fn verified_vpn_sample<S: OnboardingSystem>(system: &S, expectation: &VpnExpecta
 
 fn vpn_candidate<S: OnboardingSystem>(system: &S, config: &Config, values: &Value) -> Result<Option<(VpnExpectation, VpnObservation)>> {
     if !needs_vpn_setup(system, config) { return Ok(None); }
-    // An existing expectation remains authoritative. Re-running first-run
-    // checks must never adopt a deviation as the new expected VPN state.
+    // Keep a matching saved expectation. A changed VPN may produce a proposal
+    // for the existing preview/confirmation flow; detection never saves it.
     if let Some(expected) = config.vpn_expectation.as_ref().filter(|v| v.configured) {
-        return Ok(Some((expected.clone(), verified_vpn_sample(system, expected)?)));
+        match verified_vpn_sample(system, expected) {
+            Ok(observed) => return Ok(Some((expected.clone(), observed))),
+            Err(error) if error.code == "vpn_expectation_mismatched" => {}
+            Err(error) => return Err(error),
+        }
     }
     let seed = VpnExpectation {
         configured: true,

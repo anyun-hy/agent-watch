@@ -539,7 +539,7 @@ mod protection_tests {
         assert!(!config.require_dns && !config.require_stun);
         for criterion in ["ip", "cn", "dns", "webrtc"] {
             // Claude defaults to "force" as declared by its policy family contract.
-            // OpenAI defaults to "close" (preserve process & disconnect channel).
+            // OpenAI defaults to "close" (normal process exit).
             assert_eq!(config.action("claude", criterion), "force");
             assert_eq!(config.action("openai", criterion), "close");
         }

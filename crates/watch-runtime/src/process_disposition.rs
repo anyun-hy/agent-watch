@@ -127,7 +127,11 @@ impl ProcessIntentFence {
         }
         // Recheck the exact kernel identity at the signal boundary. Holding
         // this short lock orders cancellation against the actual signal.
-        Some(claude_watch_system::signal_bound_process(target))
+        match job.intent.action.as_str() {
+            "close" => Some(claude_watch_system::terminate_bound_process(target)),
+            "force" => Some(claude_watch_system::signal_bound_process(target)),
+            _ => None,
+        }
     }
 }
 
@@ -201,6 +205,7 @@ impl ProcessDispositionDispatcher {
 fn current_policy_and_session(
     storage: &StateStore,
     intent: &ProcessDispositionIntent,
+    token: &claude_watch_core::channel::BoundProcessToken,
     now: f64,
 ) -> bool {
     let Some(family) = PolicyCatalog::family(&intent.family) else {
@@ -217,7 +222,8 @@ fn current_policy_and_session(
     };
     config.enabled
         && config.guard_enabled
-        && config.close_action(&intent.risk_code, provider) == "force"
+        && matches!(intent.action.as_str(), "close" | "force")
+        && config.close_action(&intent.risk_code, provider) == intent.action
         && ChannelSupervisor::compute_policy_version(&config)
             .is_ok_and(|v| v == intent.policy_version)
         && SessionStore::for_family(storage.clone(), family.id)
@@ -226,6 +232,9 @@ fn current_policy_and_session(
                 session.is_some_and(|s| {
                     s.session_id == intent.session_id
                         && matches!(s.state, Phase::Active | Phase::Locked)
+                        && (intent.target_instances.contains_key(&token.pid)
+                            || SessionStore::channel_processes(&s).is_ok_and(|tokens|
+                                tokens.is_some_and(|tokens| tokens.contains(token))))
                 })
             })
 }
@@ -262,7 +271,7 @@ fn execute_batch(
 ) -> Option<ProcessDispositionReceipt> {
     let intent = &job.intent;
     let family = PolicyCatalog::family(&intent.family)?;
-    let session_lock = SessionStore::for_family(storage.clone(), family.id).lock_name();
+    let sessions = SessionStore::for_family(storage.clone(), family.id);
     if stop.load(Ordering::Acquire)
         || Instant::now() >= job.deadline
         || !job.fence.claim(intent, native::now())
@@ -276,7 +285,7 @@ fn execute_batch(
         before_target(index);
         let mut result = TargetProcessDispositionResult {
             pid: token.pid,
-            requested_action: "force_quit".into(),
+            requested_action: if intent.action == "force" { "force_quit" } else { "quit" }.into(),
             terminated: false,
             process_state: "identity_mismatch".into(),
             timestamp: native::now(),
@@ -302,13 +311,13 @@ fn execute_batch(
                 // Serialize the last policy/session read against their writers,
                 // outside the short intent fence. A busy lock fails closed.
                 let current = storage.lock("operation", None).ok().and_then(|op| {
-                    storage
-                        .lock(&session_lock, None)
+                    sessions
+                        .lock()
                         .ok()
                         .map(|session| (op, session))
                 });
                 let signal = current.and_then(|_locks| {
-                    current_policy_and_session(storage, intent, native::now())
+                    current_policy_and_session(storage, intent, token, native::now())
                         .then(|| job.fence.signal(job, &target, stop, batch_deadline))
                         .flatten()
                 });
@@ -337,7 +346,7 @@ fn execute_batch(
                 return true;
             }
             results[*index].terminated = true;
-            results[*index].process_state = "terminated".into();
+            results[*index].process_state = "confirmed_exit_after_request".into();
             results[*index].timestamp = native::now();
             false
         });
@@ -585,6 +594,7 @@ mod tests {
         assert_eq!(receipt.process_execution_state, "partially_terminated");
         assert!(!receipt.process_preserved);
         assert!(receipt.target_results[0].terminated);
+        assert_eq!(receipt.target_results[0].process_state, "confirmed_exit_after_request");
         assert_eq!(receipt.target_results[1].process_state, "cancelled");
         assert!(receipt.target_results[1].signal_sent_at.is_none());
         assert!(!first.0.wait().unwrap().success());

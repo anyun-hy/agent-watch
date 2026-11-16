@@ -38,6 +38,56 @@ fn country(v: &Value) -> String {
 fn public(v: &Value) -> Option<String> {
     v.as_str().and_then(public_unicast)
 }
+/// Only a complete success bound to an observed configuration AND egress can
+/// be reused without a diagnostic TTL. Observation/identity deadlines remain
+/// the responsibility of the caller supplying the current network facts.
+pub fn network_reusable(receipt: &Value, context: &str, current_ip: Option<&str>) -> bool {
+    receipt["status"] == "complete" && receipt["context_id"] == context && !context.is_empty()
+        && !truthy(&receipt["errors"])
+        && receipt.get("finished_at").or_else(|| receipt.get("sampled_at"))
+            .and_then(Value::as_f64).is_some_and(|at| at.is_finite() && at > 0.0)
+        && (receipt["comparison"]["state"] == "ok" || receipt["risk"]["state"] == "ok")
+        && public(&receipt["network_egress_ip"]).is_some_and(|ip|
+            current_ip.and_then(public_unicast).as_deref() == Some(ip.as_str()))
+}
+fn bound_egress(local: &Value) -> Option<String> {
+    (local["evidence_network_bound"] == true).then(|| public(&local["evidence_egress_ip"])).flatten()
+}
+fn bind_receipt(mut receipt: Value, local: &Value) -> Value {
+    if let Some(ip) = bound_egress(local) { receipt["network_egress_ip"] = json!(ip); }
+    receipt
+}
+pub fn network_state(receipt: &Value, context: &str, current_ip: Option<&str>) -> &'static str {
+    let Some(previous) = public(&receipt["network_egress_ip"]) else { return "unbound" };
+    if !context.is_empty() && receipt["context_id"] != context { return "changed"; }
+    let Some(current) = current_ip.and_then(public_unicast) else { return "unavailable" };
+    if context.is_empty() { "unavailable" }
+    else if receipt["context_id"] != context || previous != current { "changed" }
+    else { "confirmed" }
+}
+/// User references are diagnostic input, never network identity or permission.
+pub fn expected_addresses(input: &str) -> Result<BTreeSet<String>> {
+    let invalid = || CoreError::new("invalid_expected_ip", "请输入公网 IPv4 或 IPv6 地址，以逗号分隔");
+    if input.len() > 4096 { return Err(invalid()); }
+    let tokens: Vec<_> = input.split(|c: char| c.is_whitespace() || matches!(c, ',' | '，' | ';' | '；'))
+        .filter(|s| !s.is_empty()).collect();
+    if tokens.len() > 32 { return Err(invalid()); }
+    tokens.into_iter().map(|s| public_unicast(s).ok_or_else(invalid)).collect()
+}
+pub fn expected_ip_diagnostic(observations: &Value, input: &str) -> Result<Value> {
+    let expected = expected_addresses(input)?;
+    if expected.is_empty() { return Ok(Value::Null); }
+    let candidates: BTreeSet<_> = observations.as_array().into_iter().flatten()
+        .filter(|v| matches!(text(v, "kind"), "host" | "srflx" | "prflx"))
+        .filter_map(|v| public(&v["address"])).collect();
+    let state = if candidates.is_empty() { "unknown" }
+        else if candidates.is_subset(&expected) { "ok" } else { "fail" };
+    Ok(json!({"state":state,"expected_ips":expected,"detail":match state {
+        "ok" => "WebRTC 公网候选与填写的预期出口一致（仅供诊断参考）",
+        "fail" => "WebRTC 公网候选与填写的预期出口不一致（仅供诊断参考）",
+        _ => "未取得公网候选，无法核对填写的预期出口"
+    }}))
+}
 fn errors(v: &Value) -> Value {
     Value::Array(v.as_array().into_iter().flatten().filter(|v|v.is_object()).take(32).map(|v|json!({
         "stage":clipped(v,"stage",80),"code":clipped(v,"code",80),"message":clipped(v,"message",240)
@@ -131,11 +181,7 @@ fn local_context<'a>(local: &'a Value, expected: Option<&str>, webrtc: bool) -> 
         &local["context"]
     };
     let context = context.as_str().unwrap_or("");
-    let context_ok = if webrtc {
-        expected.is_none_or(|s| s == context || s == tag_signature(local))
-    } else {
-        expected.is_none_or(|s| !s.is_empty() && s == tag_signature(local))
-    };
+    let context_ok = expected.is_none_or(|s| s == context || (!s.is_empty() && s == tag_signature(local)));
     if (webrtc || expected.is_some())
         && (context.is_empty()
             || !context_ok
@@ -243,6 +289,7 @@ pub fn record_dns(probe: &Value, local: &Value, expected: Option<&str>, now: f64
     let codes = evidence.as_ref().map(|v| &v.0);
     let mut dns = BTreeSet::new();
     let mut http = BTreeSet::new();
+    let mut observations = Vec::new();
     let (mut seen_dns, mut seen_http, mut missing) = (false, false, false);
     for row in probe["observations"].as_array().into_iter().flatten() {
         let bucket = match text(row, "kind") {
@@ -275,6 +322,8 @@ pub fn record_dns(probe: &Value, local: &Value, expected: Option<&str>, now: f64
             continue;
         };
         bucket.insert((address, code.clone()));
+        observations.push(json!({"address":row["address"],"kind":row["kind"],
+            "country":code,"source":clipped(row,"source",160)}));
     }
     if let Some((_, resolvers, reference)) = &evidence {
         if resolvers
@@ -353,16 +402,16 @@ pub fn record_dns(probe: &Value, local: &Value, expected: Option<&str>, now: f64
         )
     };
     let context = local_context(local, expected, false)?;
-    Ok(
+    Ok(bind_receipt(
         json!({"schema":1,"status":probe["status"],"observed_at":now,"recorded_at":now,
         "started_at":started,"finished_at":finished,"sampled_at":finished,
         "display_expires_at":finished+DNS_DISPLAY_TTL,"launch_expires_at":finished+DNS_LAUNCH_TTL,
         "context":context,"context_id":context,"provider":"ipleak",
         "dns":{"egress_ips":dns.iter().map(|v|v.0.clone()).collect::<Vec<_>>(),"countries":dns_countries,"source":"IPLeak.net WebView authoritative DNS"},
         "http":{"egress_ips":http.iter().map(|v|v.0.clone()).collect::<Vec<_>>(),"countries":http_countries,"source":"IPLeak.net WebView HTTP reference"},
-        "comparison":compare,"errors":errors(&probe["errors"]),"query_error":query_error(&probe["errors"]),
-        "scope":probe.get("scope").and_then(Value::as_str).unwrap_or("IPLeak.net DNS 泄漏检测")}),
-    )
+        "comparison":compare,"observations":observations,"errors":errors(&probe["errors"]),"query_error":query_error(&probe["errors"]),
+        "scope":probe.get("scope").and_then(Value::as_str).unwrap_or("IPLeak.net DNS 泄漏检测")}), local,
+    ))
 }
 pub fn dns_last_valid(receipt: &Value, context: &str, now: f64) -> bool {
     let valid_time = number(&receipt["finished_at"])
@@ -384,6 +433,7 @@ pub fn dns_last_valid(receipt: &Value, context: &str, now: f64) -> bool {
 fn dns_state(
     receipt: &Value,
     context: &str,
+    current_ip: Option<&str>,
     launch: bool,
     now: f64,
     stamp: &impl Fn(f64) -> String,
@@ -416,13 +466,18 @@ fn dns_state(
     if !now.is_finite()
         || !(0.0..=90.0).contains(&(recorded - finished))
         || finished > now + 5.0
-        || now > expires
+        || (now > expires && !network_reusable(receipt, context, current_ip))
         || expires > finished + ttl
     {
         return result("unknown", "DNS 检测结果已过期，请重新检测");
     }
     if context.is_empty() || text(receipt, "context") != context {
         return result("unknown", "DNS 检测后的网络或代理上下文已变化，请重新检测");
+    }
+    if public(&receipt["network_egress_ip"]).is_some()
+        && !network_reusable(receipt, context, current_ip)
+        && receipt["comparison"]["state"] == "ok" {
+        return result("unknown", "当前出口未确认或已变化，请核对网络后重新检测");
     }
     if !receipt["comparison"].is_object() {
         return result("unknown", "DNS 检测比较结果缺失");
@@ -463,7 +518,13 @@ pub fn dns_status(
     now: f64,
     stamp: impl Fn(f64) -> String,
 ) -> Value {
-    let (state, detail) = dns_state(receipt, context, launch, now, &stamp);
+    dns_status_for_network(receipt, last_valid, context, None, launch, now, stamp)
+}
+pub fn dns_status_for_network(
+    receipt: &Value, last_valid: &Value, context: &str, current_ip: Option<&str>,
+    launch: bool, now: f64, stamp: impl Fn(f64) -> String,
+) -> Value {
+    let (state, detail) = dns_state(receipt, context, current_ip, launch, now, &stamp);
     let cacheable = state == "unknown"
         && text(receipt, "context") == context
         && (matches!(text(receipt, "status"), "partial" | "error" | "timeout")
@@ -476,7 +537,7 @@ pub fn dns_status(
             "context_changed" | "context_unavailable"
         );
     let valid = dns_last_valid(last_valid, context, now);
-    let fresh = dns_state(last_valid, context, false, now, &stamp).0 == "ok";
+    let fresh = dns_state(last_valid, context, current_ip, false, now, &stamp).0 == "ok";
     let cached = cacheable && valid;
     json!({"state":state,"detail":detail,"receipt":if receipt.is_object(){receipt.clone()}else{json!({})},
         "display_receipt":if cached{last_valid.clone()}else if receipt.is_object(){receipt.clone()}else{json!({})},
@@ -490,7 +551,7 @@ pub fn record_webrtc(
     expected: Option<&str>,
     now: f64,
 ) -> Result<Value> {
-    let (_, finished) = check_probe(probe, "webrtc", now)?;
+    let (started, finished) = check_probe(probe, "webrtc", now)?;
     let context = local_context(local, expected, true)?;
     if probe["contextChanged"] != false {
         return Err(CoreError::new(
@@ -567,12 +628,18 @@ pub fn record_webrtc(
     } else {
         "WebRTC 未取得完整的同轮 HTTP 出口与公网候选"
     };
-    Ok(
-        json!({"schema":1,"kind":"webrtc","status":probe["status"],"sampled_at":finished,"recorded_at":now,
-        "context_id":context,"risk":{"state":state,"detail":detail,"cn_candidates":cn},"observations":clean,"errors":errors(&probe["errors"])}),
-    )
+    let diagnostic = expected_ip_diagnostic(&json!(clean), text(probe,"expected_ip"))?;
+    Ok(bind_receipt(
+        json!({"schema":1,"kind":"webrtc","status":probe["status"],"started_at":started,"sampled_at":finished,"recorded_at":now,
+        "display_expires_at":finished+DNS_DISPLAY_TTL,"context_id":context,
+        "risk":{"state":state,"detail":detail,"cn_candidates":cn},"diagnostic":diagnostic,
+        "observations":clean,"errors":errors(&probe["errors"])}), local,
+    ))
 }
 pub fn webrtc_status(receipt: &Value, context: &str, now: f64) -> Value {
+    webrtc_status_for_network(receipt, context, None, now)
+}
+pub fn webrtc_status_for_network(receipt: &Value, context: &str, current_ip: Option<&str>, now: f64) -> Value {
     let unknown = |detail: &str| json!({"state":"unknown","detail":detail});
     if receipt["schema"] != 1 || text(receipt, "context_id") != context || context.is_empty() {
         return unknown("WebRTC 尚无当前网络的检测回执");
@@ -583,10 +650,15 @@ pub fn webrtc_status(receipt: &Value, context: &str, now: f64) -> Value {
         return unknown("WebRTC 时间记录无效");
     };
     if !now.is_finite()
-        || !(0.0..=300.0).contains(&(now - sampled))
+        || now < sampled
+        || (now - sampled > DNS_DISPLAY_TTL && !network_reusable(receipt, context, current_ip))
         || !(-5.0..=90.0).contains(&(recorded - sampled))
     {
         return unknown("WebRTC 检测回执已过期");
+    }
+    if public(&receipt["network_egress_ip"]).is_some()
+        && receipt["risk"]["state"] == "ok" && !network_reusable(receipt, context, current_ip) {
+        return unknown("当前出口未确认或已变化，请核对网络后重新检测");
     }
     let risk = &receipt["risk"];
     if !risk.is_object() || !matches!(text(risk, "state"), "ok" | "fail" | "unknown") {

@@ -158,9 +158,8 @@ fn stage_discovery_snapshot(
         .map(|d| d.join("ControlledEntry"))
         .filter(|p| p.is_file());
     let (approval_boot, script_approvals) = registry.script_launch_approval_view();
-    storage.atomic_json(&storage.paths.watch().join("state/target-discovery.json"), &json!({"snapshot":snapshot,
-        "selection_issues":manifest.selection_issues,"verification_pending":manifest.needs_verification_retry,
-        "approval_executor_boot_id":approval_boot, "script_launch_approvals":script_approvals}))?;
+    claude_watch_runtime::target_discovery::publish_runtime_snapshot(storage, snapshot,
+        &manifest.selection_issues, manifest.needs_verification_retry, &approval_boot, &script_approvals)?;
     stage_deliverable_entries(
         &entries_root,
         &discovered_specs,
@@ -364,6 +363,8 @@ fn spawn_vpn_observation_worker(
         .spawn(move || {
             let mut observer = VpnObserver::new(obs_boot_id, Some(storage.clone()));
             let mut watcher = watcher;
+            let listener_stream = custom_reader.is_none().then(super::runtime::listener_stream).flatten();
+            let mut listener_revision = 0;
             watcher.watch_file(storage.paths.config());
             watcher.watch_file(
                 storage
@@ -383,8 +384,30 @@ fn spawn_vpn_observation_worker(
                     .clone()
                     .unwrap_or_else(VpnExpectation::unconfigured);
 
+                // Follow new native evidence instead of repeatedly verifying an
+                // aging frame on an unrelated timer. Keep the existing 250 ms
+                // bound for config/wake checks; a new frame interrupts the wait.
+                let frame_changed = if let Some(stream) = &listener_stream {
+                    match stream.wait_for_revision(listener_revision, Duration::from_millis(250)) {
+                        Ok(revision) => {
+                            let changed = revision != listener_revision;
+                            listener_revision = revision;
+                            changed
+                        }
+                        Err(error) => {
+                            let transition = observer.handle_invalidation_event(error.code, &expectation, native::now());
+                            let _ = event_tx.send(SupervisionEvent::VpnObservationUpdated {
+                                observation: transition.observation, observed_at: native::now(),
+                            });
+                            break;
+                        }
+                    }
+                } else { true };
+                let events = watcher.wait(if listener_stream.is_some() { Duration::ZERO }
+                    else { Duration::from_millis(250) });
+                let notified = events.iter().any(|event| !matches!(event, NetworkEventKind::Timeout));
                 let mut invalidated_by_wake = false;
-                for sys_ev in watcher.wait(Duration::from_millis(250)) {
+                for sys_ev in events {
                     match sys_ev {
                         NetworkEventKind::DarwinNotification(name) => {
                             let transition = observer.handle_invalidation_event(
@@ -452,6 +475,9 @@ fn spawn_vpn_observation_worker(
                 if invalidated_by_wake {
                     continue;
                 }
+                if !frame_changed && !notified {
+                    continue;
+                }
 
                 if let Some(ref reader) = custom_reader {
                     if let Ok(transition) =
@@ -470,11 +496,11 @@ fn spawn_vpn_observation_worker(
                                 expectation.proxy_mode.clone(),
                                 creds,
                             )
-                            .with_listener_snapshot_probe(Box::new(|timeout| {
+                            .with_listener_snapshot_result(Box::new(|timeout| {
                                 // One bounded kernel frame supplies both the
                                 // controller and upstream listener identities.
-                                let runner = super::runtime::runner().ok()?;
-                                claude_watch_runtime::vpn_observer::read_vpn_kernel_snapshot(
+                                let runner = super::runtime::runner()?;
+                                claude_watch_runtime::vpn_observer::read_vpn_kernel_snapshot_checked(
                                     runner.as_ref(), timeout,
                                 )
                             }));
@@ -584,13 +610,7 @@ where F: Fn(&AsyncAuditRequest) -> Result<(Value, Value, f64)> + Send + Sync + '
         enforcer.record_activation_failure(reason, now_ts)?;
     }
 
-    let _ = storage.atomic_json(
-        &storage
-            .paths
-            .watch()
-            .join("state/channel-protocol-coverage.json"),
-        &enforcer.protocol_coverage_boundaries(),
-    );
+    let _ = enforcer.publish_protocol_coverage(&storage);
     register_production_enforcer(&storage.paths.watch(), enforcer.clone());
 
     let (event_tx, event_rx) = std::sync::mpsc::channel();
@@ -695,7 +715,11 @@ impl ProductionChannelStack {
         }
         self.reconcile_controlled_backend_with_listeners(now,
             |reg, path, stop| reg.start_registration_listener(path, stop),
-            |enforcer, stop, now| enforcer.start_launchd_proxy_listener(stop, now))
+            |enforcer, stop, now| {
+                let verified = claude_watch_system::launchd_gateway::acquire_gateway_listener()
+                    .map_err(|error| CoreError::new("gateway_endpoint_unverified_i03", &format!("系统托管网关不可用：{error}")))?;
+                enforcer.start_verified_proxy_listener(verified, stop, now)
+            })
     }
 
     #[cfg(all(test, target_os = "macos"))]
@@ -788,15 +812,8 @@ impl ProductionChannelStack {
         let sandbox_ready = self.apply_backend_identity_gate(&report, components_ready, now)?;
         if let Some(code) = component_error { self.enforcer.record_activation_failure(&code, now)?; }
         // Configuration/registration metadata is not an execution receipt or an applied policy.
-        self.supervisor.storage.atomic_json(&self.supervisor.storage.paths.watch().join("state/seatbelt-runtime.json"), &json!({
-            "backend": "seatbelt", "executor_boot_id": self.enforcer.boot_id()?,
-            "configured_policy_version": self.supervisor.saved_policy_version(),
-            "gateway_endpoint": self.enforcer.local_proxy_port().map(|p| format!("127.0.0.1:{p}")).unwrap_or_default(),
-            "registration_socket": default_registration_socket_path(&self.supervisor.storage.paths.watch()),
-            "components_ready": components_ready,
-            "sandbox_ready": components_ready && sandbox_ready && self.enforcer.sandbox_ready()?,
-            "identity_report": report, "updated_at": now
-        }))?;
+        reg.publish_runtime_state(self.supervisor.saved_policy_version(), self.enforcer.local_proxy_port(),
+            components_ready, components_ready && sandbox_ready && self.enforcer.sandbox_ready()?, &report, now)?;
         Ok(())
     }
 
@@ -820,22 +837,19 @@ impl ProductionChannelStack {
                 SupervisionEvent::EnvironmentUpdated { egress, local_guard, observed_at },
             GuardObservation::InventoryUnavailable { family, observed_at } =>
                 SupervisionEvent::ProcessInventoryUnavailable { family, observed_at },
-            GuardObservation::Inventory { family, mut desktops, mut processes, observed_at } => {
+            GuardObservation::Inventory { family, desktops, processes, observed_at } => {
                 if let Some(ref reg) = self.sandbox_registry {
                     let verified_tokens = reg.verified_family_tokens(&family, delivered_at);
-                    let mut protected_pids: Vec<u32> = verified_tokens.iter().map(|t| t.pid).collect();
+                    let mut protected_pids: Vec<u32> = processes.iter()
+                        .filter(|token| verified_tokens.contains(token)).map(|t| t.pid).collect();
                     protected_pids.sort_unstable();
                     protected_pids.dedup();
                     let mut unprotected_pids: Vec<u32> = processes.iter()
                         .filter(|t| !protected_pids.contains(&t.pid)).map(|t| t.pid).collect();
                     unprotected_pids.sort_unstable();
                     unprotected_pids.dedup();
-                    // Discovered desktops remain visible in the unmanaged
-                    // scope; only current registry members can request audits.
-                    desktops.retain(|(desktop, _, _)| verified_tokens.iter().any(|token|
-                        token.pid == desktop.pid && token.start_seconds == desktop.start_seconds
-                            && token.start_microseconds == desktop.start_microseconds));
-                    processes = verified_tokens;
+                    // All identities from the verified inventory enter supervision.
+                    // Sandbox registration determines gateway coverage only.
                     let id_report = reg.identity_report(true, true, true);
                     self.supervisor.set_family_unmanaged_pids(&family, unprotected_pids.clone(), delivered_at);
                     self.supervisor.set_family_coverage_scope(&family, Some(BackendCoverageScope {
@@ -875,11 +889,7 @@ impl ProductionChannelStack {
             // this pulse grants no network permission or protection readiness.
             if Instant::now() >= next_heartbeat {
                 if let Some(producer) = producer {
-                    self.supervisor.storage.atomic_json(
-                        &self.supervisor.storage.paths.watch().join("state/guard-service-heartbeat.json"),
-                        &json!({"schema":1,"pid":producer.pid,"start_stamp":producer.start_stamp,
-                            "time":native::now()}),
-                    )?;
+                    claude_watch_runtime::services::record_guard_heartbeat(&self.supervisor.storage, producer, native::now())?;
                 }
                 next_heartbeat = Instant::now() + PROCESS_INTERVAL;
             }
@@ -1923,8 +1933,7 @@ mod tests {
             "gateway_server_identity_unverified_i03"
         );
 
-        // Actual ingestion must consume worker VPN events and leave the
-        // supplied, unregistered identity outside managed membership.
+        // External identities enter supervision without gaining gateway coverage.
         let deadline = Instant::now() + Duration::from_secs(2);
         let snap = loop {
             let now = native::now();
@@ -1945,6 +1954,25 @@ mod tests {
                 .contains(&4100),
             "unregistered process must appear in unmanaged_member_pids"
         );
+        assert_eq!(snap.families["claude"].active_members.iter().map(|p| p.pid).collect::<Vec<_>>(), vec![4100]);
+        assert!(snap.families["claude"].coverage_scope.protected_pids.is_empty());
+
+        // Codex already running at the first round, a later launch, then exit.
+        let codex = |pid| BoundProcessToken::with_system_identity(pid, 501, 901, 1, ProcessRole::Cli)
+            .with_audit_token([501, 501, 20, 501, 20, pid, 0, 9]);
+        for pids in [vec![4200], vec![4200, 4201], vec![4201]] {
+            let now = native::now();
+            let s = stack.step_with_observations(vec![GuardObservation::Inventory {
+                family: "openai".into(), desktops: vec![],
+                processes: pids.iter().map(|pid| codex(*pid)).collect(), observed_at: now,
+            }], now).unwrap();
+            let family = &s.families["openai"];
+            assert_eq!(family.active_members.iter().map(|p| p.pid).collect::<Vec<_>>(), pids);
+            assert_eq!(family.unmanaged_member_pids, pids);
+            assert!(family.coverage_scope.protected_pids.is_empty());
+            assert!(!family.sandbox_ready, "monitoring cannot bypass the I03 identity gate");
+            assert_eq!(s.families["claude"].active_members.len(), 1, "families remain independent");
+        }
 
         stack.shutdown();
         let _ = std::fs::remove_dir_all(&root);

@@ -323,12 +323,23 @@ fn fakeip_dns_config_and_normalized_hosts_preserve_boundaries() {
     }
     cases.push(json!({"source":format!("{source}dns:\n  listen: :53\n")}));
     for (c, expected) in cases.iter().zip(oracle("tag_dns_config", &cases)) {
+        // Preserve the recorded input set; only this deliberately supported
+        // disk-profile mode has a new expected result.
+        let expected = if c["source"] == source.replace("enhanced-mode: fake-ip", "enhanced-mode: redir-host") {
+            json!({"value":[5353,"198.18.0.0/16"]})
+        } else { expected };
         let actual = match config::fakeip_dns_config(c["source"].as_str().unwrap()) {
-            Ok((port, range)) => json!({"value":[port,range.canonical()]}),
+            Ok((port, range, _)) => json!({"value":[port,range.canonical()]}),
             Err(e) => json!({"error":e.code}),
         };
         assert_eq!(actual, expected, "{c}");
     }
+    let (port, range, mode) = config::fakeip_dns_config(
+        &source.replace("enhanced-mode: fake-ip", "enhanced-mode: redir-host")).unwrap();
+    assert_eq!(port, 5353);
+    assert_eq!(range.canonical(), "198.18.0.0/16");
+    assert_eq!(mode, "redir-host");
+    assert!(config::fakeip_dns_config(&source.replace("enhanced-mode: fake-ip", "enhanced-mode: unknown")).is_err());
     let hosts: Vec<_> = [
         "Claude.AI.",
         "api.anthropic.com",

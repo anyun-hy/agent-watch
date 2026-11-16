@@ -291,6 +291,54 @@ class UnifiedRunnerTests(unittest.TestCase):
         self.assertEqual(next(s for s in steps if s.id == "webkit.resident_runtime").commands[0][-1], "--fixture")
         self.assertIn("macos.gui_session", next(s for s in steps if s.id == "webkit.resident_runtime").dependencies)
 
+    def test_default_and_native_levels_select_only_their_reviewed_commands(self):
+        for args, level in (([], 1), (["--level", "2"], 2)):
+            with self.subTest(level=level), mock.patch.object(runner_module, "Runner") as execute:
+                output = io.StringIO()
+                with contextlib.redirect_stdout(output):
+                    self.assertEqual(runner_module.main([*args, "--list"]), 0)
+                plan = json.loads(output.getvalue())
+                execute.assert_not_called()
+                self.assertEqual(plan["coverage"]["level"], level)
+                ids = {step["id"] for step in plan["steps"]}
+                self.assertNotIn("rust.workspace", ids)
+                self.assertNotIn("rust.build", ids)
+                self.assertNotIn("macos.gui_session", ids)
+                commands = [cmd for step in plan["steps"] for cmd in step["commands"]]
+                self.assertTrue(all("--workspace" not in cmd for cmd in commands))
+                if level == 1:
+                    self.assertEqual(ids, {"rust.toolchain", "rust.contracts"})
+                    self.assertEqual(commands, [["cargo", "test", "--locked", "--message-format=json"]])
+                else:
+                    source = (ROOT / "crates/watch-runtime/tests/sandbox_gateway_contracts.rs").read_text()
+                    self.assertEqual(len(commands), 2)
+                    for step in plan["steps"][1:]:
+                        cmd = step["commands"][0]
+                        self.assertIn("--exact", cmd)
+                        self.assertIn("fn " + cmd[cmd.index("--") - 1] + "()", source)
+                        self.assertIn("test result: ok. 1 passed; 0 failed", step["success_markers"])
+
+    def test_level_three_is_read_only_and_cannot_report_an_excluded_run_as_passed(self):
+        output = io.StringIO()
+        with mock.patch.object(runner_module, "Runner") as execute:
+            with contextlib.redirect_stdout(output):
+                self.assertEqual(runner_module.main(["--level", "3", "--list"]), 0)
+            plan = json.loads(output.getvalue())
+            self.assertTrue(all(step["excluded_reason"] and not step["commands"] for step in plan["steps"]))
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as error:
+                runner_module.main(["--level", "3", "--output", str(self.output)])
+            self.assertEqual(error.exception.code, 2)
+            execute.assert_not_called()
+            self.assertFalse(self.output.exists())
+
+    def test_explicit_existing_step_keeps_its_dependency_closure(self):
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output), mock.patch.object(runner_module, "Runner") as execute:
+            self.assertEqual(runner_module.main(["--only", "rust.engine", "--list"]), 0)
+        self.assertEqual([step["id"] for step in json.loads(output.getvalue())["steps"]],
+                         ["rust.toolchain", "rust.build", "rust.engine"])
+        execute.assert_not_called()
+
     def test_long_output_path_does_not_lengthen_fixture_socket_paths(self):
         output = self.root / ("long-output-" * 15)
         short_tmp = self.root / "tmp"

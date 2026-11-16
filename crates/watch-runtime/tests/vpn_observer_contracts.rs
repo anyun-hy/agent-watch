@@ -222,6 +222,43 @@ fn collector_replacement_or_frame_replay_fails_source_pair_verification() {
 }
 
 #[test]
+fn fresh_frame_handoff_preserves_original_deadline_and_listener_errors() {
+    use claude_watch_core::error::CoreError;
+    use claude_watch_runtime::{commands::{Output, ReadCommand, ReadRunner},
+        vpn_observer::read_vpn_kernel_snapshot_checked};
+    use std::time::Duration;
+    let (server, expectation) = live_owner_fixture();
+    // Reproduce the captured timing: frame 1282 expires at 1010.580;
+    // the newly delivered frame must replace it before that deadline.
+    let frame = Arc::new(Mutex::new(captured_listener(&server, 1007.080, 1282, "collector-A")));
+    let input = frame.clone();
+    let reader = HttpControllerVpnReader::new_live("tag", server.credentials())
+        .with_listener_snapshot_result(Box::new(move |_| Ok(input.lock().unwrap().clone())));
+    let mut observer = VpnObserver::new("handoff", None);
+    let old = observer.observe_from_reader(&reader, &expectation, false, 1008.0).unwrap();
+    assert_eq!(old.observation.valid_until, 1010.580);
+    *frame.lock().unwrap() = captured_listener(&server, 1009.402, 1283, "collector-A");
+    let fresh = observer.observe_from_reader(&reader, &expectation, false, 1010.144).unwrap();
+    assert!(fresh.verdict.is_matched());
+    assert_eq!(fresh.observation.valid_until, 1012.902);
+    assert!(claude_watch_core::vpn::compare_vpn(&expectation, &fresh.observation, 1010.823).is_matched());
+    assert_eq!(claude_watch_core::vpn::compare_vpn(&expectation, &fresh.observation, 1012.902), VpnMatch::Stale);
+
+    struct FailedListener;
+    impl ReadRunner for FailedListener {
+        fn run(&self, _: ReadCommand, _: &[u8], _: Duration, _: usize) -> Result<Output, CoreError> {
+            Err(CoreError::new("native_listener_origin_changed", "sensitive fixture details"))
+        }
+    }
+    let reader = HttpControllerVpnReader::new_live("tag", server.credentials())
+        .with_listener_snapshot_result(Box::new(|timeout| read_vpn_kernel_snapshot_checked(&FailedListener, timeout)));
+    let failed = observer.observe_from_reader(&reader, &expectation, false, 1011.0).unwrap();
+    assert_eq!(failed.observation.source_error.as_deref(), Some("native_listener_origin_changed"));
+    assert!(matches!(failed.verdict, VpnMatch::Unknown { .. }));
+    assert!(failed.observation.source_instance.is_none());
+}
+
+#[test]
 fn missing_or_empty_kernel_snapshot_cannot_replace_verified_source() {
     let (server, expectation) = live_owner_fixture();
     let mut empty = captured_listener(&server, 999.5, 7, "collector-A");

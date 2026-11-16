@@ -429,7 +429,7 @@ fn v1_supervisor_force_reaps_real_owned_main_and_fork_and_projects_receipt() {
     assert_eq!(authority.target_instances.get(&target.identity.pid), authority.target_instances.get(&child_pid));
     assert_eq!(authority.instance_id.as_ref(), authority.target_instances.get(&child_pid));
     for observed in &outcome.target_results {
-        assert!(observed.terminated && observed.process_state == "terminated");
+        assert!(observed.terminated && observed.process_state == "confirmed_exit_after_request");
         assert!(observed.signal_sent_at.unwrap() <= observed.timestamp);
     }
     assert!(!target.child.wait().unwrap().success());

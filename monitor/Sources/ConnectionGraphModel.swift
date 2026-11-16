@@ -185,7 +185,7 @@ struct ConnectionGraphProjection: Sendable {
         let pathState: GraphEvidence
         if explicitTun {
             pathState = observedFlowState
-            gatewayTitle = "TUN 通道"
+            gatewayTitle = "TUN 网关"
             gatewayEndpoint = selected?.interfaceName?.nonEmpty ?? "接口待确认"
             gatewayState = observedFlowState == .mismatch ? .confirmed : observedFlowState
             gatewayDetail = "TUN 接入按连接身份核对；分组和末端节点另行显示核对结果。"

@@ -1,5 +1,4 @@
 import SwiftUI
-import WebKit
 
 struct DNSLeakPage: View {
     @ObservedObject var store: LeakCheckStore
@@ -12,8 +11,7 @@ struct WebRTCLeakPage: View {
     var body: some View { LeakInspectorPage(kind: .webrtc, store: store, p: p) }
 }
 
-/// The existing store still owns validation, probe execution, cancellation,
-/// comparison, expiry and context checks. This view only arranges their output.
+/// Displays daemon-owned evidence and submits user detection requests.
 private struct LeakInspectorPage: View {
     let kind: LeakKind
     @ObservedObject var store: LeakCheckStore
@@ -25,7 +23,6 @@ private struct LeakInspectorPage: View {
     private var isIPLeak: Bool { isDNS }
     private var state: LeakCheckState { isDNS ? store.dns : store.rtc }
     private var currentProgress: String? { store.progress[kind] }
-    private var currentBrowser: WKWebView? { store.browserViews[kind] }
     // The latest result remains authoritative for the verdict and backend record.
     // The display result may be the previous good sample after a collector failure.
     private var latestResult: LeakProbeResult? { state.result }
@@ -55,23 +52,7 @@ private struct LeakInspectorPage: View {
                     }.buttonStyle(.borderedProminent).controlSize(.large).tint(style.action)
                         .accessibilityLabel(state.running ? "取消\(title)" : "开始\(title)")
                 }
-            HStack(spacing:16) {
-                if !isDNS {
-                    Picker("检测来源",selection:Binding(get:{store.source},set:{store.changeSource($0)})) {
-                        ForEach(LeakProbeSource.allCases,id: \.self) { Text($0.rawValue).tag($0) }
-                    }.pickerStyle(.segmented).frame(width:280).disabled(store.dns.running || store.rtc.running)
-                }
-                if isDNS {
-                    Picker("查询轮次",selection:$store.deepDNS) { Text("标准 · 5 轮").tag(false); Text("深度 · 8 轮").tag(true) }
-                        .frame(width:180).disabled(state.running)
-                }
-                Spacer(minLength:0)
-            }
             if state.running, let progress = currentProgress { Label(progress,systemImage:"arrow.triangle.2.circlepath").font(.callout).foregroundStyle(style.network) }
-            if let browser = currentBrowser {
-                CoffeeCollectorView(browser: browser, onDetach: { store.reattachBrowser($0, kind: kind) })
-                    .frame(height:72).clipShape(RoundedRectangle(cornerRadius:10))
-            }
             InspectorStatus(verdict: state.verdict, running: state.running, finishedAt: latestResult?.finishedAt, p: p)
             if let error = diagnosticLog.error ?? LeakDiagnosticTrace.shared.error {
                 Label(error, systemImage: "exclamationmark.triangle").font(WatchTypography.caption).foregroundStyle(p.amber)
@@ -84,6 +65,9 @@ private struct LeakInspectorPage: View {
                 Label("检测期间网络环境发生变化，本轮结果需重新核对。", systemImage: "exclamationmark.triangle")
                     .font(.callout).foregroundStyle(p.amber)
             }
+            if let diagnostic = store.diagnostics[kind] {
+                Text(diagnostic).font(.callout).foregroundStyle(p.secondary)
+            }
             referenceAndSettings
             addresses
             if !local.isEmpty {
@@ -95,9 +79,7 @@ private struct LeakInspectorPage: View {
                 }.disclosureGroupStyle(FullWidthDisclosureStyle(p: p))
             }
             details
-            if isDNS || store.source == .netCoffee {
-                Text("检测结果在环境状态、DNS 与 WebRTC 页面共享；离开本页不会取消正在进行的采样。").font(.caption).foregroundStyle(p.secondary)
-            }
+            Text("检测结果在环境状态、DNS 与 WebRTC 页面共享；离开本页不会取消正在进行的采样。").font(.caption).foregroundStyle(p.secondary)
             Label(isDNS ? "本机 WebView 发起查询，IPLeak 返回 DNS 观测；不代表所有 AI 应用。"
                   : "仅代表当前检测 WebView，不代表 AI 应用或其他浏览器。", systemImage: "info.circle")
                 .font(.caption).foregroundStyle(p.secondary)
@@ -168,7 +150,7 @@ private struct LeakInspectorPage: View {
                     .textFieldStyle(.roundedBorder).font(.system(.callout, design: .monospaced))
                     .disabled(state.running).controlSize(.large)
                     .accessibilityLabel("预期出口 IP（可选）")
-                Text("留空时，与本轮 HTTP 出口参考比较。")
+                Text("填写后由后台显示诊断对照；保护判定仍依据同轮 HTTP 出口。")
                     .font(.caption).foregroundStyle(p.secondary).fixedSize(horizontal: false, vertical: true)
             }
             if let error = state.inputError, !error.isEmpty {
@@ -176,7 +158,7 @@ private struct LeakInspectorPage: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
             Divider().overlay(style.border)
-            Label(isDNS ? "IPLeak DNS · IPLeak HTTP · 本机采样" : store.source == .netCoffee ? "Net.Coffee 归属 · Cloudflare HTTP · 本机采样" : "Google / Cloudflare STUN", systemImage: "server.rack")
+            Label(isDNS ? "IPLeak DNS · IPLeak HTTP · 本机采样" : "Net.Coffee 归属 · Cloudflare HTTP · 本机采样", systemImage: "server.rack")
                 .font(.caption).foregroundStyle(style.transport)
             Text(isDNS ? "DNS 与 HTTP 参考均通过当前检测 WebView。" : "按当前系统路由检测，不强制 UDP 走 7890。")
                 .font(.caption).foregroundStyle(p.secondary).fixedSize(horizontal: false, vertical: true)
@@ -311,17 +293,4 @@ private struct LeakInspectorPage: View {
     private func probeTime(_ epoch: Double) -> String {
         epoch.isFinite && epoch > 0 ? timeText(epoch, date: true) : "未取得"
     }
-}
-
-struct CoffeeCollectorView: NSViewRepresentable {
-    let browser: WKWebView
-    var onDetach: ((WKWebView) -> Void)? = nil
-    final class Coordinator {
-        let onDetach: ((WKWebView) -> Void)?
-        init(_ onDetach: ((WKWebView) -> Void)?) { self.onDetach = onDetach }
-    }
-    func makeCoordinator() -> Coordinator { Coordinator(onDetach) }
-    func makeNSView(context: Context) -> WKWebView { browser }
-    func updateNSView(_ nsView: WKWebView, context: Context) {}
-    static func dismantleNSView(_ nsView: WKWebView, coordinator: Coordinator) { coordinator.onDetach?(nsView) }
 }

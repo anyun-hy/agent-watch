@@ -55,6 +55,7 @@ struct ConnectionGraphView: View {
     private var codeTitle: String { selectedProduct.graphCLITitle }
     private var gatewayIsTun: Bool { graph.gatewayTitle.localizedCaseInsensitiveContains("TUN") }
     private var gatewayIsProxy: Bool { graph.routePresentation == "proxy" }
+    private var gatewayNodeTitle: String { gatewayIsProxy ? "本机代理" : graph.gatewayTitle }
     private var shouldAnimate: Bool {
         display.canAnimate && !reduceMotion
     }
@@ -258,9 +259,8 @@ struct ConnectionGraphView: View {
                 parts.append("未知/过期：\(reasons.joined(separator: ", "))")
             }
         }
-        let unmanaged = store.unmanagedPids(for: selectedProduct)
-        if !unmanaged.isEmpty {
-            parts.append("发现 \(unmanaged.count) 个未接管实例 · 点击网关查看详情")
+        if !store.unmanagedPids(for: selectedProduct).isEmpty {
+            parts.append("点击“\(gatewayNodeTitle)”查看详情")
         }
         return parts.isEmpty ? nil : parts.joined(separator: " · ")
     }
@@ -272,7 +272,6 @@ struct ConnectionGraphView: View {
             if state == "unknown" || state == "stale" || sup.requires_migration == true { return p.amber }
         }
         if store.channelState(for: selectedProduct)?.sandbox_ready == false ||
-           !store.unmanagedPids(for: selectedProduct).isEmpty ||
            store.switcher.policySyncPendingApply {
             return p.amber
         }
@@ -492,7 +491,7 @@ struct ConnectionGraphView: View {
                 glyph(gatewayIsProxy ? "router" : graph.routePresentation == "localService" ? "server" : "network",
                       state: graph.gatewayState)
                 VStack(alignment: .leading, spacing: 5) {
-                    Text(historicalTitle(gatewayIsProxy ? "本机代理" : graph.gatewayTitle))
+                    Text(historicalTitle(gatewayNodeTitle))
                         .font(WatchTypography.bodyStrong).foregroundStyle(p.text).lineLimit(1)
                     Text(graph.gatewayEndpoint.replacingOccurrences(of: "http://", with: ""))
                         .font(WatchTypography.small).foregroundStyle(p.secondary)
@@ -505,7 +504,7 @@ struct ConnectionGraphView: View {
                 .background(tileBackground(.gateway, state: graph.gatewayState))
                 .contentShape(RoundedRectangle(cornerRadius: 12))
         }.buttonStyle(.plain).help(graph.gatewayDetail)
-            .accessibilityLabel("\(historicalTitle(gatewayIsProxy ? "本机代理" : graph.gatewayTitle))，\(evidenceLabel(graph.gatewayState))，点击查看证据")
+            .accessibilityLabel("\(historicalTitle(gatewayNodeTitle))，\(evidenceLabel(graph.gatewayState))，点击查看证据")
     }
 
     private func tagHub(width: CGFloat) -> some View {
@@ -639,7 +638,7 @@ struct ConnectionGraphView: View {
         case .code: title = codeTitle
         case .desktop: title = selectedProduct == .openAI ? "ChatGPT / Codex 桌面应用" : selectedProduct.graphDesktopTitle
         case .managed: title = "Codex 托管后台"
-        case .gateway: title = graph.gatewayTitle
+        case .gateway: title = gatewayNodeTitle
         case .tag: title = "TAG · " + graph.groupTitle
         case .node: title = "代理节点 · " + graph.nodeTitle
         case .service: title = serverTarget.title
@@ -665,10 +664,9 @@ struct ConnectionGraphView: View {
             }
         case .gateway:
             let unmanaged = store.unmanagedPids(for: selectedProduct)
-            let unmanagedNotice = unmanaged.isEmpty
-                ? ""
-                : "\n未接管实例（\(unmanaged.count) 个）：PID \(unmanaged.map(String.init).joined(separator: ", "))。这些实例未纳入当前受控通道，网关状态不代表它们的连接状态。"
-            let scope = store.channelState(for: selectedProduct).map { "\n当前监督范围：\($0.scopeSummary)\n\($0.gatewayCountsLabel) · \($0.policy_sync_label_zh)\n累计计数来自当前网关记录，不代表本轮连接，也不包含未接管实例的流量。" } ?? ""
+            let unmanagedNotice = unmanaged.isEmpty ? ""
+                : "\n网关未覆盖进程（\(unmanaged.count) 个）：PID \(unmanaged.map(String.init).joined(separator: ", "))。这些进程未经过受控网关，网关状态不代表它们的连接状态。"
+            let scope = store.channelState(for: selectedProduct).map { "\n当前监督范围：\($0.scopeSummary)\n\($0.gatewayCountsLabel) · \($0.policy_sync_label_zh)\n累计计数来自当前网关记录，不代表本轮连接，也不包含未覆盖进程的流量。" } ?? ""
             let path = graph.gatewayDetail + (gatewayIsProxy ? "\n" + (proxy?.listenerPath ?? "监听者路径未取得") : "")
             let pathDetail = display.isHistorical ? "上次路径证据，不代表当前连接：\n" + path + "\n原始说明：" + (graph.flow?.reason ?? "") : path
             return pathDetail + scope + unmanagedNotice
