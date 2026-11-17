@@ -357,6 +357,13 @@ impl AuditStore {
         } else {
             Vec::new()
         };
+        let confirmed_env = self.storage.read_json(
+            &self.storage.paths.base().join("confirmed-environment.json"),
+            Value::Null,
+        ).ok();
+        let confirmed_ip = confirmed_env.as_ref()
+            .and_then(|v| v.pointer("/values/ip"))
+            .and_then(Value::as_str);
         let mut output = audit::evaluate_target(
             AuditInput {
                 config: &after_config,
@@ -366,6 +373,7 @@ impl AuditStore {
                 zones,
                 policy: &policy,
                 now,
+                confirmed_ip,
             },
             target,
             |v| format!("{v:.0}"),
@@ -387,6 +395,7 @@ impl AuditStore {
                     zones,
                     policy: &policy,
                     now,
+                    confirmed_ip,
                 },
                 claude_watch_core::processes::LaunchTarget::ChatgptDesktop,
                 |v| format!("{v:.0}"),

@@ -37,6 +37,7 @@ pub struct AuditInput<'a> {
     pub zones: &'a ZoneCatalog,
     pub policy: &'a str,
     pub now: f64,
+    pub confirmed_ip: Option<&'a str>,
 }
 fn row(id: &str, state: &str, detail: impl Into<String>, required: bool, scope: &str) -> Value {
     let name = CHECKS.iter().find(|v| v.0 == id).map(|v| v.1).unwrap_or(id);
@@ -225,6 +226,7 @@ pub fn evaluate_target(
         zones,
         policy,
         now,
+        confirmed_ip,
     } = input;
     if !now.is_finite() || !local.is_object() || !online.is_object() {
         return Err(CoreError::new(
@@ -322,17 +324,28 @@ pub fn evaluate_target(
         addresses.insert(address.clone());
     }
     let changed = !address.is_empty() && !previous.is_empty() && previous != address;
+    let baseline_ip = confirmed_ip.unwrap_or("").trim();
+    let baseline_changed = !baseline_ip.is_empty() && !address.is_empty() && address != baseline_ip;
+    let (ip_history_state, ip_history_detail, ip_history_required) = if address.is_empty() {
+        ("unknown", "实测出口 IP 未取得".into(), false)
+    } else if baseline_changed {
+        (
+            "warn",
+            format!("出口已由基准 {} 变动为 {}；已拦截启动，等待确认", baseline_ip, address),
+            true,
+        )
+    } else if !baseline_ip.is_empty() {
+        ("ok", format!("出口与确认基准 {} 一致", baseline_ip), false)
+    } else if changed || addresses.len() >= 3 {
+        ("warn", format!("48 小时内观测到 {} 个出口；变化不等同泄漏", addresses.len()), false)
+    } else {
+        ("ok", format!("48 小时内观测到 {} 个出口；变化不等同泄漏", addresses.len()), false)
+    };
     rows.push(row(
         "ip_history",
-        if address.is_empty() {
-            "unknown"
-        } else if changed || addresses.len() >= 3 {
-            "warn"
-        } else {
-            "ok"
-        },
-        format!("48 小时内观测到 {} 个出口；变化不等同泄漏", addresses.len()),
-        false,
+        ip_history_state,
+        ip_history_detail,
+        ip_history_required,
         "检测历史；运行中 IP 变化由不可滚动的会话基准阻断",
     ));
     let expected_tz = text(&measured, "timezone");
@@ -658,7 +671,13 @@ pub fn evaluate_target(
     }
     let blocked: Vec<_> = rows
         .iter()
-        .filter(|v| v["required"] == true && matches!(text(v, "state"), "fail" | "unknown"))
+        .filter(|v| {
+            if v["required"] != true {
+                return false;
+            }
+            matches!(text(v, "state"), "fail" | "unknown")
+                || (text(v, "id") == "ip_history" && text(v, "state") == "warn")
+        })
         .map(|v| v["id"].clone())
         .collect();
     let message = if !blocked.is_empty() {

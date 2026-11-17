@@ -7,6 +7,7 @@ enum WatchTypography {
     static let body = Font.system(size: 13)
     static let bodyStrong = Font.system(size: 13, weight: .medium)
     static let caption = Font.system(size: 12)
+    static let captionStrong = Font.system(size: 12, weight: .medium)
     static let small = Font.system(size: 11)
     static let mono = Font.system(size: 12, design: .monospaced)
 }

@@ -28,6 +28,12 @@ impl ReceiptStore {
                 ProbeKind::Dns => self.dns_status_for_network(context, current_ip, false, now, |t| format!("{t:.0}")),
                 ProbeKind::WebRtc => self.webrtc_status_for_network(context, current_ip, now),
             };
+            let ip_mismatch = current_ip.is_some_and(|cur| {
+                v.get("network_egress_ip").and_then(Value::as_str).is_some_and(|old| old != cur)
+            });
+            if ip_mismatch {
+                return false;
+            }
             matches!(status["state"].as_str(), Some("ok" | "fail")) && v["status"] == "complete"
                 && v[context_key] == context && v[stamp].as_f64().is_some_and(|t|
                     ((0.0..kind.refresh_age()).contains(&(now - t)) || receipts::network_reusable(&v, context, current_ip))

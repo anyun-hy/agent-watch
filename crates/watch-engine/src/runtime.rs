@@ -245,6 +245,12 @@ pub fn dispatch_read(request: &Request, paths: Paths) -> Result<Option<Value>> {
     {
         return Ok(None);
     }
+    if request.command == "environment"
+        && (request.flag("confirm-baseline")
+            || request.action.as_deref() == Some("confirm-baseline"))
+    {
+        return Ok(None);
+    }
     let mut host = host(paths, Authority::ReadOnly)?;
     match request.command.as_str() {
         "self-check" => {
@@ -582,7 +588,9 @@ pub fn dispatch_operations(request: &Request, paths: Paths) -> Result<Option<Ope
             request.action.as_deref(),
             Some("switch" | "recover" | "import")
         );
+    let confirm_baseline = request.command == "environment" && request.flag("confirm-baseline");
     if !account_action
+        && !confirm_baseline
         && !matches!(
             request.command.as_str(),
             "launch" | "guard-tick" | "dns-leak-record" | "webrtc-risk-record"
@@ -597,6 +605,79 @@ pub fn dispatch_operations(request: &Request, paths: Paths) -> Result<Option<Ope
     }
     let mut host = host(paths, Authority::ExplicitPermit)?;
     let storage = host.storage.clone();
+    if confirm_baseline {
+        let confirmed_path = storage.paths.base().join("confirmed-environment.json");
+        let mut confirmed = storage.read_json(&confirmed_path, Value::Null)?;
+        if confirmed.is_null() || !confirmed.is_object() {
+            return Err(CoreError::new("baseline_missing", "未找到已确认环境基准文件"));
+        }
+        let target_ip = if let Some(ip) = request.value("ip") {
+            ip.to_owned()
+        } else {
+            let last_detect = storage
+                .read_json(&storage.paths.base().join("last-environment-detection.json"), Value::Null)
+                .unwrap_or(Value::Null);
+            let observed_ip = last_detect
+                .pointer("/display_facts/online/trace/ip")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            if observed_ip.is_empty() {
+                let egress = host.network.fast_egress();
+                egress
+                    .data
+                    .as_ref()
+                    .and_then(|d| d.get("ip"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_owned()
+            } else {
+                observed_ip.to_owned()
+            }
+        };
+        let valid_target_ip = claude_watch_core::network::public_unicast(&target_ip)
+            .ok_or_else(|| CoreError::new("invalid_ip", "实测出口 IP 无效或非公网单播 IP"))?;
+
+        let node_name = request.value("node").map(str::to_owned).or_else(|| {
+            let last_detect = storage
+                .read_json(&storage.paths.base().join("last-environment-detection.json"), Value::Null)
+                .unwrap_or(Value::Null);
+            last_detect
+                .pointer("/display_facts/local/tag/api/selected_node")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        });
+
+        confirmed["values"]["ip"] = json!(valid_target_ip);
+        if let Some(node) = node_name {
+            if !node.is_empty() {
+                confirmed["values"]["node"] = json!(node);
+            }
+        }
+        confirmed["confirmed_at"] = json!(native::now());
+        if confirmed.get("sources").and_then(Value::as_object).is_some() {
+            confirmed["sources"]["ip"] = json!("主公手动核准新出口基准");
+        }
+        storage.atomic_json(&confirmed_path, &confirmed)?;
+
+        // 同步清理/解除已停止旧会话上的 IP 阻断锁，避免旧会话阻碍新启动
+        let session_path = storage.paths.session();
+        if session_path.is_file() {
+            if let Ok(mut session) = storage.read_json(&session_path, Value::Null) {
+                let state = session.get("state").and_then(Value::as_str).unwrap_or("");
+                if state == "locked" || state == "ended" {
+                    session["state"] = json!("ended");
+                    session["baseline"]["ip"] = json!(valid_target_ip);
+                    let _ = storage.atomic_json(&session_path, &session);
+                }
+            }
+        }
+
+        return Ok(Some(OperationOutcome::Receipt(json!({
+            "status": "ok",
+            "confirmed_ip": valid_target_ip,
+            "message": format!("已成功核准出口基准为 {}", valid_target_ip)
+        }))));
+    }
     if matches!(
         request.command.as_str(),
         "dns-leak-record" | "webrtc-risk-record"

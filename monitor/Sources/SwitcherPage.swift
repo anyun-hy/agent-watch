@@ -170,7 +170,8 @@ struct SwitcherPage: View {
                             LazyVGrid(columns: [GridItem(.adaptive(minimum: 310), spacing: 10, alignment: .top)], spacing: 10) {
                                 ForEach(result.rows) { row in
                                     EnvironmentCheckTile(row: row, p: p, stale: historical, previous: previousRows[row.id],
-                                                         flags: row.id == "dns" ? dnsRecursiveFlags(leakChecks) : nil)
+                                                         flags: row.id == "dns" ? dnsRecursiveFlags(leakChecks) : nil,
+                                                         onConfirmBaseline: row.id == "ip_history" ? { Task { _ = await store.confirmBaseline() } } : nil)
                                 }
                                 if let local = result.display_facts?.local { EnvironmentModeTile(local: local, p: p, stale: historical) }
                                 if let leakChecks { EnvironmentWebRTCTile(state: leakChecks.rtc, p: p, stale: historical, open: { openLeakCheck(.webrtc) }) }
@@ -440,6 +441,21 @@ struct SwitcherPage: View {
                                 VStack(alignment: .leading, spacing: 4) {
                                     Label(row.name + " · " + row.statusLabel, systemImage: row.statusSymbol).font(WatchTypography.bodyStrong)
                                     Text(row.detail).font(WatchTypography.caption)
+                                    if row.id == "ip_history" {
+                                        HStack(spacing: 8) {
+                                            Button {
+                                                Task {
+                                                    _ = await store.confirmBaseline()
+                                                }
+                                            } label: {
+                                                Label("核准此 IP 为新基准", systemImage: "checkmark.seal.fill")
+                                            }
+                                            .buttonStyle(.borderedProminent)
+                                            .controlSize(.small)
+                                            .disabled(store.busy)
+                                            Text("确认后将更新基准并重新核验启动条件").font(WatchTypography.small).foregroundStyle(p.secondary)
+                                        }.padding(.top, 4)
+                                    }
                                 }.foregroundStyle(expired ? p.secondary : p.amber)
                             }
                         }
@@ -854,6 +870,7 @@ struct EnvironmentCheckTile: View {
     /// Recursive-resolver country codes for the DNS row; displayed as small
     /// flag chips under the value.
     var flags: [String]? = nil
+    var onConfirmBaseline: (() -> Void)? = nil
     @State private var presentation = EnvironmentDetailPresentation()
     @State private var previewTask: Task<Void, Never>?
     @State private var closeTask: Task<Void, Never>?
@@ -892,7 +909,8 @@ struct EnvironmentCheckTile: View {
     }
     private var popoverDetails: some View {
         EnvironmentCheckDetails(row: row, p: p, pinned: presentation.isPinned,
-            togglePin: { presentation.togglePin(); updateHover() }, close: dismiss, stale: stale)
+            togglePin: { presentation.togglePin(); updateHover() }, close: dismiss, stale: stale,
+            onConfirmBaseline: onConfirmBaseline)
             .onHover { inside in
                 presentation.hoverDetails(inside)
                 updateHover()
@@ -943,6 +961,10 @@ struct EnvironmentCheckTile: View {
                         }
                         if showReference, let reference = row.reference {
                             Text("要求：" + reference).font(WatchTypography.small).foregroundStyle(p.secondary).lineLimit(2)
+                        }
+                        if row.id == "ip_history" && row.state == "warn" {
+                            Label("与基准不一致，已拦截启动（点击查看）", systemImage: "hand.raised.fill")
+                                .font(WatchTypography.small).foregroundStyle(p.amber)
                         }
                         if let sampled = row.sampled_at {
                             Text((row.state == "cached" ? "上次有效采样：" : (row.sample_reused == true ? "复用采样：" : "采样时间：")) + environmentSummaryTime(sampled))
@@ -1164,36 +1186,83 @@ private struct EnvironmentIPQualitySummary: View {
     @ObservedObject var store: NetCoffeeStore
     let environment: CurrentEnvironmentReceipt
     let p: Palette
+    private var egressRow: EnvironmentCheckRow? {
+        environment.rows.first(where: { $0.id == "egress" })
+    }
     private var ip: String? {
-        guard let raw = environment.rows.first(where: { $0.id == "egress" })?.current else { return nil }
+        guard let raw = egressRow?.current else { return nil }
         return raw.components(separatedBy: " / ").first.flatMap { LeakIPAddress($0.trimmingCharacters(in: .whitespacesAndNewlines))?.canonical }
     }
     var body: some View {
         guard let ip else { return AnyView(EmptyView()) }
         let receipt = store.report(ip)
         let fresh = store.isFreshLookup(ip)
+        let isp = receipt?.field("isp").replacingOccurrences(of: "未提供", with: "") ?? egressRow?.isp ?? ""
+        let company = receipt?.field("company_name").replacingOccurrences(of: "未提供", with: "") ?? egressRow?.company_name ?? ""
+        let org = receipt?.field("asOrganization").replacingOccurrences(of: "未提供", with: "") ?? egressRow?.as_org ?? ""
+        let effectiveCompany = !company.isEmpty ? company : org
+        let nature = egressRow?.nature ?? ""
+        let isResidential = receipt?.data?["isResidential"]?.flag ?? egressRow?.is_residential
+        let isDatacenter = receipt?.data?["is_datacenter"]?.flag ?? egressRow?.is_datacenter
+        let typeBadge = isResidential == true ? "家庭住宅 IP (原生)" : (isDatacenter == true ? "机房/数据中心" : (!nature.isEmpty ? nature : ""))
+        let rdns = receipt?.field("rdns").replacingOccurrences(of: "未提供", with: "") ?? egressRow?.rdns ?? ""
+        let city = receipt?.field("city").replacingOccurrences(of: "未提供", with: "") ?? ""
+        let region = receipt?.field("region").replacingOccurrences(of: "未提供", with: "") ?? ""
+        let location = !region.isEmpty && !city.isEmpty ? "\(region) \(city)" : (egressRow?.location ?? "")
+
         return AnyView(Surface(p, padding: 12) {
-            VStack(alignment: .leading, spacing: 8) {
+            VStack(alignment: .leading, spacing: 10) {
                 HStack {
-                    Label("IP 质量概要", systemImage: "gauge.with.dots.needle.50percent").font(WatchTypography.bodyStrong)
+                    Label("IP 质量与运营商归属", systemImage: "gauge.with.dots.needle.50percent").font(WatchTypography.bodyStrong)
+                    if !typeBadge.isEmpty {
+                        Text(typeBadge)
+                            .font(WatchTypography.small)
+                            .foregroundStyle(isResidential == true ? p.mint : p.amber)
+                            .padding(.horizontal, 6).padding(.vertical, 2)
+                            .background((isResidential == true ? p.mint : p.amber).opacity(0.12), in: Capsule())
+                    }
                     Spacer()
-                    Text(store.running.contains(ip) ? "更新中" : receipt == nil ? "未取得" : fresh && receipt?.cache_state != "last_good" ? "本轮 IP" : "历史资料").font(WatchTypography.small).foregroundStyle(p.secondary)
+                    Text(store.running.contains(ip) ? "更新中" : receipt == nil ? "未取得" : fresh && receipt?.cache_state != "last_good" ? "本轮实测" : "历史资料")
+                        .font(WatchTypography.small).foregroundStyle(p.secondary)
                 }
                 if let receipt {
                     HStack(alignment: .top, spacing: 18) {
                         VStack(alignment: .leading, spacing: 3) {
-                            Text(receipt.score.map(String.init) ?? "—").font(.system(size: 22, weight: .semibold, design: .rounded)).monospacedDigit()
-                            Text("Net.Coffee 信任分 / 100").font(WatchTypography.small).foregroundStyle(p.secondary)
-                        }
-                        VStack(alignment: .leading, spacing: 3) {
-                            Text("AS\(receipt.field("asn")) · \(receipt.field("asOrganization"))").font(WatchTypography.caption).lineLimit(1)
-                            Text("出口地理国家：\(receipt.field("country"))；IP 注册地（Net.Coffee）：\(receipt.field("registered_country"))").font(WatchTypography.small).foregroundStyle(p.secondary).lineLimit(2)
-                        }
+                            Text(receipt.score.map(String.init) ?? "—")
+                                .font(.system(size: 26, weight: .bold, design: .rounded)).monospacedDigit()
+                                .foregroundStyle((receipt.score ?? 0) >= 80 ? p.mint : p.text)
+                            Text("Net.Coffee 信任分").font(WatchTypography.small).foregroundStyle(p.secondary)
+                        }.frame(minWidth: 80, alignment: .leading)
+
+                        VStack(alignment: .leading, spacing: 4) {
+                            HStack(spacing: 8) {
+                                Text("AS\(receipt.field("asn")) · \(effectiveCompany)")
+                                    .font(WatchTypography.captionStrong)
+                                    .lineLimit(1)
+                                if !isp.isEmpty && isp != effectiveCompany {
+                                    Text("(\(isp))")
+                                        .font(WatchTypography.caption)
+                                        .foregroundStyle(p.secondary)
+                                        .lineLimit(1)
+                                }
+                            }
+                            HStack(spacing: 12) {
+                                if !location.isEmpty {
+                                    Label(location, systemImage: "mappin.and.ellipse")
+                                        .font(WatchTypography.small).foregroundStyle(p.secondary)
+                                }
+                                if !rdns.isEmpty {
+                                    Text("rDNS: \(rdns)")
+                                        .font(WatchTypography.small).foregroundStyle(p.secondary)
+                                        .lineLimit(1)
+                                }
+                            }
+                        }.frame(maxWidth: .infinity, alignment: .leading)
                     }
-                    Text((fresh && receipt.cache_state != "last_good" ? "资料时间：" : "历史资料时间：") + environmentSummaryTime(receipt.queriedAt) + " · 数据来自 Net.Coffee")
+                    Text((fresh && receipt.cache_state != "last_good" ? "资料时间：" : "历史资料时间：") + environmentSummaryTime(receipt.queriedAt) + " · 数据来自 Net.Coffee 原站")
                         .font(WatchTypography.small).foregroundStyle(p.secondary)
                 } else {
-                    Text("正在按本轮公网出口 IP 读取 Net.Coffee 网络资料；未返回时保持未取得。")
+                    Text("正在按本轮公网出口 IP 读取 Net.Coffee 运营商与网络资料；未返回时保持未取得。")
                         .font(WatchTypography.caption).foregroundStyle(p.secondary)
                 }
             }
@@ -1223,6 +1292,7 @@ struct EnvironmentCheckDetails: View {
     let togglePin: () -> Void
     let close: () -> Void
     var stale = false
+    var onConfirmBaseline: (() -> Void)? = nil
     @State private var contentHeight: CGFloat = 240
 
     private var tint: Color {
@@ -1235,11 +1305,21 @@ struct EnvironmentCheckDetails: View {
     }
     private var copyText: String {
         let stamp = row.state == "cached" ? "上次有效采样：" : (row.sample_reused == true ? "复用采样：" : "采样时间：")
-        return [row.name + " · " + (stale ? "历史样本" : row.statusLabel), "实测：" + value,
-         "判定依据：" + (row.reference ?? "无独立参考值"), "说明：" + row.detail,
-         "来源：" + (row.source ?? row.scope),
-         row.sampled_at.map { stamp + environmentSummaryTime($0) } ?? "",
-         row.query_error.map { "本次查询失败：" + $0 } ?? ""].filter { !$0.isEmpty }.joined(separator: "\n")
+        var lines = [
+            row.name + " · " + (stale ? "历史样本" : row.statusLabel),
+            "实测：" + value,
+            "判定依据：" + (row.reference ?? "无独立参考值"),
+            "说明：" + row.detail
+        ]
+        if let asn = row.asn_num, !asn.isEmpty { lines.append("ASN: AS\(asn)") }
+        if let isp = row.isp, !isp.isEmpty { lines.append("服务商/ISP: \(isp)") }
+        if let company = row.company_name ?? row.as_org, !company.isEmpty { lines.append("企业/归属: \(company)") }
+        if let rdns = row.rdns, !rdns.isEmpty { lines.append("反向DNS: \(rdns)") }
+        if let loc = row.location, !loc.isEmpty { lines.append("定位: \(loc)") }
+        lines.append("来源：" + (row.source ?? row.scope))
+        if let sampled = row.sampled_at { lines.append(stamp + environmentSummaryTime(sampled)) }
+        if let error = row.query_error, !error.isEmpty { lines.append("本次查询失败：" + error) }
+        return lines.filter { !$0.isEmpty }.joined(separator: "\n")
     }
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -1285,12 +1365,126 @@ struct EnvironmentCheckDetails: View {
             detail("实测", value)
             if let reference = row.reference { detail("判定依据", reference) }
             detail("说明", row.detail)
+
+            if row.id == "egress" || row.id == "asn" || row.isp != nil || row.as_org != nil || row.company_name != nil {
+                asnAndOperatorSection
+            }
+
+            if row.id == "ip_history" || row.confirmed_ip != nil {
+                ipHistorySection
+                if let onConfirm = onConfirmBaseline, row.id == "ip_history", row.state == "warn" {
+                    HStack(spacing: 8) {
+                        Button {
+                            onConfirm()
+                            close()
+                        } label: {
+                            Label("核准实测 IP 为新基准", systemImage: "checkmark.seal.fill")
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.small)
+                        Text("核准后重新核验并解除拦截").font(WatchTypography.small).foregroundStyle(p.secondary)
+                    }
+                    .padding(8)
+                    .background(p.elevated.opacity(0.85), in: RoundedRectangle(cornerRadius: 6))
+                }
+            }
+
             detail("来源", row.source ?? row.scope)
             if let sampled = row.sampled_at {
                 detail(row.state == "cached" ? "上次有效采样" : (row.sample_reused == true ? "复用采样" : "采样时间"), environmentSummaryTime(sampled))
             }
             if let error = row.query_error, !error.isEmpty { detail("本次查询失败", error) }
         }.frame(maxWidth: .infinity, alignment: .leading).textSelection(.enabled)
+    }
+
+    @ViewBuilder
+    private var asnAndOperatorSection: some View {
+        let asn = row.asn_num ?? ""
+        let isp = row.isp ?? ""
+        let company = row.company_name ?? row.as_org ?? ""
+        let kind = row.asn_kind ?? ""
+        let rdns = row.rdns ?? ""
+        let loc = row.location ?? ""
+        let res = row.is_residential
+        let nature = row.nature ?? ""
+
+        if !asn.isEmpty || !isp.isEmpty || !company.isEmpty || !rdns.isEmpty {
+            VStack(alignment: .leading, spacing: 6) {
+                Text("ASN / 运营商详细归属").font(WatchTypography.captionStrong).foregroundStyle(p.secondary)
+                VStack(alignment: .leading, spacing: 5) {
+                    if !asn.isEmpty {
+                        attributeRow("ASN", "AS\(asn)")
+                    }
+                    if !isp.isEmpty {
+                        attributeRow("服务商 / ISP", isp)
+                    }
+                    if !company.isEmpty {
+                        attributeRow("ASN 归属 / 企业", company)
+                    }
+                    if !nature.isEmpty {
+                        attributeRow("使用场景 / 评估", nature)
+                    } else if let res {
+                        attributeRow("标记类型", res ? "家庭住宅 IP (原生)" : "数据中心 / 机房")
+                    }
+                    if !kind.isEmpty {
+                        attributeRow("ASN 自报类型", kind == "backbone" ? "backbone (骨干网)" : kind)
+                    }
+                    if let count = row.asn_ipv4_count {
+                        attributeRow("ASN IPv4 总量", String(count))
+                    }
+                    if let tbps = row.asn_tbps, !tbps.isEmpty {
+                        attributeRow("预估带宽", tbps)
+                    }
+                    if let alloc = row.asn_allocated, !alloc.isEmpty {
+                        attributeRow("ASN 注册日期", alloc)
+                    }
+                    if !rdns.isEmpty {
+                        attributeRow("反向 DNS (rDNS)", rdns)
+                    }
+                    if !loc.isEmpty {
+                        attributeRow("地区定位", loc)
+                    }
+                }
+                .padding(8)
+                .background(p.elevated.opacity(0.7), in: RoundedRectangle(cornerRadius: 6))
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var ipHistorySection: some View {
+        if let entries = row.history_entries, !entries.isEmpty {
+            VStack(alignment: .leading, spacing: 6) {
+                Text("出口历史与基准对比").font(WatchTypography.captionStrong).foregroundStyle(p.secondary)
+                VStack(alignment: .leading, spacing: 5) {
+                    ForEach(entries) { entry in
+                        HStack(alignment: .firstTextBaseline) {
+                            Text(entry.label ?? entry.role ?? "").font(WatchTypography.small).foregroundStyle(p.secondary).frame(width: 90, alignment: .leading)
+                            Text(entry.ip).font(WatchTypography.caption).monospaced()
+                            if let node = entry.node, !node.isEmpty {
+                                Text("(\(node))").font(WatchTypography.small).foregroundStyle(p.secondary)
+                            }
+                            Spacer()
+                        }
+                    }
+                }
+                .padding(8)
+                .background(p.elevated.opacity(0.7), in: RoundedRectangle(cornerRadius: 6))
+            }
+        } else if let confirmed = row.confirmed_ip, !confirmed.isEmpty {
+            VStack(alignment: .leading, spacing: 4) {
+                Text("已确认基准 IP").font(WatchTypography.small).foregroundStyle(p.secondary)
+                Text(confirmed).font(WatchTypography.caption).monospaced()
+            }
+        }
+    }
+
+    private func attributeRow(_ label: String, _ val: String) -> some View {
+        HStack(alignment: .firstTextBaseline) {
+            Text(label).font(WatchTypography.small).foregroundStyle(p.secondary).frame(width: 110, alignment: .leading)
+            Text(val).font(WatchTypography.caption).fixedSize(horizontal: false, vertical: true)
+            Spacer()
+        }
     }
     private func detail(_ title: String, _ text: String) -> some View {
         VStack(alignment: .leading, spacing: 4) {

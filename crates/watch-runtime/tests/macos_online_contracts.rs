@@ -214,6 +214,7 @@ fn online_uses_bound_camel_case_lookup_for_geo_asn_and_registered_country() {
             zones: &zones,
             policy: "test",
             now: 1.0,
+            confirmed_ip: None,
         },
         |_| "test".into(),
     )

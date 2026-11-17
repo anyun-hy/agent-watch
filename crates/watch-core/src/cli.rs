@@ -50,7 +50,11 @@ impl Request {
         let (actions, flags, values): (&[&str], &[&str], &[&str]) = match command {
             "status" | "self-check" | "service-status" | "guard-tick" => (&[], &[], &[]),
             "protection" => (&["preview", "apply"], &["apply"], &["plan-id"]),
-            "environment" => (&[], &["online", "record"], &["mode"]),
+            "environment" => (
+                &[],
+                &["online", "record", "apply", "confirm-baseline"],
+                &["mode", "ip", "node"],
+            ),
             "dns-leak-record" | "webrtc-risk-record" => (&[], &["apply"], &[]),
             "evidence" => (&["refresh", "inspect"], &["apply"], &[]),
             "process-exit" => (&["prepare", "apply"], &["apply", "force"], &["family", "protect-pid"]),

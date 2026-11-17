@@ -3,6 +3,14 @@ import Combine
 import Foundation
 import SwiftUI
 
+struct HistoryEntry: Decodable, Identifiable {
+    var id: String { ip + (role ?? "") }
+    let ip: String
+    var role: String? = nil
+    var node: String? = nil
+    var label: String? = nil
+}
+
 struct EnvironmentCheckRow: Decodable, Identifiable {
     let id, name, state, detail, scope: String
     let required: Bool
@@ -14,6 +22,27 @@ struct EnvironmentCheckRow: Decodable, Identifiable {
     /// hit or a cached query) rather than a probe from the current round.
     var sample_reused: Bool? = nil
     var query_error: String? = nil
+
+    // ISP & Network Attribution
+    var isp: String? = nil
+    var company_name: String? = nil
+    var as_org: String? = nil
+    var nature: String? = nil
+    var rdns: String? = nil
+    var location: String? = nil
+    var asn_num: String? = nil
+    var asn_kind: String? = nil
+    var is_residential: Bool? = nil
+    var is_datacenter: Bool? = nil
+    var trust_score: Int? = nil
+    var asn_ipv4_count: Int? = nil
+    var asn_tbps: String? = nil
+    var asn_allocated: String? = nil
+
+    // IP History & Baseline
+    var confirmed_ip: String? = nil
+    var baseline_changed: Bool? = nil
+    var history_entries: [HistoryEntry]? = nil
     var statusLabel: String {
         switch state {
         case "ok":
@@ -1280,6 +1309,19 @@ final class SwitcherStore: ObservableObject {
     func recordDetectionFailure(_ reason: String) {
         invalidateCurrentEnvironmentRequest()
         detectionError = reason
+    }
+    func confirmBaseline(newIP: String? = nil) async -> Bool {
+        guard !busy else { return false }
+        var args = ["environment", "--confirm-baseline", "--apply"]
+        if let ip = newIP, !ip.isEmpty {
+            args += ["--ip", ip]
+        }
+        await perform(args, refresh: false)
+        if !failure {
+            _ = await detectCurrentEnvironment()
+            return true
+        }
+        return false
     }
     func cancelCurrentDetection() {
         environmentGeneration += 1

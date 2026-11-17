@@ -43,6 +43,7 @@ fn evaluate(case: &Value) -> Value {
             zones: &zones,
             policy: "test-policy",
             now: case["now"].as_f64().unwrap(),
+            confirmed_ip: None,
         },
         |v| format!("T{v:.0}"),
     )
@@ -345,6 +346,7 @@ fn observation_targets_share_network_policy_without_claude_specific_requirements
                 zones: &zones,
                 policy: "test",
                 now: NOW,
+                confirmed_ip: None,
             },
             target,
             |t| format!("{t}"),

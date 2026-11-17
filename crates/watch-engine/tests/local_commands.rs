@@ -389,3 +389,36 @@ fn receipt_diagnostic_command_preserves_run_and_rejects_private_fields() {
     assert!(history.to_string().contains(&run));
     assert!(!history.to_string().contains("203.0.113.9"));
 }
+
+#[test]
+fn environment_confirm_baseline_updates_baseline_and_cleans_session() {
+    let home = Home::new();
+    let base = home.0.join("Library/Application Support/ClaudeWatch");
+    fs::create_dir_all(base.join("switcher")).unwrap();
+    let confirmed_path = base.join("switcher/confirmed-environment.json");
+    fs::write(
+        &confirmed_path,
+        br#"{"schema":1,"values":{"ip":"1.1.1.1","country":"JP","node":"Node A"},"sources":{"ip":"test"}}"#,
+    ).unwrap();
+    let session_path = base.join("switcher/session-guard.json");
+    fs::write(
+        &session_path,
+        br#"{"state":"locked","session_id":"test-session","baseline":{"ip":"1.1.1.1"},"reason":{"code":"egress_ip_changed"}}"#,
+    ).unwrap();
+
+    let (code, _) = call(&home, &["environment", "--confirm-baseline", "--ip", "106.178.129.173"], None);
+    assert_ne!(code, 0);
+
+    let (code, val) = call(&home, &["environment", "--confirm-baseline", "--apply", "--ip", "106.178.129.173"], None);
+    assert_eq!(code, 0, "{val}");
+    assert_eq!(val["status"], "ok");
+    assert_eq!(val["confirmed_ip"], "106.178.129.173");
+
+    let updated: Value = serde_json::from_str(&fs::read_to_string(&confirmed_path).unwrap()).unwrap();
+    assert_eq!(updated["values"]["ip"], "106.178.129.173");
+    assert_eq!(updated["sources"]["ip"], "主公手动核准新出口基准");
+
+    let updated_session: Value = serde_json::from_str(&fs::read_to_string(&session_path).unwrap()).unwrap();
+    assert_eq!(updated_session["state"], "ended");
+    assert_eq!(updated_session["baseline"]["ip"], "106.178.129.173");
+}

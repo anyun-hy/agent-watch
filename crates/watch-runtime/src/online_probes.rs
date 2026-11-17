@@ -101,6 +101,7 @@ mod tests {
                 zones: &zones,
                 policy: "test",
                 now: 1.0,
+                confirmed_ip: None,
             },
             |_| "test".into(),
         )?;

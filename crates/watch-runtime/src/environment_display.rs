@@ -350,6 +350,54 @@ fn present_rows(audit: &Value) -> Vec<Value> {
         value["current"] = json!(current);
         value["reference"] = json!(reference);
         value["source"] = json!(source);
+        if id == "egress" || id == "asn" {
+            let lookup = &online["netcoffee_lookup"];
+            let data = lookup.get("data").filter(|v| v.is_object()).unwrap_or(lookup);
+            if data.is_object() {
+                let isp = text(data, "isp");
+                let org = text(data, "asOrganization");
+                let company = text(data, "company_name");
+                let nature = data.pointer("/ai_verdict/label").and_then(Value::as_str).unwrap_or("");
+                let rdns = text(data, "rdns");
+                let city = text(data, "city");
+                let region = text(data, "region");
+                let asn_num = data.get("asn").and_then(|v| {
+                    v.as_u64().map(|n| n.to_string()).or_else(|| v.as_str().map(String::from))
+                }).unwrap_or_default();
+                let asn_kind = text(data, "asn_kind");
+                let asn_tbps = text(data, "asn_tbps");
+                let asn_allocated = text(data, "asn_allocated");
+                let asn_ipv4_count = data.get("asn_ipv4_count").and_then(Value::as_i64);
+                let is_residential = data.get("isResidential").and_then(Value::as_bool);
+                let is_datacenter = data.get("is_datacenter").and_then(Value::as_bool);
+                let trust_score = data.get("trust_score").and_then(Value::as_i64);
+
+                value["isp"] = json!(isp);
+                value["company_name"] = json!(if !company.is_empty() { company.clone() } else { org.clone() });
+                value["as_org"] = json!(org);
+                value["nature"] = json!(nature);
+                value["rdns"] = json!(rdns);
+                let loc = format!("{} {}", region, city).trim().to_owned();
+                value["location"] = json!(loc);
+                if !asn_num.is_empty() { value["asn_num"] = json!(asn_num); }
+                if !asn_kind.is_empty() { value["asn_kind"] = json!(asn_kind); }
+                if !asn_tbps.is_empty() { value["asn_tbps"] = json!(asn_tbps); }
+                if !asn_allocated.is_empty() { value["asn_allocated"] = json!(asn_allocated); }
+                if let Some(count) = asn_ipv4_count { value["asn_ipv4_count"] = json!(count); }
+                if let Some(res) = is_residential { value["is_residential"] = json!(res); }
+                if let Some(dc) = is_datacenter { value["is_datacenter"] = json!(dc); }
+                if let Some(score) = trust_score { value["trust_score"] = json!(score); }
+
+                if id == "egress" && !isp.is_empty() {
+                    let label = country_label(&country);
+                    if !loc.is_empty() {
+                        value["current"] = json!(format!("{address} / {label} · {loc} · {isp}"));
+                    } else {
+                        value["current"] = json!(format!("{address} / {label} · {isp}"));
+                    }
+                }
+            }
+        }
         if matches!(id.as_str(), "egress" | "timezone" | "locale") {
             value["sampled_at"] = json!(source_time(online, "geo", now));
         } else if id == "asn" {
@@ -476,7 +524,12 @@ fn cache_rows(store: &StateStore, audit: &Value, rows: &mut [Value], persist: bo
     Ok(())
 }
 
-fn apply_session_rows(rows: &mut [Value], session: &Value, address: &str) -> Option<String> {
+fn apply_session_rows(
+    store: &StateStore,
+    rows: &mut [Value],
+    session: &Value,
+    address: &str,
+) -> Option<String> {
     let state = text(session, "state");
     let mut policy_message = None;
     if matches!(state.as_str(), "locked" | "unknown" | "pending") {
@@ -502,10 +555,31 @@ fn apply_session_rows(rows: &mut [Value], session: &Value, address: &str) -> Opt
         }
         policy_message = Some(explanation);
     }
-    let baseline = if matches!(state.as_str(), "idle" | "missing") {
+    let session_baseline = if matches!(state.as_str(), "idle" | "missing") {
         String::new()
     } else {
         text(&session["baseline"], "ip")
+    };
+    let confirmed_env = store
+        .read_json(&store.paths.base().join("confirmed-environment.json"), Value::Null)
+        .ok();
+    let confirmed_ip = confirmed_env
+        .as_ref()
+        .and_then(|v| v.pointer("/values/ip"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_owned();
+    let confirmed_node = confirmed_env
+        .as_ref()
+        .and_then(|v| v.pointer("/values/node"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_owned();
+    let is_confirmed_baseline = session_baseline.is_empty() && !confirmed_ip.is_empty();
+    let baseline = if session_baseline.is_empty() {
+        confirmed_ip.clone()
+    } else {
+        session_baseline
     };
     if baseline.is_empty() {
         return policy_message;
@@ -513,17 +587,22 @@ fn apply_session_rows(rows: &mut [Value], session: &Value, address: &str) -> Opt
     let locked_change =
         state == "locked" && text(&session["reason"], "code") == "egress_ip_changed";
     let different = !address.is_empty() && address != baseline;
-    let (row_state, detail) = if locked_change {
+    let (row_state, detail) = if is_confirmed_baseline && different {
+        (
+            "warn",
+            format!("实测出口 {} 与已确认基准 {} 不一致；已拦截启动，等待主公确认。", address, baseline),
+        )
+    } else if locked_change {
         (
             "fail",
-            "会话已因 IP 变化停止；再次启动必须完整核验并建立新基准。",
+            "会话已因 IP 变化停止；再次启动必须完整核验并建立新基准。".to_owned(),
         )
     } else if different {
-        ("fail", "当前出口 IP 与本次会话基准不同，保护正在处理。")
+        ("fail", "当前出口 IP 与本次会话基准不同，保护正在处理。".to_owned())
     } else if !address.is_empty() {
-        ("ok", "当前出口 IP 与本次受控会话基准一致。")
+        ("ok", format!("当前出口 IP 与基准 {} 一致。", baseline))
     } else {
-        ("unknown", "本轮公网 IP 尚未取得，保留会话基准。")
+        ("unknown", "本轮公网 IP 尚未取得，保留会话基准。".to_owned())
     };
     if let Some(row) = row(rows, "ip_history") {
         row["state"] = json!(row_state);
@@ -532,13 +611,32 @@ fn apply_session_rows(rows: &mut [Value], session: &Value, address: &str) -> Opt
         } else {
             address
         });
-        row["reference"] = json!(format!("会话基准 {baseline}"));
+        row["reference"] = json!(format!("确认基准 {baseline}"));
         row["detail"] = json!(detail);
-        row["source"] = json!("本轮实测出口 / 受控启动会话基准");
-        row["required"] = json!(true);
+        row["source"] = json!("本轮实测出口 / 系统已确认基准 (confirmed-environment.json)");
+        row["required"] = json!(different);
+        row["confirmed_ip"] = json!(baseline);
+        row["baseline_changed"] = json!(different);
+        let mut history_entries = Vec::new();
+        if !address.is_empty() {
+            history_entries.push(json!({
+                "ip": address,
+                "role": "current",
+                "label": "当前实测出口",
+            }));
+        }
+        if !confirmed_ip.is_empty() {
+            history_entries.push(json!({
+                "ip": confirmed_ip,
+                "node": confirmed_node,
+                "role": "confirmed_baseline",
+                "label": "已确认基准",
+            }));
+        }
+        row["history_entries"] = json!(history_entries);
     }
-    if matches!(row_state, "fail" | "unknown") {
-        Some(detail.to_owned())
+    if matches!(row_state, "fail" | "unknown") || (is_confirmed_baseline && different) {
+        Some(detail)
     } else {
         policy_message
     }
@@ -554,7 +652,7 @@ pub fn receipt(store: &StateStore, audit: Value, session: Value, persist: bool) 
     let mut rows = present_rows(&audit);
     cache_rows(store, &audit, &mut rows, persist)?;
     let address = valid_ip(&audit["display_facts"]["online"]["trace"]["ip"]);
-    let policy_message = apply_session_rows(&mut rows, &session, &address);
+    let policy_message = apply_session_rows(store, &mut rows, &session, &address);
     let mut preview = audit.clone();
     preview["purpose"] = json!("launch_requirements_preview");
     preview["grants_launch_permission"] = json!(false);
@@ -562,7 +660,7 @@ pub fn receipt(store: &StateStore, audit: Value, session: Value, persist: bool) 
     preview["session_guard"] = session.clone();
     let mut policy_rows = preview["rows"].as_array().cloned().unwrap_or_default();
     let policy_message =
-        apply_session_rows(&mut policy_rows, &session, &address).or(policy_message);
+        apply_session_rows(store, &mut policy_rows, &session, &address).or(policy_message);
     preview["rows"] = json!(policy_rows);
     if let Some(message) = policy_message {
         preview["ready"] = json!(false);
@@ -573,7 +671,7 @@ pub fn receipt(store: &StateStore, audit: Value, session: Value, persist: bool) 
                     .as_array()
                     .and_then(|rows| rows.iter().find(|value| value["id"] == *row))
                     .is_some_and(|value| {
-                        matches!(value["state"].as_str(), Some("fail" | "unknown"))
+                        matches!(value["state"].as_str(), Some("fail" | "unknown" | "warn"))
                             && value["required"] == true
                     })
             })
