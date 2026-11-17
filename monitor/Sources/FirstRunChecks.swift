@@ -421,7 +421,7 @@ final class FirstRunChecks: InitializationChecking {
         if boundContext != nil && !contextMatches {
             failures[.connection] = Self.networkContextFailure(bound: boundContext, current: store.initializationContext, timeoutStage: nil)
         } else if boundContext != nil && store.error != nil {
-            failures[.connection] = .failed(code: "backend_error", detail: store.error?.localizedDescription ?? "后台连接发生错误，请重新检查。")
+            failures[.connection] = .failed(code: "backend_error", detail: store.error ?? "后台连接发生错误，请重新检查。")
         }
         if let acceptedSettings, acceptedSettings != settingsData {
             failures[.environment] = .failed(code: "settings_changed", detail: "已确认的 Watch 设置发生变化，请重新检查。")
