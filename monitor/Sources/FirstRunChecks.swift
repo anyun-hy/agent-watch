@@ -283,8 +283,12 @@ final class FirstRunChecks: InitializationChecking {
         guard let candidate = store.switcher.candidate, !store.switcher.failure else {
             return .failed(code: "environment_unavailable", detail: store.switcher.message.isEmpty ? "未能取得实测环境" : store.switcher.message)
         }
-        let country = candidate.country.isEmpty ? "" : " / \(candidate.country)"
-        let detail = "实测出口 \(candidate.ip)\(country)，时区及启动策略就绪，后续将合并确认并启用守护。"
+        let ip = candidate.rows.first(where: { $0.id == "ip" })?.current ?? ""
+        let countryRow = candidate.rows.first(where: { $0.id == "country" })?.current ?? ""
+        let country = countryRow.isEmpty ? "" : " / \(countryRow)"
+        let detail = ip.isEmpty
+            ? "环境出口、时区及启动策略就绪，后续将合并确认并启用守护。"
+            : "实测出口 \(ip)\(country)，时区及启动策略就绪，后续将合并确认并启用守护。"
         return .passed(detail)
     }
     private func previewSetup(candidateID: String, enableProtection: Bool) async -> InitializationResult {
