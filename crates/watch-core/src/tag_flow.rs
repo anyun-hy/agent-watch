@@ -632,7 +632,41 @@ pub fn correlate(input: CorrelationInput<'_>) -> Value {
     let metadata = &record["metadata"];
     let destination = destination_evidence(metadata);
     result["association"] = json!("correlated");
-    result["host"] = metadata.get("host").cloned().unwrap_or(json!(""));
+    let detected_host = metadata
+        .get("host")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .or_else(|| {
+            let proof = &fakeip_evidence[text(record, "id")];
+            proof
+                .get("host")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+        })
+        .unwrap_or_default();
+    result["host"] = json!(detected_host);
+    let is_core_platform = {
+        let h = detected_host.to_ascii_lowercase();
+        h == "claude.ai"
+            || h.ends_with(".claude.ai")
+            || h == "anthropic.com"
+            || h.ends_with(".anthropic.com")
+            || h == "chatgpt.com"
+            || h.ends_with(".chatgpt.com")
+            || h == "openai.com"
+            || h.ends_with(".openai.com")
+            || h == "oaistatic.com"
+            || h.ends_with(".oaistatic.com")
+            || h == "oaiusercontent.com"
+            || h.ends_with(".oaiusercontent.com")
+    };
+    result["flow_kind"] = json!(if is_core_platform {
+        "core_platform"
+    } else {
+        "app_auxiliary"
+    });
     result["chains"] = record["chains"].clone();
     result["rule"] = record.get("rule").cloned().unwrap_or(json!(""));
     result["rule_payload"] = record.get("rulePayload").cloned().unwrap_or(json!(""));

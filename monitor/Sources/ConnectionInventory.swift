@@ -70,13 +70,17 @@ enum ConnectionInventory {
         let gateway = host(flow.peer) == host(proxyEndpoint)
             && URLComponents(string: "http://" + flow.peer)?.port == URLComponents(string: proxyEndpoint.contains("://") ? proxyEndpoint : "http://" + proxyEndpoint)?.port
         if flow.association == "local_service" || (loopback(flow.peer) && !gateway) { return .local }
+        if flow.flowKind == "core_platform" { return .platform }
         let domain = host(flow.host)
-        let domains = process?.product == .claude ? ["anthropic.com", "claude.ai"] : ["openai.com", "chatgpt.com", "oaiusercontent.com"]
+        let domains = process?.product == .claude
+            ? ["anthropic.com", "claude.ai", "claude.com", "claudeusercontent.com"]
+            : ["openai.com", "chatgpt.com", "oaistatic.com", "oaiusercontent.com", "auth0.openai.com"]
         if domains.contains(where: { domain == $0 || domain.hasSuffix("." + $0) }) { return .platform }
         // The helper process name establishes ownership, not request purpose.
         // A missing host or a raw socket IP remains unidentified.
         let addressLike = domain.isEmpty || domain.contains(":") || domain.split(separator: ".").allSatisfy { Int($0) != nil }
         if !addressLike && (process?.runtimeRole?.hasPrefix("chromium_") == true || process?.kind.contains("desktop-helper") == true) { return .component }
+        if flow.flowKind == "app_auxiliary" { return .component }
         return .unidentified
     }
     static func groups(product: MonitoredProduct, processes: [WatchedProcess], flows: [Flow], proxyEndpoint: String = "127.0.0.1:7890") -> [ConnectionServiceGroup] {
@@ -126,6 +130,12 @@ extension WatchedProcess {
 extension ConnectionGraphScope {
     var platformFlows: [Flow] {
         let owners = Dictionary(processes.map { ($0.pid, $0) }, uniquingKeysWith: { first, _ in first })
-        return flows.filter { ConnectionInventory.purpose($0, process: owners[$0.pid]) == .platform }
+        let core = flows.filter { ConnectionInventory.purpose($0, process: owners[$0.pid]) == .platform }
+        if !core.isEmpty { return core }
+        // 优雅降级：当核心平台流量暂无样本时，选取已关联且非本地的辅助组件流量，防止全景图灰线假死
+        return flows.filter {
+            let p = ConnectionInventory.purpose($0, process: owners[$0.pid])
+            return (p == .platform || p == .component) && $0.association == "correlated"
+        }
     }
 }

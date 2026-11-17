@@ -55,7 +55,7 @@ struct ConnectionGraphView: View {
     private var codeTitle: String { selectedProduct.graphCLITitle }
     private var gatewayIsTun: Bool { graph.gatewayTitle.localizedCaseInsensitiveContains("TUN") }
     private var gatewayIsProxy: Bool { graph.routePresentation == "proxy" }
-    private var gatewayNodeTitle: String { gatewayIsProxy ? "本机代理" : graph.gatewayTitle }
+    private var gatewayNodeTitle: String { "Access Gateway" }
     private var shouldAnimate: Bool {
         display.canAnimate && !reduceMotion
     }
@@ -196,7 +196,7 @@ struct ConnectionGraphView: View {
                 ? "（\(channelState.processDispositionLabel(now: now))）" : ""
             let previous = channelState.previousProcessDispositionLabel(now: now).map { "\n\($0)" } ?? ""
             if channelState.managedMemberCount == 0 && !channelState.unmanagedPids.isEmpty {
-                text = "检测到外部运行实例（未接入受控网关）\(disposition)\n\(channelState.gatewayCountsLabel)\(previous)"
+                text = "检测到外部运行实例（走系统代理隧道出海，未接入受控网关沙箱）\(disposition)\n受控网关活动连接 0（可通过‘以受控网关重启’接入断流保护）\(previous)"
             } else {
                 text = "\(channelState.protectionScopeLabel)\(disposition) · \(channelState.scopeSummary)\n\(channelState.gatewayCountsLabel)\(previous)"
             }
@@ -474,7 +474,7 @@ struct ConnectionGraphView: View {
                     Text(title).font(WatchTypography.bodyStrong).foregroundStyle(p.text).lineLimit(1)
                     Text(verbatim: sourceStatus)
                         .font(WatchTypography.small).foregroundStyle(p.secondary).lineLimit(1)
-                    Text(sourceGraph?.sourceLocal ?? (connectionCount > 0 ? "未归入当前路径" : "等待连接样本"))
+                    Text(sourceGraph?.sourceLocal ?? (connectionCount > 0 ? "未归入当前路径" : (process != nil ? "运行中 · PID \(process!.pid)" : "等待连接样本")))
                         .font(WatchTypography.small).foregroundStyle(p.secondary)
                         .lineLimit(2).truncationMode(.middle).fixedSize(horizontal: false, vertical: true)
                 }.frame(maxWidth: .infinity, alignment: .leading)
@@ -482,7 +482,7 @@ struct ConnectionGraphView: View {
                 .background(tileBackground(id, state: state))
                 .contentShape(RoundedRectangle(cornerRadius: 12))
         }.buttonStyle(.plain)
-            .help(sourceGraph.map { $0.sourceLocal + "\n" + $0.summary } ?? (connectionCount > 0 ? "存在平台连接，但尚未归入当前显示的路径。" : (store.snapshot == nil ? "正在读取进程状态" : "当前没有关联到此设备的连接样本")))
+            .help(sourceGraph.map { $0.sourceLocal + "\n" + $0.summary } ?? (connectionCount > 0 ? "存在平台连接，但尚未归入当前显示的路径。" : (process != nil ? "进程已在运行，正在通过系统代理隧道出海。" : (store.snapshot == nil ? "正在读取进程状态" : "当前没有关联到此设备的连接样本"))))
             .accessibilityLabel("\(title)，\(sourceStatus)，\(evidenceLabel(state))")
     }
 
@@ -497,8 +497,7 @@ struct ConnectionGraphView: View {
                     Text(graph.gatewayEndpoint.replacingOccurrences(of: "http://", with: ""))
                         .font(WatchTypography.small).foregroundStyle(p.secondary)
                         .lineLimit(2).truncationMode(.middle).fixedSize(horizontal: false, vertical: true)
-                    Text(verbatim: !gatewayIsProxy ? evidenceLabel(graph.gatewayState) :
-                            "TAG · " + evidenceLabel(graph.gatewayState))
+                    Text(verbatim: "\(graph.gatewayTitle) · " + evidenceLabel(graph.gatewayState))
                         .font(WatchTypography.small).foregroundStyle(color(graph.gatewayState)).lineLimit(1)
                 }.frame(maxWidth: .infinity, alignment: .leading)
             }.padding(.horizontal, 10).frame(width: width, height: 84)

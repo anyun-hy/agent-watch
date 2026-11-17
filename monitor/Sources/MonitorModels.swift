@@ -236,12 +236,14 @@ struct Flow: Decodable, Identifiable, Sendable {
     var destinationPort: Int? = nil
     var destinationIPState: String? = nil
     var destinationCountry: String? = nil
+    var flowKind: String? = nil
     enum CodingKeys: String, CodingKey {
         case id, pid, host, peer, local, association, policy, reason, chains
         case transport = "protocol"
         case routePath = "path"
         case interfaceName = "interface"
         case destinationIP, destinationPort, destinationIPState, destinationCountry
+        case flowKind = "flow_kind"
     }
 }
 
