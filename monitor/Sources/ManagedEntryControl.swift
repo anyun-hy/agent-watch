@@ -10,8 +10,11 @@ final class ManagedEntryControl: ObservableObject {
     @Published private(set) var isConfigured: Bool = false
     @Published private(set) var statusLabel: String = "未配置"
     @Published private(set) var entryPath: String = ""
+    @Published private(set) var candidateSources: [String] = []
     @Published private(set) var busy: Bool = false
     @Published private(set) var errorMessage: String? = nil
+    
+    var hasMultipleSources: Bool { candidateSources.count > 1 }
     
     let isFixture: Bool
 
@@ -39,13 +42,17 @@ final class ManagedEntryControl: ObservableObject {
             let data = try await Task.detached(priority: .utility) {
                 try AIProcessInventory.runEngine(["entry", "status", "--target", t], timeout: 10)
             }.value
-            if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-               let report = json["status_report"] as? [String: Any] {
-                self.isGenerated = report["entry_generated"] as? Bool ?? false
-                self.isConfigured = report["activation_configured"] as? Bool ?? false
-                self.statusLabel = report["status_label"] as? String ?? "状态未知"
-                self.entryPath = report["entry_path"] as? String ?? ""
-                self.errorMessage = nil
+            if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                if let report = json["status_report"] as? [String: Any] {
+                    self.isGenerated = report["entry_generated"] as? Bool ?? false
+                    self.isConfigured = report["activation_configured"] as? Bool ?? false
+                    self.statusLabel = report["status_label"] as? String ?? "状态未知"
+                    self.entryPath = report["entry_path"] as? String ?? ""
+                    self.errorMessage = nil
+                }
+                if let sources = json["candidate_sources"] as? [String] {
+                    self.candidateSources = sources
+                }
             }
         } catch {
             self.errorMessage = error.localizedDescription

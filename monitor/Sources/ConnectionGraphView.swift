@@ -144,6 +144,9 @@ struct ConnectionGraphView: View {
 
             protectionSummary
             managedEntryRow
+            if store.managedEntryControl.hasMultipleSources {
+                multipleSourcesBanner
+            }
 
             ViewThatFits(in: .horizontal) {
                 wideScene.frame(minWidth: 900)
@@ -351,6 +354,48 @@ struct ConnectionGraphView: View {
         .padding(.horizontal, 23)
         .padding(.vertical, 6)
         .background(p.elevated.opacity(0.25))
+    }
+
+    private var multipleSourcesBanner: some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundStyle(p.amber)
+                .font(.system(size: 14))
+                .padding(.top, 2)
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 6) {
+                    Text("检测到系统中存在多个 \(selectedProduct.title) 安装版本，需要处理")
+                        .font(WatchTypography.caption.weight(.semibold))
+                        .foregroundStyle(p.amber)
+                    Badge(text: "共 \(store.managedEntryControl.candidateSources.count) 个安装", color: p.amber)
+                }
+                Text("已优先选用系统标准安装：/Applications/\(selectedProduct.title).app。为避免启动歧义与配置冲突，建议清理多余残留版本：")
+                    .font(WatchTypography.small)
+                    .foregroundStyle(p.secondary)
+                VStack(alignment: .leading, spacing: 2) {
+                    ForEach(store.managedEntryControl.candidateSources, id: \.self) { path in
+                        HStack(spacing: 6) {
+                            Text(path.hasPrefix("/Applications/") ? "• [推荐使用]" : "• [建议清理]")
+                                .font(WatchTypography.small.weight(.medium))
+                                .foregroundStyle(path.hasPrefix("/Applications/") ? p.mint : p.amber)
+                            Text(path)
+                                .font(WatchTypography.small)
+                                .foregroundStyle(p.text)
+                                .textSelection(.enabled)
+                        }
+                    }
+                }
+                .padding(.top, 2)
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 8)
+        .background(p.amber.opacity(0.12))
+        .clipShape(RoundedRectangle(cornerRadius: 10))
+        .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(p.amber.opacity(0.3), lineWidth: 1))
+        .padding(.horizontal, 23)
+        .padding(.vertical, 4)
     }
 
     private func archivedPath(_ sample: GraphPathSample) -> some View {

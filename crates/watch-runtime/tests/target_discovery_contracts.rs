@@ -1598,5 +1598,9 @@ fn select_prefers_system_applications_when_multiple_sources_exist() {
     };
     let selected = snapshot.select(LaunchTarget::ChatgptDesktop, None).unwrap();
     assert_eq!(selected.entry_path, Path::new("/Applications/ChatGPT.app"));
+    let candidates = snapshot.candidate_sources(LaunchTarget::ChatgptDesktop);
+    assert_eq!(candidates.len(), 2);
+    assert!(candidates.contains(&PathBuf::from("/Applications/ChatGPT.app")));
+    assert!(candidates.contains(&PathBuf::from("/Users/someone/staged/ChatGPT.app")));
 }
 

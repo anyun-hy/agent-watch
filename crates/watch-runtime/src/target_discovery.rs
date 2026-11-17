@@ -155,6 +155,23 @@ impl DiscoverySnapshot {
             .copied()
             .ok_or_else(|| CoreError::new("target_app_unavailable", "未找到经安装证据验证的目标"))
     }
+    pub fn candidate_sources(&self, target: LaunchTarget) -> Vec<PathBuf> {
+        let accepts = |r: &&DiscoveredTarget| {
+            r.target == target
+                || (target == LaunchTarget::ChatgptDesktop && r.target == LaunchTarget::CodexDesktop)
+                || (target == LaunchTarget::CodexDesktop && r.target == LaunchTarget::ChatgptDesktop)
+        };
+        let mut paths: Vec<PathBuf> = self
+            .targets
+            .iter()
+            .filter(accepts)
+            .filter(|r| r.valid())
+            .map(|r| r.entry_path.clone())
+            .collect();
+        paths.sort();
+        paths.dedup();
+        paths
+    }
     pub fn cli_paths(&self) -> TrustedCliPaths {
         self.process_paths(false)
     }

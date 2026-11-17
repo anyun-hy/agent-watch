@@ -245,7 +245,7 @@ pub(crate) fn dispatch(request: &Request, storage: StateStore) -> Result<Value> 
                     let mut targets = vec![];
                     if matches!(source, EntrySource::Cli { script: true, .. }) {
                         let mut sampler = Sampler::new(runner.clone(), storage.paths.clone());
-                        sampler.set_discovery(discovery);
+                        sampler.set_discovery(discovery.clone());
                         let round = sampler.processes()?;
                         if !round.complete && action == "activate" {
                             return Err(CoreError::new(
@@ -263,11 +263,14 @@ pub(crate) fn dispatch(request: &Request, storage: StateStore) -> Result<Value> 
                 Err(e) if action == "status" => (EntryActivity::default(), Some(e.code.clone())),
                 Err(e) => return Err(e.clone()),
             };
+            let candidate_sources = discovery
+                .observation_snapshot(runner.as_ref(), native::now())
+                .candidate_sources(target);
             if action == "activate" {
-                Ok(json!({"status":"ok", "result":manager.activate(target, &source?, &activity)?}))
+                Ok(json!({"status":"ok", "result":manager.activate(target, &source?, &activity)?, "candidate_sources":candidate_sources}))
             } else {
                 Ok(
-                    json!({"status":"ok", "status_report":manager.status(target, activity)?, "source_issue":source_issue}),
+                    json!({"status":"ok", "status_report":manager.status(target, activity)?, "source_issue":source_issue, "candidate_sources":candidate_sources}),
                 )
             }
         }

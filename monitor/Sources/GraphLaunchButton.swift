@@ -104,7 +104,10 @@ struct GraphLaunchButton: View {
             }
             Button("取消", role: .cancel) { pending = nil }
         } message: {
-            Text("将重新执行 \(pending?.title ?? "应用") 的完整启动检查，通过后建立该应用的受控会话。")
+            let multiWarning = monitor.managedEntryControl.hasMultipleSources
+                ? "\n\n⚠️ 提示：检测到系统中存在 \(monitor.managedEntryControl.candidateSources.count) 个安装版本，已选用系统官方安装启动。建议稍后处理多余版本。"
+                : ""
+            Text("将重新执行 \(pending?.title ?? "应用") 的完整启动检查，通过后建立该应用的受控会话。\(multiWarning)")
         }
         .alert(resultTitle, isPresented: $showingResult) {
             Button("知道了", role: .cancel) {}
@@ -223,7 +226,10 @@ struct ControlledRestartButton: View {
             }
             Button("取消", role: .cancel) {}
         } message: {
-            Text("检测到 \(product.title) 正在运行但尚未接入受控网关沙箱。\n将先平稳关闭当前外部实例，随后以受控网关环境重新启动建立保护。是否继续？")
+            let multiWarning = monitor.managedEntryControl.hasMultipleSources
+                ? "\n\n⚠️ 提示：检测到系统中存在 \(monitor.managedEntryControl.candidateSources.count) 个安装版本，将平稳关闭外部实例并以系统官方安装启动接管。建议稍后处理多余版本。"
+                : ""
+            Text("检测到 \(product.title) 正在运行但尚未接入受控网关沙箱。\n将先平稳关闭当前外部实例，随后以受控网关环境重新启动建立保护。是否继续？\(multiWarning)")
         }
         .alert(resultTitle, isPresented: $showingResult) {
             Button("知道了", role: .cancel) {}
