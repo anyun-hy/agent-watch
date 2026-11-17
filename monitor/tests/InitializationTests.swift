@@ -536,13 +536,30 @@ struct InitializationTests {
         }
         defer { fullProducer.cancel() }
         await full.start()
+        expect(full.approval?.action == .environment && full.passedCount == 3,
+               "full flow stops at the real environment confirmation before any DNS or guard changes")
+        // Supply the continuing background snapshots the production wizard
+        // receives while waiting for receipts and user confirmation.
+        let fullProducer = Task { @MainActor in
+            while !Task.isCancelled {
+                do { try await Task.sleep(nanoseconds: 500_000_000) } catch { return }
+                let at = Date()
+                fullStore.acceptSnapshot(snapshot(node: fullNode, at: at.timeIntervalSince1970), receivedAt: at)
+            }
+        }
+        defer { fullProducer.cancel() }
+        if let request = full.approval { await full.authorize(request) }
+        expect(fullSwitcher.candidate == nil &&
+               fullSwitcher.setupPlan?.candidate_id.hasPrefix("confirmed-protection:") == true,
+               "protection approval reuses the current audit and does not discover a second environment candidate; \(full.rows.map { ($0.step, $0.code, $0.detail) })")
         expect(full.approval?.action == .protection && full.passedCount == 6 &&
                fullLeaks.initializationReceiptIsCurrent(.dns) && fullLeaks.initializationReceiptIsCurrent(.webrtc),
-               "full flow runs smoothly to unified guard & environment confirmation without stopping twice")
+               "full flow carries the actual two accepted fixture receipts into guard confirmation")
         let retainedDNS = fullLeaks.dns.result!.finishedAt
         let retainedRTC = fullLeaks.rtc.result!.finishedAt
         let freshAudit = fullSwitcher.currentEnvironment!.observed_at
         await full.retry()
+        if full.approval?.action == .environment, let request = full.approval { await full.authorize(request) }
         expect(full.approval?.action == .protection && fullSwitcher.currentEnvironment!.observed_at == freshAudit,
                "a current backend audit is reused without an unnecessary environment refresh")
         let expiredApproval = full.approval!
@@ -554,6 +571,7 @@ struct InitializationTests {
                fullSwitcher.settings["guard_enabled"] as? Bool != true,
                "expiry while awaiting confirmation cannot enable guard using the display deadline")
         await full.retry()
+        if full.approval?.action == .environment, let request = full.approval { await full.authorize(request) }
         expect(full.approval?.action == .protection && fullSwitcher.currentEnvironment!.observed_at > freshAudit &&
                fullSwitcher.currentEnvironment!.audit_expires_at! > Date().timeIntervalSince1970,
                "retry refreshes an expired audit even while its display receipt remains current")
@@ -564,6 +582,7 @@ struct InitializationTests {
         let refreshedAudit = fullSwitcher.currentEnvironment!.observed_at
         fullSwitcher.setInitializationAuditExpiryForFixture(nil)
         await full.retry()
+        if full.approval?.action == .environment, let request = full.approval { await full.authorize(request) }
         expect(full.approval?.action == .protection && fullSwitcher.currentEnvironment!.observed_at > refreshedAudit,
                "a legacy receipt without the source deadline is refreshed instead of trusting its display window")
         expect(fullLeaks.dns.result!.finishedAt == retainedDNS && fullLeaks.rtc.result!.finishedAt == retainedRTC,
@@ -576,6 +595,7 @@ struct InitializationTests {
         await full.authorize(mismatchedApproval)
         expect(fullSwitcher.settings["guard_enabled"] as? Bool != true, "a backend context mismatch cannot use the old approval")
         await full.retry()
+        if full.approval?.action == .environment, let request = full.approval { await full.authorize(request) }
         expect(full.approval?.action == .protection,
                "new matching backend receipts permit a fresh guard confirmation; \(full.rows.map { $0.code })")
         fullSwitcher.setInitializationReadbackForFixture(.dns, sampled: 1)
@@ -583,6 +603,7 @@ struct InitializationTests {
         expect(full.rows[4].code == "dns_backend_receipt_changed" && full.approval == nil,
                "a replaced persisted DNS receipt revokes the old green and guard confirmation")
         await full.retry()
+        if full.approval?.action == .environment, let request = full.approval { await full.authorize(request) }
         expect(full.approval?.action == .protection, "retry obtains a new persisted receipt after the backend readback changes")
         let oldGuardApproval = full.approval!
         fullNode = "B"
@@ -594,6 +615,8 @@ struct InitializationTests {
         await full.authorize(oldGuardApproval)
         expect(fullSwitcher.settings["guard_enabled"] as? Bool != true, "old approval cannot enable guard after a context change")
         await full.retry()
+        expect(full.approval?.action == .environment, "new context requires a new environment confirmation")
+        if let request = full.approval { await full.authorize(request) }
         expect(full.approval?.action == .protection && fullLeaks.initializationReceiptIsCurrent(.dns) &&
                fullLeaks.initializationReceiptIsCurrent(.webrtc),
                "retry obtains new-context receipts before presenting a new guard confirmation")
