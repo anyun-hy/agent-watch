@@ -1580,7 +1580,12 @@ impl ChannelSupervisor {
                         // even while the same risk episode is still active.
                         track.process_episode = None;
                     }
-                    if !track.processes.iter().any(|p| processes.contains(p)) && track.processes != processes {
+                    let managed_departed = self.coverage_scopes.get(&family).is_some_and(|scope| {
+                        let had_managed = track.processes.iter().any(|p| !scope.unprotected_pids.contains(&p.pid));
+                        let has_managed = processes.iter().any(|p| !scope.unprotected_pids.contains(&p.pid));
+                        had_managed && !has_managed
+                    });
+                    if (managed_departed || !track.processes.iter().any(|p| processes.contains(p))) && track.processes != processes {
                         // An audit of a replaced/execed process cannot authorize
                         // the new instance, even if its PID was reused.
                         track.cancel_audit();

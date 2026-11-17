@@ -414,7 +414,9 @@ fn queued_inventory_failure_keeps_other_family_and_ordinary_connections() {
         }], native::now()).unwrap();
         let snapshot = stack.supervisor.snapshot(native::now());
         let family = &snapshot.families["claude"];
-        assert!(family.active_members.is_empty() && family.active_member_pids.is_empty());
+        assert_eq!(family.active_members, vec![ordinary_token.clone()]);
+        assert_eq!(family.active_member_pids, vec![ordinary_identity.pid]);
+        assert!(family.coverage_scope.protected_pids.is_empty());
         assert!(family.unmanaged_member_pids.contains(&ordinary_identity.pid));
         assert!(family.coverage_scope.unprotected_pids.contains(&ordinary_identity.pid));
         assert_eq!(family.permit_state, ChannelPermitState::PendingVerification);
@@ -469,9 +471,11 @@ fn queued_inventory_failure_keeps_other_family_and_ordinary_connections() {
         thread::sleep(Duration::from_millis(5));
     };
     // A later timestamp for the identical managed set must keep this audit.
+    let mut current_claude_observed = registry.verified_family_tokens("claude", native::now());
+    current_claude_observed.push(ordinary_token.clone());
     stack.apply_guard_observation(GuardObservation::Inventory {
         family:"claude".into(), desktops:vec![ordinary_desktop.clone()],
-        processes:vec![ordinary_token.clone()], observed_at:native::now(),
+        processes:current_claude_observed, observed_at:native::now(),
     }, native::now()).unwrap();
     assert!(!cancellation.load(Ordering::Acquire));
     assert!(inspect_process_identity(audit_child_pid).is_some());
@@ -491,10 +495,13 @@ fn queued_inventory_failure_keeps_other_family_and_ordinary_connections() {
     assert_eq!(stack.supervisor.snapshot(native::now()).families["claude"].permit_state, ChannelPermitState::PendingVerification);
     claude = Target::start(stack, &helper, &claude_path, LaunchTarget::ClaudeCli, upstream.port(),
         fixture::sample_vpn_observation(native::now(), 1).epoch);
+    fixture::seed_probe_receipts(&store, native::now(), "US");
     let now = native::now();
+    let mut adoption_observed = registry.verified_family_tokens("claude", now);
+    adoption_observed.push(ordinary_token.clone());
     stack.apply_guard_observation(GuardObservation::Inventory {
         family:"claude".into(), desktops:vec![ordinary_desktop.clone()],
-        processes:vec![ordinary_token.clone()], observed_at:now,
+        processes:adoption_observed, observed_at:now,
     }, now).unwrap();
     let initial_identity = inspect_process_identity(claude.child.id()).unwrap();
     assert_ne!(claude.child.id(), removed_pid);
