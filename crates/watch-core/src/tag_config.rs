@@ -238,15 +238,16 @@ pub fn fakeip_dns_config(source: &str) -> Result<(u16, FakeRange, String)> {
         .get("fake-ip-range")
         .and_then(|s| FakeRange::parse(s))
         .ok_or_else(|| CoreError::new("unsupported_fakeip_range", "fake-IP 地址范围不受支持"))?;
-    let (address, port) = values
-        .get("listen")
-        .and_then(|s| s.rsplit_once(':'))
-        .ok_or_else(|| {
-            CoreError::new(
-                "dns_listener_not_loopback_reachable",
-                "未取得本机 DNS 监听地址",
-            )
-        })?;
+    let (address, port) = if let Some((addr, p)) = values.get("listen").and_then(|s| s.rsplit_once(':')) {
+        (addr, p)
+    } else if let Some(p) = values.get("listen").filter(|s| s.bytes().all(|b| b.is_ascii_digit())) {
+        ("127.0.0.1", p.as_str())
+    } else {
+        return Err(CoreError::new(
+            "dns_listener_not_loopback_reachable",
+            "未取得本机 DNS 监听地址",
+        ));
+    };
     if port.is_empty() || !port.bytes().all(|v| v.is_ascii_digit()) {
         return Err(CoreError::new(
             "dns_listener_not_loopback_reachable",

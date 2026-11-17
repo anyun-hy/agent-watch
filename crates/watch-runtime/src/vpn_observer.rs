@@ -136,6 +136,21 @@ impl VpnObservationState {
         self.cached_rules_digest = None;
     }
 
+    /// Touches an existing healthy observation if still fresh and valid,
+    /// advancing sample_seq, observed_at, and valid_until without rotating epoch.
+    pub fn touch_liveness(&mut self, now: f64) -> Option<VpnObservation> {
+        let obs = self.current.as_mut()?;
+        if !Self::healthy(obs) {
+            return None;
+        }
+        self.last_sample_seq = self.last_sample_seq.saturating_add(1);
+        obs.sample_seq = self.last_sample_seq;
+        obs.sample_started_at = now;
+        obs.observed_at = now;
+        obs.valid_until = now + DEFAULT_VPN_OBSERVATION_TTL_SECONDS;
+        Some(obs.clone())
+    }
+
     /// Marks the current VPN observation as invalidated due to a network change,
     /// config file mutation, sleep/wake, or controller failure, immediately
     /// advancing `change_generation`.
@@ -1107,6 +1122,38 @@ impl VpnObserver {
         transition
     }
 
+    pub fn touch_liveness(&mut self, now: f64) -> Option<VpnObservation> {
+        let obs = self.state.touch_liveness(now)?;
+        self.persist_observation(&obs);
+        Some(obs)
+    }
+
+    pub fn is_observation_liveness_intact(&self, creds: Option<&Credentials>) -> bool {
+        let Some(obs) = self.state.current_observation() else {
+            return false;
+        };
+        if !VpnObservationState::healthy(obs) {
+            return false;
+        }
+        if let Some(ref inst) = obs.source_instance {
+            if let Some((pid, sec, mic)) = parse_source_instance_pid(inst) {
+                if !verify_proxy_pid_alive(pid, (sec, mic)) {
+                    return false;
+                }
+            } else {
+                return false;
+            }
+        } else {
+            return false;
+        }
+        if let Some(creds) = creds {
+            if !check_controller_liveness(creds) {
+                return false;
+            }
+        }
+        true
+    }
+
     fn persist_observation(&self, observation: &VpnObservation) {
         if let Some(ref store) = self.storage {
             if let Ok(val) = serde_json::to_value(observation) {
@@ -1115,6 +1162,33 @@ impl VpnObserver {
             }
         }
     }
+}
+
+pub fn parse_source_instance_pid(instance: &str) -> Option<(u32, u64, u32)> {
+    let mut parts = instance.split(':');
+    if parts.next()? != "pid" {
+        return None;
+    }
+    let pid = parts.next()?.parse::<u32>().ok()?;
+    let seconds = parts.next()?.parse::<u64>().ok()?;
+    let micros = parts.next()?.parse::<u32>().ok()?;
+    Some((pid, seconds, micros))
+}
+
+pub fn verify_proxy_pid_alive(pid: u32, expected_start: (u64, u32)) -> bool {
+    if pid <= 1 {
+        return false;
+    }
+    claude_watch_system::process_start_time_any_user(pid) == Some(expected_start)
+}
+
+pub fn check_controller_liveness(creds: &Credentials) -> bool {
+    if let Some(sock) = creds.unix_socket() {
+        if sock.exists() && std::os::unix::net::UnixStream::connect(sock).is_ok() {
+            return true;
+        }
+    }
+    std::net::TcpStream::connect_timeout(&creds.endpoint(), Duration::from_millis(100)).is_ok()
 }
 
 #[cfg(test)]

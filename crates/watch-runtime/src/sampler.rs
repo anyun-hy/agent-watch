@@ -606,7 +606,8 @@ impl<R: ReadRunner> Sampler<R> {
             let store = StateStore::new(self.paths.clone());
             for path in &candidate_paths {
                 if let Ok(Some(bytes)) = store.read_bytes(path, tag_config::CONFIG_LIMIT) {
-                    if let Ok(text) = String::from_utf8(bytes) {
+                    if let Ok(mut text) = String::from_utf8(bytes) {
+                        merge_sibling_dns_config(&store, path, &mut text);
                         config = Some(text);
                         config_path = path.clone();
                         break;
@@ -964,6 +965,34 @@ pub fn parse_process_table(text: &str) -> Result<BTreeMap<u32, Value>> {
     }
     Ok(result)
 }
+
+fn merge_sibling_dns_config(store: &StateStore, config_path: &Path, text: &mut String) {
+    if !text.contains("dns:") {
+        if let Some(parent) = config_path.parent() {
+            for candidate in ["dns_config.yaml", "dns.yaml"] {
+                let dns_path = parent.join(candidate);
+                if let Ok(Some(bytes)) = store.read_bytes(&dns_path, tag_config::CONFIG_LIMIT) {
+                    if let Ok(dns_text) = String::from_utf8(bytes) {
+                        if dns_text.contains("dns:") {
+                            text.push('\n');
+                            text.push_str(&dns_text);
+                            break;
+                        } else if dns_text.contains("fake-ip-range") || dns_text.contains("enhanced-mode") {
+                            text.push_str("\ndns:\n");
+                            for line in dns_text.lines() {
+                                text.push_str("  ");
+                                text.push_str(line.trim_start());
+                                text.push('\n');
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 struct TagSource<'a, R: ReadRunner> {
     sampler: &'a Sampler<R>,
     client: Option<&'a Client>,
@@ -981,11 +1010,14 @@ impl<R: ReadRunner> fakeip_probe::Source for TagSource<'_, R> {
         self.started.elapsed()
     }
     fn config(&mut self) -> Result<String> {
-        let bytes = StateStore::new(self.sampler.paths.clone())
+        let store = StateStore::new(self.sampler.paths.clone());
+        let bytes = store
             .read_bytes(&self.config_path, tag_config::CONFIG_LIMIT)?
             .ok_or_else(|| CoreError::new("tag_config_unavailable", "TAG运行配置不存在"))?;
-        String::from_utf8(bytes)
-            .map_err(|_| CoreError::new("tag_config_encoding", "TAG运行配置编码无效"))
+        let mut text = String::from_utf8(bytes)
+            .map_err(|_| CoreError::new("tag_config_encoding", "TAG运行配置编码无效"))?;
+        merge_sibling_dns_config(&store, &self.config_path, &mut text);
+        Ok(text)
     }
     fn listeners(&mut self) -> Result<CommandEvidence> {
         self.sampler

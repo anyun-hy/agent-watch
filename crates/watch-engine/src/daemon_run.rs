@@ -372,6 +372,12 @@ fn spawn_vpn_observation_worker(
                     .home
                     .join("Library/Application Support/com.tag.lab/mihomo/runtime.yaml"),
             );
+            let v2_dir = storage
+                .paths
+                .home
+                .join("Library/Application Support/com.tag.lab.v2");
+            watcher.watch_file(v2_dir.join("config.yaml"));
+            watcher.watch_file(v2_dir.join("dns_config.yaml"));
             let config_store = ConfigStore {
                 storage: storage.clone(),
             };
@@ -475,12 +481,43 @@ fn spawn_vpn_observation_worker(
                 if invalidated_by_wake {
                     continue;
                 }
-                let needs_refresh = observer
-                    .state
-                    .current_observation()
-                    .map_or(true, |obs| now + 1.0 >= obs.valid_until);
+                let current_obs = observer.state.current_observation();
+                let has_obs = current_obs.is_some();
 
-                if !frame_changed && !notified && !needs_refresh {
+                // 方案 B：事实保活（O(1) Liveness）+ 事件失效重测（Event Invalidation）
+                if !frame_changed && !notified && has_obs {
+                    let obs = current_obs.unwrap();
+                    if now + 1.2 < obs.valid_until {
+                        // 租约还充裕，无需任何操作，继续等待系统事件
+                        continue;
+                    }
+                    // 临近过期：执行微秒级 O(1) 事实存活验证（PID+Socket），不走昂贵的 netstat 和 4x HTTP
+                    if custom_reader.is_none() {
+                        let creds = resolve_vpn_controller_credentials(&storage, &expectation.proxy_mode).ok();
+                        if observer.is_observation_liveness_intact(creds.as_ref()) {
+                            if let Some(touched) = observer.touch_liveness(now) {
+                                let _ = event_tx.send(SupervisionEvent::VpnObservationUpdated {
+                                    observation: touched,
+                                    observed_at: now,
+                                });
+                                continue;
+                            }
+                        } else {
+                            // O(1) 事实验证失败：代理进程退出或崩溃，判定失效
+                            let transition = observer.handle_invalidation_event(
+                                "proxy_process_liveness_lost",
+                                &expectation,
+                                now,
+                            );
+                            let _ = event_tx.send(SupervisionEvent::VpnObservationUpdated {
+                                observation: transition.observation,
+                                observed_at: now,
+                            });
+                        }
+                    }
+                }
+
+                if !frame_changed && !notified && has_obs && custom_reader.is_none() {
                     continue;
                 }
 
