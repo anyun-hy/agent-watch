@@ -12,6 +12,7 @@ struct ConnectionGraphView: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var selectedNode: GraphNodeID = .gateway
     @State private var expandedNode: GraphNodeID?
+    @State private var showingEntryConfirm = false
 
     private var selectedProduct: MonitoredProduct { store.networkSelection.product }
     private var display: GraphDisplayState { store.graphDisplay(for: selectedProduct) }
@@ -139,6 +140,7 @@ struct ConnectionGraphView: View {
             }.padding(.horizontal, 23).padding(.top, 17).padding(.bottom, 7)
 
             protectionSummary
+            managedEntryRow
 
             ViewThatFits(in: .horizontal) {
                 wideScene.frame(minWidth: 900)
@@ -183,7 +185,21 @@ struct ConnectionGraphView: View {
         }
         .clipShape(RoundedRectangle(cornerRadius: 20))
         .overlay(RoundedRectangle(cornerRadius: 20).strokeBorder(p.border, lineWidth: 1))
-        .onAppear { store.synchronizeNetworkSelection() }
+        .onAppear {
+            store.synchronizeNetworkSelection()
+            Task { await store.managedEntryControl.refresh(for: selectedProduct) }
+        }
+        .onChange(of: selectedProduct) {
+            Task { await store.managedEntryControl.refresh(for: selectedProduct) }
+        }
+        .confirmationDialog("启用 \(selectedProduct.title) 受控桌面入口？", isPresented: $showingEntryConfirm, titleVisibility: .visible) {
+            Button("确认启用") {
+                Task { await store.managedEntryControl.setEnabled(true, for: selectedProduct) }
+            }
+            Button("取消", role: .cancel) {}
+        } message: {
+            Text("将在您的个人目录 ~/Applications 生成受控入口包装。\n原版 /Applications 中的应用绝对零篡改；关闭此开关即可毫秒级清理零残留。是否继续？")
+        }
     }
 
     private var protectionSummary: some View {
@@ -277,6 +293,50 @@ struct ConnectionGraphView: View {
             return p.amber
         }
         return p.secondary
+    }
+
+    private var managedEntryRow: some View {
+        HStack(spacing: 10) {
+            Image(systemName: store.managedEntryControl.isGenerated ? "shield.checkered" : "shield.slash")
+                .foregroundStyle(store.managedEntryControl.isGenerated ? p.mint : p.secondary)
+                .font(.system(size: 13))
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 6) {
+                    Text("受控桌面入口 (Opt-in)")
+                        .font(WatchTypography.caption.weight(.medium))
+                        .foregroundStyle(p.text)
+                    Badge(text: store.managedEntryControl.isGenerated ? "已部署" : "未启用（原版直通）",
+                          color: store.managedEntryControl.isGenerated ? p.mint : p.secondary)
+                }
+                Text(store.managedEntryControl.isGenerated
+                     ? "在 ~/Applications 部署了独立受控入口，直接点击即受控启动；原版应用零篡改。"
+                     : "原版 /Applications/\(selectedProduct.title).app 零篡改；开启后在个人目录生成独立受控入口。")
+                    .font(WatchTypography.small)
+                    .foregroundStyle(p.secondary)
+                    .lineLimit(1)
+            }
+            Spacer(minLength: 12)
+            if store.managedEntryControl.busy {
+                ProgressView().controlSize(.small)
+            } else {
+                Toggle("", isOn: Binding(
+                    get: { store.managedEntryControl.isGenerated },
+                    set: { willEnable in
+                        if willEnable {
+                            showingEntryConfirm = true
+                        } else {
+                            Task { await store.managedEntryControl.setEnabled(false, for: selectedProduct) }
+                        }
+                    }
+                ))
+                .toggleStyle(.switch)
+                .controlSize(.small)
+                .labelsHidden()
+            }
+        }
+        .padding(.horizontal, 23)
+        .padding(.vertical, 6)
+        .background(p.elevated.opacity(0.25))
     }
 
     private func archivedPath(_ sample: GraphPathSample) -> some View {

@@ -9,6 +9,7 @@ final class MonitorStore: ObservableObject {
     let aiChecks: AIProbeStore
     let netCoffee = NetCoffeeStore()
     let processControl = AIProcessControl()
+    let managedEntryControl = ManagedEntryControl()
     let switcher: SwitcherStore
     /// First-run owns diagnostic/mutation sequencing; the timer only reads snapshots.
     @Published private(set) var initializing = false
