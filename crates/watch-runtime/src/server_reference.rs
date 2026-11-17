@@ -145,7 +145,7 @@ fn get<T: Transport>(transport: &T, url: String) -> Result<Value, String> {
     let is_dns = url.starts_with(DNS_URL);
     json(transport.get(&Request {
         url,
-        proxy: Some(crate::network_client::DEFAULT_PROXY.into()),
+        proxy: Some(crate::network_client::default_proxy_url().into()),
         timeout: Duration::from_secs(8),
         connect_timeout: Some(Duration::from_secs(3)),
         max_body: MAX_RESPONSE_BYTES,

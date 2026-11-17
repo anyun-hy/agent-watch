@@ -668,7 +668,7 @@ impl<R: ReadRunner, T: Transport, M: Mutator> Macos<R, T, M> {
             && tag["entry"]["state"] == "verified"
             && (tag["api"]["covers_7890"] == true || tag["api"]["covers_7897"] == true)
         {
-            let endpoint = tag["entry"]["endpoint"].as_str().unwrap_or(crate::network_client::DEFAULT_PROXY);
+            let endpoint = tag["entry"]["endpoint"].as_str().unwrap_or(crate::network_client::default_proxy_url());
             json!(endpoint)
         } else {
             Value::Null
@@ -701,7 +701,7 @@ impl<R: ReadRunner, T: Transport, M: Mutator> Macos<R, T, M> {
                 environment_at = environment_at.min(listener_at);
             }
             if selected != "tag" && proxy == "ok" {
-                let endpoint = if c.proxy_url.trim().is_empty() { crate::network_client::DEFAULT_PROXY } else { &c.proxy_url };
+                let endpoint = if c.proxy_url.trim().is_empty() { crate::network_client::default_proxy_url() } else { &c.proxy_url };
                 let url = url::Url::parse(endpoint).ok()
                     .filter(|_| claude_watch_core::config::valid_loopback_proxy(endpoint))
                     .ok_or_else(|| CoreError::new("proxy_listener_unavailable", "未取得受控代理监听端点"))?;

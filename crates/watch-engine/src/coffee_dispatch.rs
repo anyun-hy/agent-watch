@@ -4,7 +4,7 @@ use claude_watch_core::{
     error::{CoreError, Result},
 };
 use claude_watch_runtime::{
-    network_client::{NetworkClient, Receipt, UreqTransport, DEFAULT_PROXY},
+    network_client::{NetworkClient, Receipt, UreqTransport, default_proxy_url},
     storage::{Paths, StateStore},
 };
 use serde_json::{json, Value};
@@ -142,7 +142,7 @@ pub fn dispatch(request: &Request, paths: Paths) -> Result<Option<Value>> {
     if kind != "trace" && query.is_empty() {
         return Err(CoreError::new("invalid_arguments", "查询参数不能为空"));
     }
-    let network = NetworkClient::new(Arc::new(UreqTransport), Some(DEFAULT_PROXY.into()))
+    let network = NetworkClient::new(Arc::new(UreqTransport), Some(default_proxy_url().into()))
         .map_err(|error| CoreError::new(&error.code, &error.detail))?
         .with_state_store(StateStore::new(paths));
     let receipt = match kind {

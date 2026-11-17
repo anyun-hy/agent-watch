@@ -475,7 +475,12 @@ fn spawn_vpn_observation_worker(
                 if invalidated_by_wake {
                     continue;
                 }
-                if !frame_changed && !notified {
+                let needs_refresh = observer
+                    .state
+                    .current_observation()
+                    .map_or(true, |obs| now + 1.0 >= obs.valid_until);
+
+                if !frame_changed && !notified && !needs_refresh {
                     continue;
                 }
 
