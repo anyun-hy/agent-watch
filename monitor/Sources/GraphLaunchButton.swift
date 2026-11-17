@@ -47,6 +47,7 @@ enum GraphLaunchTarget: Equatable {
     }
 }
 
+@MainActor
 func isExternalRunningUnmanaged(product: MonitoredProduct, monitor: MonitorStore, switcher: SwitcherStore, at now: Date) -> Bool {
     let target = GraphLaunchTarget(product: product)
     let running: Bool
