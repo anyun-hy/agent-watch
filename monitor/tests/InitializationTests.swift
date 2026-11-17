@@ -525,9 +525,6 @@ struct InitializationTests {
             }, startSnapshotPolling: false)
         var fullWrites = 0
         let full = FirstRunInitialization(checks: fullChecks, completed: false, saveCompletion: { fullWrites += 1 })
-        await full.start()
-        expect(full.approval?.action == .environment && full.passedCount == 2,
-               "full flow stops at the real environment confirmation before any DNS or guard changes")
         // Supply the continuing background snapshots the production wizard
         // receives while waiting for receipts and user confirmation.
         let fullProducer = Task { @MainActor in
@@ -538,13 +535,10 @@ struct InitializationTests {
             }
         }
         defer { fullProducer.cancel() }
-        if let request = full.approval { await full.authorize(request) }
-        expect(fullSwitcher.candidate == nil &&
-               fullSwitcher.setupPlan?.candidate_id.hasPrefix("confirmed-protection:") == true,
-               "protection approval reuses the current audit and does not discover a second environment candidate; \(full.rows.map { ($0.step, $0.code, $0.detail) })")
+        await full.start()
         expect(full.approval?.action == .protection && full.passedCount == 6 &&
                fullLeaks.initializationReceiptIsCurrent(.dns) && fullLeaks.initializationReceiptIsCurrent(.webrtc),
-               "full flow carries the actual two accepted fixture receipts into guard confirmation")
+               "full flow runs smoothly to unified guard & environment confirmation without stopping twice")
         let retainedDNS = fullLeaks.dns.result!.finishedAt
         let retainedRTC = fullLeaks.rtc.result!.finishedAt
         let freshAudit = fullSwitcher.currentEnvironment!.observed_at
@@ -582,7 +576,6 @@ struct InitializationTests {
         await full.authorize(mismatchedApproval)
         expect(fullSwitcher.settings["guard_enabled"] as? Bool != true, "a backend context mismatch cannot use the old approval")
         await full.retry()
-        if full.approval?.action == .environment, let request = full.approval { await full.authorize(request) }
         expect(full.approval?.action == .protection,
                "new matching backend receipts permit a fresh guard confirmation; \(full.rows.map { $0.code })")
         fullSwitcher.setInitializationReadbackForFixture(.dns, sampled: 1)
@@ -590,20 +583,17 @@ struct InitializationTests {
         expect(full.rows[4].code == "dns_backend_receipt_changed" && full.approval == nil,
                "a replaced persisted DNS receipt revokes the old green and guard confirmation")
         await full.retry()
-        if full.approval?.action == .environment, let request = full.approval { await full.authorize(request) }
         expect(full.approval?.action == .protection, "retry obtains a new persisted receipt after the backend readback changes")
         let oldGuardApproval = full.approval!
         fullNode = "B"
         fullStore.acceptSnapshot(snapshot(node: fullNode, at: Date().timeIntervalSince1970), receivedAt: Date())
         full.refreshReadiness()
-        expect(full.approval == nil && full.rows[1].status == .failed && full.rows[4].status == .failed &&
+        expect(full.approval == nil && full.rows[2].status == .failed && full.rows[4].status == .failed &&
                full.rows[5].status == .failed && full.rows[6].status == .pending,
                "changing the real shared context revokes both receipt greens and the pending guard approval")
         await full.authorize(oldGuardApproval)
         expect(fullSwitcher.settings["guard_enabled"] as? Bool != true, "old approval cannot enable guard after a context change")
         await full.retry()
-        expect(full.approval?.action == .environment, "new context requires a new environment confirmation")
-        if let request = full.approval { await full.authorize(request) }
         expect(full.approval?.action == .protection && fullLeaks.initializationReceiptIsCurrent(.dns) &&
                fullLeaks.initializationReceiptIsCurrent(.webrtc),
                "retry obtains new-context receipts before presenting a new guard confirmation")

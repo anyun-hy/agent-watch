@@ -3,17 +3,17 @@ import Darwin
 import Foundation
 
 enum InitializationStep: String, CaseIterable, Codable, Identifiable {
-    case components, connection, environment, accessibility, dns, webrtc, protection, verification
+    case components, accessibility, connection, environment, dns, webrtc, protection, verification
     var id: String { rawValue }
     var title: String {
         switch self {
         case .components: return "运行组件与数据目录"
-        case .connection: return "采集后台与本机代理"
-        case .environment: return "实测环境与设置"
         case .accessibility: return "辅助功能授权"
+        case .connection: return "采集后台与本机代理"
+        case .environment: return "网络出口与实测环境"
         case .dns: return "DNS 主检测"
         case .webrtc: return "WebRTC 泄漏检测"
-        case .protection: return "启用 Watch 自有守护"
+        case .protection: return "环境策略与守护激活"
         case .verification: return "环境与保护状态联合复核"
         }
     }
@@ -410,13 +410,15 @@ final class FirstRunInitialization: ObservableObject {
             }
             switch outcome {
             case .passed(let expiry):
-                if self.rows[1].status == .failed && ["context_unavailable", "snapshot_unavailable"].contains(self.rows[1].code) {
-                    self.rows[1].status = .passed; self.rows[1].code = "passed"
-                    self.rows[1].detail = "已重新确认原有代理上下文和后台采样。"
+                if let connIdx = self.rows.firstIndex(where: { $0.step == .connection }),
+                   self.rows[connIdx].status == .failed && ["context_unavailable", "snapshot_unavailable"].contains(self.rows[connIdx].code) {
+                    self.rows[connIdx].status = .passed; self.rows[connIdx].code = "passed"
+                    self.rows[connIdx].detail = "已重新确认原有代理上下文和后台采样。"
                 }
-                if self.rows[2].status == .pending && self.rows[2].code == "dependency_invalidated" {
-                    self.rows[2].status = .passed; self.rows[2].code = "passed"
-                    self.rows[2].detail = "已确认的环境设置与当前状态保持一致。"
+                if let envIdx = self.rows.firstIndex(where: { $0.step == .environment }),
+                   self.rows[envIdx].status == .pending && self.rows[envIdx].code == "dependency_invalidated" {
+                    self.rows[envIdx].status = .passed; self.rows[envIdx].code = "passed"
+                    self.rows[envIdx].detail = "已确认的环境设置与当前状态保持一致。"
                 }
                 for step in [InitializationStep.dns, .webrtc] {
                     let index = self.rows.firstIndex { $0.step == step }!
@@ -430,9 +432,9 @@ final class FirstRunInitialization: ObservableObject {
                 let verification = self.rows.count - 1
                 _ = self.accept(.passed("本轮自动刷新已完成；网络、配置与保护状态一致。", validUntil: expiry), at: verification)
             case .failed(let step, let code, let detail):
-                if step == .connection && self.rows[2].status == .passed {
-                    self.rows[2].status = .pending; self.rows[2].code = "dependency_invalidated"
-                    self.rows[2].detail = "代理状态暂不可确认，等待重新核对环境。"
+                if step == .connection, let envIdx = self.rows.firstIndex(where: { $0.step == .environment }), self.rows[envIdx].status == .passed {
+                    self.rows[envIdx].status = .pending; self.rows[envIdx].code = "dependency_invalidated"
+                    self.rows[envIdx].detail = "代理状态暂不可确认，等待重新核对环境。"
                 }
                 for item in [InitializationStep.dns, .webrtc, .protection, .verification] {
                     let index = self.rows.firstIndex { $0.step == item }!

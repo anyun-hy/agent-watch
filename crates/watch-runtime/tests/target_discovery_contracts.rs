@@ -1557,3 +1557,46 @@ fn canonical_home_alias_and_registry_failure_reuse_current_evidence_conservative
     );
     println!("M5 canonical home alias: shared cache and explicit native source agree; failed registry query becomes partial while current known installation remains usable under existing gates");
 }
+
+#[test]
+fn select_prefers_system_applications_when_multiple_sources_exist() {
+    let target1 = DiscoveredTarget {
+        target: LaunchTarget::ChatgptDesktop,
+        source_kind: "system".into(),
+        source_id: "system-app".into(),
+        entry_path: "/Applications/ChatGPT.app".into(),
+        bundle: Some("/Applications/ChatGPT.app".into()),
+        bundle_id: Some("com.openai.chat".into()),
+        executable: Some("/Applications/ChatGPT.app/Contents/MacOS/ChatGPT".into()),
+        script_entry: None,
+        interpreter: None,
+        launcher_supported: true,
+        child_executables: vec![],
+        error_code: None,
+    };
+    let target2 = DiscoveredTarget {
+        target: LaunchTarget::ChatgptDesktop,
+        source_kind: "user".into(),
+        source_id: "user-staged".into(),
+        entry_path: "/Users/someone/staged/ChatGPT.app".into(),
+        bundle: Some("/Users/someone/staged/ChatGPT.app".into()),
+        bundle_id: Some("com.openai.chat".into()),
+        executable: Some("/Users/someone/staged/ChatGPT.app/Contents/MacOS/ChatGPT".into()),
+        script_entry: None,
+        interpreter: None,
+        launcher_supported: true,
+        child_executables: vec![],
+        error_code: None,
+    };
+    let snapshot = DiscoverySnapshot {
+        revision: "rev-1".into(),
+        prior_revision: None,
+        complete: true,
+        targets: vec![target1, target2],
+        issues: vec![],
+        preferred_sources: BTreeMap::new(),
+    };
+    let selected = snapshot.select(LaunchTarget::ChatgptDesktop, None).unwrap();
+    assert_eq!(selected.entry_path, Path::new("/Applications/ChatGPT.app"));
+}
+

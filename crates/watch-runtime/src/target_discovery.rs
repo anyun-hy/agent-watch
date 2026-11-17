@@ -130,6 +130,21 @@ impl DiscoverySnapshot {
             .filter_map(|r| r.executable.as_ref())
             .collect();
         if files.len() > 1 {
+            let system_apps: Vec<_> = records
+                .iter()
+                .filter(|r| {
+                    r.entry_path.starts_with("/Applications/")
+                        && !r.entry_path.starts_with("/Applications/Utilities/")
+                })
+                .copied()
+                .collect();
+            let system_files: BTreeSet<_> = system_apps
+                .iter()
+                .filter_map(|r| r.executable.as_ref())
+                .collect();
+            if system_files.len() == 1 {
+                return Ok(system_apps[0]);
+            }
             return Err(CoreError::new(
                 "ambiguous_source",
                 "存在多个有效安装，尚未选定来源",

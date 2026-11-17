@@ -13,6 +13,7 @@ struct ConnectionGraphView: View {
     @State private var selectedNode: GraphNodeID = .gateway
     @State private var expandedNode: GraphNodeID?
     @State private var showingEntryConfirm = false
+    @State private var showingEntryError = false
 
     private var selectedProduct: MonitoredProduct { store.networkSelection.product }
     private var display: GraphDisplayState { store.graphDisplay(for: selectedProduct) }
@@ -117,6 +118,8 @@ struct ConnectionGraphView: View {
                     }
                     Spacer(minLength: 0)
                     HStack(spacing: 8) {
+                        ControlledRestartButton(product: selectedProduct, monitor: store, switcher: store.switcher,
+                                                processControl: store.processControl, p: p)
                         GraphLaunchButton(product: selectedProduct, monitor: store, switcher: store.switcher,
                                           processControl: store.processControl, p: p)
                         AIProcessCloseButton(product: selectedProduct, store: store, control: store.processControl,
@@ -194,11 +197,19 @@ struct ConnectionGraphView: View {
         }
         .confirmationDialog("启用 \(selectedProduct.title) 受控桌面入口？", isPresented: $showingEntryConfirm, titleVisibility: .visible) {
             Button("确认启用") {
-                Task { await store.managedEntryControl.setEnabled(true, for: selectedProduct) }
+                Task {
+                    let ok = await store.managedEntryControl.setEnabled(true, for: selectedProduct)
+                    if !ok { showingEntryError = true }
+                }
             }
             Button("取消", role: .cancel) {}
         } message: {
             Text("将在您的个人目录 ~/Applications 生成受控入口包装。\n原版 /Applications 中的应用绝对零篡改；关闭此开关即可毫秒级清理零残留。是否继续？")
+        }
+        .alert("受控入口配置未完成", isPresented: $showingEntryError) {
+            Button("知道了", role: .cancel) {}
+        } message: {
+            Text(store.managedEntryControl.errorMessage ?? "操作未能完成，请查看系统日志或重试。")
         }
     }
 
@@ -325,7 +336,10 @@ struct ConnectionGraphView: View {
                         if willEnable {
                             showingEntryConfirm = true
                         } else {
-                            Task { await store.managedEntryControl.setEnabled(false, for: selectedProduct) }
+                            Task {
+                                let ok = await store.managedEntryControl.setEnabled(false, for: selectedProduct)
+                                if !ok { showingEntryError = true }
+                            }
                         }
                     }
                 ))

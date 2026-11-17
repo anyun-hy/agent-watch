@@ -37,7 +37,7 @@ struct AIProcessCloseButton: View {
                 .font(WatchTypography.caption.weight(.medium)).padding(.horizontal, 12).frame(height: 32)
                 .foregroundStyle(p.red).background(p.red.opacity(0.1), in: RoundedRectangle(cornerRadius: 8))
         }
-        .buttonStyle(.plain).disabled(control.busy || switcher.busy).opacity(control.busy || switcher.busy ? 0.55 : 1)
+        .buttonStyle(.plain).disabled(control.busy).opacity(control.busy ? 0.55 : 1)
         .help("核对身份后强制结束 \(product.title) 桌面应用、CLI 与关联子进程；未保存内容可能丢失")
         .accessibilityLabel("强制结束 \(product.title)")
         .confirmationDialog("强制结束 \(product.title)？", isPresented: $confirming, titleVisibility: .visible) {

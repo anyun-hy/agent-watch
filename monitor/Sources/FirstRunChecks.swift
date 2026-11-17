@@ -124,16 +124,16 @@ final class FirstRunChecks: InitializationChecking {
         case .dns, .webrtc:
             return await checkNetwork(step, forceNew: false)
         case .protection:
-            guard contextMatches, acceptedSettings != nil, acceptedSettings == settingsData else { return changedFailure }
+            guard contextMatches else { return changedFailure }
+            guard !recoveryRequired else { return recoveryFailure }
             // The leak checks may already have read back both receipts in a
             // fresh environment audit. Only acquire a new audit when needed.
             if !hasCurrentProtectionReadback, !(await store.switcher.detectCurrentEnvironment()) {
                 return .failed(code: "environment_unstable", detail: "启用守护前的环境预检未完成，请重试。")
             }
             requireBackendContextMatch = true
-            let precheck = preProtectionEvidence()
-            if case .failed = precheck { return precheck }
-            guard let id = store.switcher.currentEnvironment?.observation_id, !id.isEmpty else {
+            guard accessibilityTrusted() else { return .failed(code: "permission_missing", detail: "辅助功能权限未确认，请重新授权。") }
+            guard let id = store.switcher.currentEnvironment?.observation_id ?? store.switcher.candidate?.id, !id.isEmpty else {
                 return .failed(code: "environment_not_ready", detail: "环境回执缺少本轮观测编号。")
             }
             return await previewSetup(candidateID: "confirmed-protection:\(id)", enableProtection: true)
@@ -205,7 +205,7 @@ final class FirstRunChecks: InitializationChecking {
         // greens, so a waiting-period refresh and a failed-round resume can
         // never disagree about what counts as current evidence.
         let blocking = currentEvidenceFailures()
-        for step in [InitializationStep.connection, .environment, .accessibility] {
+        for step in [InitializationStep.accessibility, .connection, .environment] {
             if case .failed(let code, let detail)? = blocking[step] {
                 return .failed(step: step, code: code, detail: detail)
             }
@@ -246,34 +246,25 @@ final class FirstRunChecks: InitializationChecking {
                   store.switcher.setupCanConfirm, Self.allowed(plan.actions) else {
                 return .failed(code: "setup_preview_expired", detail: "授权预览已过期或环境改变，请重新检查并确认。")
             }
-            if request.action == .protection {
-                // Consent may have taken minutes. Recheck the original source
-                // times immediately before enabling protection, not just the
-                // more recently generated preview's expiry.
-                let precheck = preProtectionEvidence()
-                if case .failed = precheck { return precheck }
-            }
+            guard accessibilityTrusted() else { return .failed(code: "permission_missing", detail: "辅助功能权限未确认，请重新授权。") }
             await store.switcher.applyEnvironment(refreshDetection: false, progress: progress)
             guard !store.switcher.failure, !recoveryRequired,
                   store.switcher.environment?.initialized == true,
-                  request.action != .protection || protectionSettingsEnabled else {
+                  protectionSettingsEnabled else {
                 return .failed(code: "setup_not_applied", detail: store.switcher.message.isEmpty ? "环境或守护未能应用并确认，请查看检查记录。" : store.switcher.message)
             }
             guard contextMatches else { return changedFailure }
             setupWasApproved = true
             approvedContext = boundContext
             acceptedSettings = settingsData
-            if request.action == .protection {
-                let deadline = Date().addingTimeInterval(15)
-                repeat {
-                    await store.switcher.refreshBackground(maximumAge: 5)
-                    if backgroundIsCurrent { break }
-                    try? await Task.sleep(nanoseconds: 500_000_000)
-                } while Date() < deadline && !Task.isCancelled
-                guard backgroundIsCurrent else { return backgroundFailure }
-                return .passed("Watch 守护已开启并确认运行心跳，继续联合复核。")
-            }
-            return .passed("实测环境已保存并回读，继续核对权限及网络。")
+            let deadline = Date().addingTimeInterval(15)
+            repeat {
+                await store.switcher.refreshBackground(maximumAge: 5)
+                if backgroundIsCurrent { break }
+                try? await Task.sleep(nanoseconds: 500_000_000)
+            } while Date() < deadline && !Task.isCancelled
+            guard backgroundIsCurrent else { return backgroundFailure }
+            return .passed("环境策略与 Watch 守护已应用并确认运行心跳，继续联合复核。")
         }
     }
     private var hasCurrentProtectionReadback: Bool {
@@ -290,47 +281,43 @@ final class FirstRunChecks: InitializationChecking {
         guard !recoveryRequired else { return recoveryFailure }
         await store.switcher.detectEnvironment()
         guard let candidate = store.switcher.candidate, !store.switcher.failure else {
-            return .failed(code: "environment_unavailable", detail: store.switcher.message)
+            return .failed(code: "environment_unavailable", detail: store.switcher.message.isEmpty ? "未能取得实测环境" : store.switcher.message)
         }
-        return await previewSetup(candidateID: candidate.id, enableProtection: false)
+        let country = candidate.country.isEmpty ? "" : " / \(candidate.country)"
+        let detail = "实测出口 \(candidate.ip)\(country)，时区及启动策略就绪，后续将合并确认并启用守护。"
+        return .passed(detail)
     }
     private func previewSetup(candidateID: String, enableProtection: Bool) async -> InitializationResult {
-        store.switcher.setupApplyEnvironment = !enableProtection
+        store.switcher.setupApplyEnvironment = true
         store.switcher.setupEnablePolicy = true
-        // First collect/verify the environment. Enabling new protection is a
-        // separate, explicit step only after DNS, WebRTC and precheck passed.
-        store.switcher.setupGuard = enableProtection || store.switcher.isOn(Setting.guardEnabled)
-        store.switcher.setupWatchdog = enableProtection || store.switcher.isOn(Setting.timezoneWatchdog)
+        store.switcher.setupGuard = true
+        store.switcher.setupWatchdog = true
         store.switcher.setupUpdater = store.switcher.isOn(Setting.autoUpdate)
         await store.switcher.previewEnvironment(candidateID: candidateID)
         guard let plan = store.switcher.setupPlan else {
-            return .failed(code: "setup_preview_unavailable", detail: store.switcher.message)
+            return .failed(code: "setup_preview_unavailable", detail: store.switcher.message.isEmpty ? "环境预览不可用" : store.switcher.message)
         }
         guard plan.candidate_id == candidateID,
-              plan.expires_at > Date().timeIntervalSince1970, Self.allowed(plan.actions), contextMatches,
-              !enableProtection || plan.actions.allSatisfy({ $0.id == "watchdog" }) else {
+              plan.expires_at > Date().timeIntervalSince1970, Self.allowed(plan.actions), contextMatches else {
             return .failed(code: "setup_preview_invalid", detail: "环境预览不可用、已变化或包含范围外操作；未执行变更。请重新检查。")
         }
         if setupWasApproved && approvedContext == boundContext && plan.actions.isEmpty
-            && (plan.confirmation_lines ?? []).isEmpty && (!enableProtection || protectionSettingsEnabled) {
+            && (plan.confirmation_lines ?? []).isEmpty && protectionSettingsEnabled {
             acceptedSettings = settingsData
-            if enableProtection {
-                guard backgroundIsCurrent else { return backgroundFailure }
-                return .passed("Watch 守护已开启并确认运行心跳，继续联合复核。")
-            }
-            return .passed("已确认的环境设置保持一致。")
+            guard backgroundIsCurrent else { return backgroundFailure }
+            return .passed("Watch 守护已开启并确认运行心跳，继续联合复核。")
         }
         let needsAdministrator = plan.actions.contains { ["timezone", "ipv6", "watchdog"].contains($0.id) }
         let description = needsAdministrator
-            ? "确认后先复核出口，再请求 macOS 管理员权限以执行所列系统操作，完成后回读。"
-            : "确认后先复核出口，再保存 Watch 设置；本次列出的操作不需要管理员权限。"
-        return .approval(.init(id: plan.id, action: enableProtection ? .protection : .environment,
-            title: enableProtection ? "启用 Watch 自有守护" : "确认初始化环境",
+            ? "确认后先复核出口，再请求 macOS 管理员权限以执行所列系统操作，完成后回读并启动守护。"
+            : "确认后先复核出口，再保存 Watch 设置并启动守护；本次列出的操作不需要管理员权限。"
+        return .approval(.init(id: plan.id, action: .protection,
+            title: "确认环境策略并启用 Watch 自有守护",
             detail: description,
-            changes: Self.confirmationChanges(plan, enableProtection: enableProtection)))
+            changes: Self.confirmationChanges(plan, enableProtection: true)))
     }
     static func confirmationChanges(_ plan: EnvironmentSetupPlan, enableProtection: Bool) -> [String] {
-        (enableProtection ? ["开启 Watch 保镖与时区守护，保存重启后的自动恢复设置"] : ["保存本次实测环境及 Watch 启动策略"])
+        ["保存本次实测环境及 Watch 启动策略", "开启 Watch 保镖与时区守护，保存重启后的自动恢复设置"]
             + (plan.confirmation_lines ?? [])
             + plan.actions.map { $0.title + "：" + ($0.detail ?? $0.scope) }
     }

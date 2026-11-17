@@ -22,6 +22,7 @@ struct FirstRunView: View {
     @AppStorage("darkAppearance") private var dark = false
     @State private var showingApproval: InitializationApproval?
     @State private var showingReport = false
+    @State private var showingPolicyDetails = false
     @State private var lastPresentedApproval: String?
     private let clock = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
 
@@ -45,26 +46,39 @@ struct FirstRunView: View {
                     }
                     if let policy = switcher.currentPolicyEvaluation {
                         Surface(p) {
-                            VStack(alignment: .leading, spacing: 12) {
-                                Text("最近一次环境检测的必检项目").font(WatchTypography.section)
-                                Text("以下保留该次采样结果，不代表设置变更后的状态。保护后台的当前结果见下方核对；能否进入仍以第 8 项联合复核为准。")
-                                    .font(WatchTypography.caption).foregroundStyle(p.secondary)
-                                ForEach(policy.rows.filter(\.required)) { row in
-                                    HStack(alignment: .top, spacing: 12) {
-                                        Image(systemName: row.state == "ok" ? "checkmark.circle.fill"
-                                                : row.state == "fail" ? "xmark.octagon.fill" : "exclamationmark.circle")
-                                            .foregroundStyle(row.state == "ok" ? p.mint
-                                                    : row.state == "fail" ? p.red : p.amber)
-                                        VStack(alignment: .leading, spacing: 4) {
-                                            Text(row.id == "guard" ? row.name + "（该次采样）" : row.name).font(WatchTypography.bodyStrong)
-                                            Text(row.id == "guard" ? "采样时：" + row.detail : row.detail).font(WatchTypography.caption).foregroundStyle(p.secondary)
-                                                .fixedSize(horizontal: false, vertical: true).textSelection(.enabled)
-                                        }
-                                        Spacer(minLength: 8)
-                                        Text(row.statusLabel).font(WatchTypography.caption)
-                                            .foregroundStyle(row.state == "ok" ? p.mint
-                                                    : row.state == "fail" ? p.red : p.amber)
-                                    }.accessibilityElement(children: .combine)
+                            DisclosureGroup(isExpanded: $showingPolicyDetails) {
+                                VStack(alignment: .leading, spacing: 12) {
+                                    Text("以下保留该次采样结果，不代表设置变更后的状态。保护后台的当前结果见下方核对；能否进入仍以第 8 项联合复核为准。")
+                                        .font(WatchTypography.caption).foregroundStyle(p.secondary)
+                                        .padding(.top, 4)
+                                    ForEach(policy.rows.filter(\.required)) { row in
+                                        HStack(alignment: .top, spacing: 12) {
+                                            Image(systemName: row.state == "ok" ? "checkmark.circle.fill"
+                                                    : row.state == "fail" ? "xmark.octagon.fill" : "exclamationmark.circle")
+                                                .foregroundStyle(row.state == "ok" ? p.mint
+                                                        : row.state == "fail" ? p.red : p.amber)
+                                            VStack(alignment: .leading, spacing: 4) {
+                                                Text(row.id == "guard" ? row.name + "（该次采样）" : row.name).font(WatchTypography.bodyStrong)
+                                                Text(row.id == "guard" ? "采样时：" + row.detail : row.detail).font(WatchTypography.caption).foregroundStyle(p.secondary)
+                                                    .fixedSize(horizontal: false, vertical: true).textSelection(.enabled)
+                                            }
+                                            Spacer(minLength: 8)
+                                            Text(row.statusLabel).font(WatchTypography.caption)
+                                                .foregroundStyle(row.state == "ok" ? p.mint
+                                                        : row.state == "fail" ? p.red : p.amber)
+                                        }.accessibilityElement(children: .combine)
+                                    }
+                                }
+                            } label: {
+                                HStack(spacing: 8) {
+                                    Image(systemName: "checklist.checked")
+                                        .foregroundStyle(p.mint)
+                                    Text("最近一次环境检测的必检项目")
+                                        .font(WatchTypography.section)
+                                    Spacer()
+                                    Text(showingPolicyDetails ? "收起明细" : "展开查看 9 项明细")
+                                        .font(WatchTypography.caption)
+                                        .foregroundStyle(p.secondary)
                                 }
                             }
                         }
