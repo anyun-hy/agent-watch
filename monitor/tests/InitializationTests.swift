@@ -121,8 +121,8 @@ struct InitializationTests {
         let coordinator = FirstRunInitialization(checks: fake, completed: false, saveCompletion: { writes += 1 })
         expect(!coordinator.entered && !coordinator.canEnter(at: Date().timeIntervalSince1970), "fresh install has no route into the main view")
         await coordinator.start()
-        expect(fake.calls == [.components, .connection, .environment] && fake.begins == 1, "sequential checks stop before the first required authorization")
-        expect(coordinator.approval == approval && writes == 0 && coordinator.passedCount == 2, "waiting for approval cannot create green state or completion")
+        expect(fake.calls == [.components, .accessibility, .connection, .environment] && fake.begins == 1, "sequential checks stop before the first required authorization")
+        expect(coordinator.approval == approval && writes == 0 && coordinator.passedCount == 3, "waiting for approval cannot create green state or completion")
         await coordinator.enter()
         expect(!coordinator.entered && writes == 0, "enter action itself cannot bypass a pending check")
         let staleApproval = InitializationApproval(id: "old-plan", action: .environment, title: "old", detail: "", changes: [])
@@ -131,14 +131,14 @@ struct InitializationTests {
         fake.approvalResult = .failed(code: "authorization_denied", detail: "denied")
         await coordinator.authorize(approval)
         expect(!coordinator.allPassed && !coordinator.entered && writes == 0 && coordinator.approval == nil, "denied authorization leaves the gate closed")
-        let failedDetail = coordinator.rows[2].detail
+        let failedDetail = coordinator.rows[3].detail
         fake.previousProgress?(.requestAdministrator)
-        expect(coordinator.rows[2].status == .failed && coordinator.rows[2].detail == failedDetail,
+        expect(coordinator.rows[3].status == .failed && coordinator.rows[3].detail == failedDetail,
                "late progress cannot overwrite a completed failure or reopen the gate")
         fake.overrides = [:]
         await coordinator.retry()
         expect(coordinator.allPassed && !coordinator.entered && writes == 0, "all required checks must finish before entry becomes available")
-        expect(fake.calls.suffix(7) == [.components, .environment, .accessibility, .dns, .webrtc, .protection, .verification],
+        expect(fake.calls.suffix(6) == [.components, .environment, .dns, .webrtc, .protection, .verification],
                "retry rechecks components and resumes at the failed step instead of re-collecting current evidence")
         expect(coordinator.canEnter(at: Date().timeIntervalSince1970), "all current checks enable the entry control")
         fake.validation = .failed(code: "context_changed", detail: "actual network changed")
@@ -516,12 +516,13 @@ struct InitializationTests {
         let fullLeaks = LeakCheckStore(isFixture: true)
         fullLeaks.fixtureDelayNanoseconds = 1_000_000
         let fullStore = MonitorStore(leakChecks: fullLeaks, aiChecks: AIProbeStore(isFixture: true), switcher: fullSwitcher)
-        var fullNode = "A"
-        fullStore.acceptSnapshot(snapshot(node: "A", at: Date().timeIntervalSince1970), receivedAt: Date())
+        final class NodeBox: @unchecked Sendable { var value = "A" }
+        let fullNode = NodeBox()
+        fullStore.acceptSnapshot(snapshot(node: fullNode.value, at: Date().timeIntervalSince1970), receivedAt: Date())
         let fullChecks = FirstRunChecks(store: fullStore, componentCheck: {}, accessibilityTrusted: { true },
             requestAccessibility: {}, waitForConnectionPoll: {
                 try? await Task.sleep(nanoseconds: 5_000_000)
-                fullStore.acceptSnapshot(snapshot(node: fullNode, at: Date().timeIntervalSince1970), receivedAt: Date())
+                fullStore.acceptSnapshot(snapshot(node: fullNode.value, at: Date().timeIntervalSince1970), receivedAt: Date())
             }, startSnapshotPolling: false)
         var fullWrites = 0
         let full = FirstRunInitialization(checks: fullChecks, completed: false, saveCompletion: { fullWrites += 1 })
@@ -531,23 +532,13 @@ struct InitializationTests {
             while !Task.isCancelled {
                 do { try await Task.sleep(nanoseconds: 500_000_000) } catch { return }
                 let at = Date()
-                fullStore.acceptSnapshot(snapshot(node: fullNode, at: at.timeIntervalSince1970), receivedAt: at)
+                fullStore.acceptSnapshot(snapshot(node: fullNode.value, at: at.timeIntervalSince1970), receivedAt: at)
             }
         }
         defer { fullProducer.cancel() }
         await full.start()
         expect(full.approval?.action == .environment && full.passedCount == 3,
                "full flow stops at the real environment confirmation before any DNS or guard changes")
-        // Supply the continuing background snapshots the production wizard
-        // receives while waiting for receipts and user confirmation.
-        let fullProducer = Task { @MainActor in
-            while !Task.isCancelled {
-                do { try await Task.sleep(nanoseconds: 500_000_000) } catch { return }
-                let at = Date()
-                fullStore.acceptSnapshot(snapshot(node: fullNode, at: at.timeIntervalSince1970), receivedAt: at)
-            }
-        }
-        defer { fullProducer.cancel() }
         if let request = full.approval { await full.authorize(request) }
         expect(fullSwitcher.candidate == nil &&
                fullSwitcher.setupPlan?.candidate_id.hasPrefix("confirmed-protection:") == true,
@@ -606,8 +597,8 @@ struct InitializationTests {
         if full.approval?.action == .environment, let request = full.approval { await full.authorize(request) }
         expect(full.approval?.action == .protection, "retry obtains a new persisted receipt after the backend readback changes")
         let oldGuardApproval = full.approval!
-        fullNode = "B"
-        fullStore.acceptSnapshot(snapshot(node: fullNode, at: Date().timeIntervalSince1970), receivedAt: Date())
+        fullNode.value = "B"
+        fullStore.acceptSnapshot(snapshot(node: fullNode.value, at: Date().timeIntervalSince1970), receivedAt: Date())
         full.refreshReadiness()
         expect(full.approval == nil && full.rows[2].status == .failed && full.rows[4].status == .failed &&
                full.rows[5].status == .failed && full.rows[6].status == .pending,
@@ -700,7 +691,7 @@ struct InitializationTests {
             logPath: "/fixture/log", backendVersion: "fixture", monitoredApps: ["claude"])
         fullStore.acceptSnapshot(gap, receivedAt: Date())
         full.refreshReadiness()
-        let gapRevokedExpectedRows = full.rows[1].code == "context_unavailable" && full.rows[2].status == .pending && !full.allPassed
+        let gapRevokedExpectedRows = full.rows[2].code == "context_unavailable" && full.rows[3].status == .pending && !full.allPassed
         if !gapRevokedExpectedRows {
             let diagnosticNow = Date().timeIntervalSince1970
             let states = full.rows.map { "\($0.step.rawValue):\($0.status.rawValue):\($0.code)" }
@@ -713,9 +704,14 @@ struct InitializationTests {
         }
         expect(gapRevokedExpectedRows,
                "a temporary proxy sampling gap revokes dependent green states")
-        fullStore.acceptSnapshot(snapshot(node: fullNode, at: Date().timeIntervalSince1970), receivedAt: Date())
+        fullStore.acceptSnapshot(snapshot(node: fullNode.value, at: Date().timeIntervalSince1970), receivedAt: Date())
         full.refreshReadiness(at: Date().addingTimeInterval(31))
         for _ in 0..<300 where full.running { try await Task.sleep(nanoseconds: 10_000_000) }
+        if !(full.allPassed && full.canEnter(at: Date().timeIntervalSince1970)) {
+            let states = full.rows.map { "\($0.step.rawValue):\($0.status.rawValue):\($0.code)" }
+            print("Failed recovered context rows: \(states)")
+            print("Failed recovered context: running=\(full.running), allPassed=\(full.allPassed), canEnter=\(full.canEnter(at: Date().timeIntervalSince1970))")
+        }
         expect(full.allPassed && full.canEnter(at: Date().timeIntervalSince1970),
                "the same recovered context automatically rechecks both receipts and environment")
         await full.enter()

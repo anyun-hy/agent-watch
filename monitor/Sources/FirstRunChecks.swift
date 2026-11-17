@@ -90,6 +90,7 @@ final class FirstRunChecks: InitializationChecking {
                 traceConnection(event: "poll_begin", phase: phase, code: "reading_backend", deadline: deadline,
                                 candidate: candidate, sampled: candidateSample)
                 await store.switcher.refreshBackground(maximumAge: 5)
+                store.refresh(full: true)
                 let now = connectionNow()
                 let failure = connectionEvidenceFailure(at: now)
                 let observedCode: String

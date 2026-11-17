@@ -81,7 +81,7 @@ struct InitializationStabilityTests {
         changed.refreshReadiness()
         changedChecks.failures = [:]
         changed.refreshReadiness(at: Date().addingTimeInterval(120))
-        expect(!changed.running && changed.rows[1].code == "context_changed" && !changed.allPassed,
+        expect(!changed.running && changed.rows[2].code == "context_changed" && !changed.allPassed,
                "a confirmed proxy change cannot automatically reuse the earlier environment approval")
         print("Initialization stability: scheduler and freshness contracts passed; fixture only")
     }

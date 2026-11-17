@@ -374,11 +374,15 @@ final class FirstRunInitialization: ObservableObject {
         }
     }
     private var canRetryAutomaticRefresh: Bool {
-        guard rows[0].status == .passed, rows[3].status == .passed else { return false }
-        let connection = rows[1]
+        guard let compIdx = rows.firstIndex(where: { $0.step == .components }),
+              let accIdx = rows.firstIndex(where: { $0.step == .accessibility }),
+              let connIdx = rows.firstIndex(where: { $0.step == .connection }),
+              let envIdx = rows.firstIndex(where: { $0.step == .environment }) else { return false }
+        guard rows[compIdx].status == .passed, rows[accIdx].status == .passed else { return false }
+        let connection = rows[connIdx]
         let connectionReady = connection.status == .passed ||
             (connection.status == .failed && ["context_unavailable", "snapshot_unavailable"].contains(connection.code))
-        let environment = rows[2]
+        let environment = rows[envIdx]
         let environmentReady = environment.status == .passed ||
             (environment.status == .pending && environment.code == "dependency_invalidated")
         return connectionReady && environmentReady
