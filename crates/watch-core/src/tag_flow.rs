@@ -83,12 +83,23 @@ pub fn is_tag_process(record: &Value, uid: u32) -> bool {
     let Some(executable) = record.get("executable").and_then(Value::as_str) else {
         return false;
     };
-    let matched_name = TAG_BINARY_DIRS.iter().find_map(|dir| executable.strip_prefix(dir));
-    let Some(name) = matched_name else {
-        return false;
+    let matched_by_dir = TAG_BINARY_DIRS.iter().any(|dir| {
+        executable.strip_prefix(dir).is_some_and(|name| name.starts_with("mihomo") && !name.contains('/'))
+    });
+    let is_proxy = if matched_by_dir {
+        true
+    } else {
+        let path = std::path::Path::new(executable);
+        let Some(filename) = path.file_name().and_then(|f| f.to_str()) else {
+            return false;
+        };
+        let known_binary = filename.starts_with("mihomo")
+            || filename.starts_with("clash")
+            || filename.starts_with("sing-box");
+        let safe_location = !executable.starts_with("/tmp/") && !executable.starts_with("/var/tmp/");
+        known_binary && safe_location
     };
-    name.starts_with("mihomo")
-        && !name.contains('/')
+    is_proxy
         && record["uid"]
             .as_u64()
             .is_some_and(|v| v == 0 || v == u64::from(uid))
@@ -150,12 +161,35 @@ fn kernel_listener_owners_at(kernel: &CommandEvidence, port: u16, address: Optio
     }
     (owners, incomplete)
 }
+pub fn detect_kernel_listener_port(kernel: &CommandEvidence) -> Option<u16> {
+    let mut candidates = Vec::new();
+    for line in kernel.stdout.lines() {
+        let fields: Vec<_> = line.split_whitespace().collect();
+        if fields.len() >= 6
+            && ["tcp4", "tcp6", "tcp46"].contains(&fields[0])
+            && fields[5] == "LISTEN"
+        {
+            if let Some((host, raw_port)) = fields[3].rsplit_once('.') {
+                if let Ok(port) = raw_port.parse::<u16>() {
+                    let is_loopback = ["127.0.0.1", "*", "0.0.0.0", "::", "::1"].contains(&host);
+                    if is_loopback && port > 1024 {
+                        if port == 7897 || port == 7890 {
+                            return Some(port);
+                        }
+                        candidates.push(port);
+                    }
+                }
+            }
+        }
+    }
+    candidates.into_iter().next()
+}
 pub fn listener_fallback(
     lsof: CommandEvidence,
     kernel: Option<&CommandEvidence>,
 ) -> CommandEvidence {
-    if kernel.as_ref().is_some_and(|k| k.stdout.contains(".7897 ") || k.stdout.contains(":7897 ")) {
-        listener_fallback_for_port(lsof, kernel, 7897)
+    if let Some(port) = kernel.and_then(detect_kernel_listener_port) {
+        listener_fallback_for_port(lsof, kernel, port)
     } else {
         listener_fallback_for_port(lsof, kernel, 7890)
     }
@@ -246,13 +280,19 @@ pub fn inspect_entry(
             pid = raw.parse::<u32>().ok();
         } else if let Some(endpoint) = line.strip_prefix('n') {
             if let Some(pid) = pid {
-                let is_7890 = ["127.0.0.1:7890", "*:7890", "0.0.0.0:7890", "[::]:7890"].contains(&endpoint);
-                let is_7897 = ["127.0.0.1:7897", "*:7897", "0.0.0.0:7897", "[::]:7897"].contains(&endpoint);
-                if is_7890 || is_7897 {
-                    pids.insert(pid);
-                    public |= !["127.0.0.1:7890", "127.0.0.1:7897"].contains(&endpoint);
-                    if detected_port == 0 {
-                        detected_port = if is_7897 { 7897 } else { 7890 };
+                if let Some((host, port_str)) = endpoint.rsplit_once(':') {
+                    if let Ok(parsed_port) = port_str.parse::<u16>() {
+                        if parsed_port > 0 {
+                            let is_loopback = ["127.0.0.1", "[::1]", "localhost"].contains(&host);
+                            let is_wildcard = ["*", "0.0.0.0", "[::]"].contains(&host);
+                            if is_loopback || is_wildcard {
+                                pids.insert(pid);
+                                public |= is_wildcard;
+                                if detected_port == 0 {
+                                    detected_port = parsed_port;
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -508,14 +548,20 @@ pub fn correlate(input: CorrelationInput<'_>) -> Value {
     result["association"] = json!("unconfirmed");
     result["policy"] = json!("unconfirmed");
     result["chains"] = json!([]);
-    let via_proxy = flow.peer.0 == "127.0.0.1" && (flow.peer.1 == 7890 || flow.peer.1 == 7897) && flow.protocol == "tcp";
+    let is_active_proxy_port = flow.peer.1 == 7890
+        || flow.peer.1 == 7897
+        || api.get("active_ports").and_then(Value::as_array).is_some_and(|ports| {
+            ports.iter().any(|p| p.as_u64() == Some(u64::from(flow.peer.1)))
+        });
+    let via_proxy = flow.peer.0 == "127.0.0.1" && is_active_proxy_port && flow.protocol == "tcp";
     if flow.peer.0.parse::<IpAddr>().is_ok_and(|v| v.is_loopback()) && !via_proxy {
         result["association"] = json!("local_service");
         result["policy"] = json!("not_applicable");
         result["reason"] = json!("其他本机服务连接，不视为代理绕过");
         return result;
     }
-    if via_proxy && (api["state"] != "available" || !(truthy(&api["covers_7890"]) || truthy(&api["covers_7897"]))) {
+    let covers_proxy = truthy(&api["covers_proxy"]) || truthy(&api["covers_7890"]) || truthy(&api["covers_7897"]);
+    if via_proxy && (api["state"] != "available" || !covers_proxy) {
         result["reason"] =
             json!(format!("控制接口不可用或属于另一内核，不能把 {} 连接与外层 TUN 链强行对应", flow.peer.1));
         return result;

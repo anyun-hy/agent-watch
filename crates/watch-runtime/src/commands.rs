@@ -198,7 +198,7 @@ impl ReadCommand {
                 vec![
                     "-nP".into(),
                     "-a".into(),
-                    "-iTCP:7897".into(),
+                    "-iTCP:7897,7890".into(),
                     "-sTCP:LISTEN".into(),
                     "-Fpn".into(),
                 ],

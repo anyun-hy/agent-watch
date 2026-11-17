@@ -556,8 +556,11 @@ impl<R: ReadRunner> Sampler<R> {
         let listener = listener.map(|v| tag_flow::listener_fallback(v, kernel.as_ref().ok()));
         report["listener_observed_at"] = listener.as_ref().ok().and_then(|listener|
             if listener.source == "netstat" { kernel_at } else { Some(listener_at) }).map_or(Value::Null, |at| json!(at));
-        let reachable = self.runner.loopback_tcp_reachable(7897, Duration::from_millis(500))
-            || self.runner.loopback_tcp_reachable(7890, Duration::from_millis(500));
+        let detected_port = kernel.as_ref().ok().and_then(tag_flow::detect_kernel_listener_port);
+        let test_port = detected_port.unwrap_or(7897);
+        let reachable = self.runner.loopback_tcp_reachable(test_port, Duration::from_millis(500))
+            || (test_port != 7897 && self.runner.loopback_tcp_reachable(7897, Duration::from_millis(500)))
+            || (test_port != 7890 && self.runner.loopback_tcp_reachable(7890, Duration::from_millis(500)));
         let after = before.as_ref().map_err(Clone::clone).and_then(|table| {
             let pids = table.iter().filter_map(|(pid, row)|
                 (tag_flow::is_tag_process(row, processes.uid) || processes.targets.iter().any(|p| p.identity.pid == *pid))
@@ -591,6 +594,11 @@ impl<R: ReadRunner> Sampler<R> {
             self.paths.home.join("Library/Application Support/com.tag.lab.v2/config.yaml"),
             self.paths.home.join("Library/Application Support/com.tag.lab.v2/verge.yaml"),
             self.paths.home.join("Library/Application Support/com.tag.lab/mihomo/runtime.yaml"),
+            self.paths.home.join("Library/Application Support/io.github.clash-verge-rev.clash-verge-rev/clash-verge.yaml"),
+            self.paths.home.join("Library/Application Support/io.github.clash-verge-rev.clash-verge-rev/config.yaml"),
+            self.paths.home.join(".config/clash-verge/clash-verge.yaml"),
+            self.paths.home.join(".config/clash/config.yaml"),
+            self.paths.home.join(".config/mihomo/config.yaml"),
         ];
         let mut config = None;
         let mut config_path = candidate_paths[0].clone();
@@ -606,21 +614,39 @@ impl<R: ReadRunner> Sampler<R> {
                 }
             }
         }
+        let uid = claude_watch_system::effective_uid();
+        let socket_candidates = [
+            std::path::PathBuf::from(format!("/var/run/tag-service/users/{uid}/tag-mihomo.sock")),
+            self.paths.home.join("Library/Application Support/com.tag.lab.v2/clash.sock"),
+            self.paths.home.join("Library/Application Support/io.github.clash-verge-rev.clash-verge-rev/clash.sock"),
+            std::path::PathBuf::from("/var/run/clash.sock"),
+            std::path::PathBuf::from("/var/run/mihomo.sock"),
+        ];
+        let live_socket = socket_candidates
+            .into_iter()
+            .find(|p| p.exists() && std::os::unix::net::UnixStream::connect(p).is_ok());
+
         let client = config
             .as_deref()
             .and_then(|s| tag_config::controller_credentials(s).ok())
             .map(|mut creds| {
-                let uid = claude_watch_system::effective_uid();
-                let default_sock = std::path::PathBuf::from(format!("/var/run/tag-service/users/{uid}/tag-mihomo.sock"));
-                if default_sock.exists() {
+                if let Some(sock) = &live_socket {
                     let configured_dead = creds.unix_socket().map_or(true, |p| {
                         !p.exists() || std::os::unix::net::UnixStream::connect(p).is_err()
                     });
-                    if configured_dead && std::os::unix::net::UnixStream::connect(&default_sock).is_ok() {
-                        creds = creds.with_unix_socket(default_sock);
+                    if configured_dead {
+                        creds = creds.with_unix_socket(sock.clone());
                     }
                 }
                 Client::new(creds)
+            })
+            .or_else(|| {
+                if let Some(sock) = live_socket {
+                    if let Ok(creds) = tag_config::Credentials::from_parts("127.0.0.1:9097", String::new()) {
+                        return Some(Client::new(creds.with_unix_socket(sock)));
+                    }
+                }
+                None
             });
         // /configs does not expose every DNS/profile setting. Bind the existing
         // runtime configuration too, without publishing its credential-bearing text.

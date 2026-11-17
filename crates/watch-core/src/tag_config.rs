@@ -514,7 +514,7 @@ pub fn api_snapshot(
     direct_groups.sort();
     let covers = ["port", "mixed-port", "socks-port"]
         .iter()
-        .any(|key| configs[*key] == 7890 || configs[*key] == 7897);
+        .any(|key| configs.get(*key).and_then(Value::as_u64).is_some_and(|p| p > 0));
     Ok((
         json!({"state":"available","controller":base,"mode":mode,"covers_7890":covers,
         "selected_node":selected,"route_chains":routes,"global_node":global,"direct_groups":direct_groups,"reason":"","rules":rules}),
