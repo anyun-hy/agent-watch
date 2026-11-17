@@ -420,8 +420,8 @@ final class FirstRunChecks: InitializationChecking {
         var failures: [InitializationStep: InitializationResult] = [:]
         if boundContext != nil && !contextMatches {
             failures[.connection] = Self.networkContextFailure(bound: boundContext, current: store.initializationContext, timeoutStage: nil)
-        } else if boundContext != nil && !snapshotIsCurrent {
-            failures[.connection] = .failed(code: "snapshot_unavailable", detail: "后台或代理采样状态暂不可确认，请重新检查。")
+        } else if boundContext != nil && store.error != nil {
+            failures[.connection] = .failed(code: "backend_error", detail: store.error?.localizedDescription ?? "后台连接发生错误，请重新检查。")
         }
         if let acceptedSettings, acceptedSettings != settingsData {
             failures[.environment] = .failed(code: "settings_changed", detail: "已确认的 Watch 设置发生变化，请重新检查。")
@@ -559,7 +559,7 @@ final class FirstRunChecks: InitializationChecking {
     private func snapshotIsCurrent(at now: Double) -> Bool {
         guard store.error == nil, let snapshot = store.snapshot, snapshot.installed,
               snapshot.autoStart, snapshot.keepAlive, store.initializationContext != nil else { return false }
-        return MonitorSnapshotTiming.isCurrent(capturedAt: snapshot.capturedAt, now: now)
+        return MonitorSnapshotTiming.isCurrent(capturedAt: snapshot.capturedAt, now: now, maximumAge: 60)
     }
     private var backgroundIsCurrent: Bool {
         guard let value = store.switcher.background,
