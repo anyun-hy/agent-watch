@@ -1764,7 +1764,7 @@ final class SwitcherStore: ObservableObject {
     }
     static func fixtureAudit() -> EnvironmentAuditReceipt {
         let names = ["代理内核", "TUN 网卡", "出口国家", "IP 一致性", "时区", "地区与日期格式", "IPv6 策略",
-                     "DNS", "UDP/STUN 出口", "保护后台", "代理规则覆盖", "Claude 语言", "ASN 属性", "Claude 服务",
+                     "DNS", "UDP/STUN 出口", "保护后台", "代理规则覆盖", "系统语言", "ASN 属性", "Claude 服务",
                      "ChatGPT 服务"]
         let ids = ["proxy", "tun", "egress", "ip_history", "timezone", "locale", "ipv6", "dns", "stun", "guard", "routing", "language", "asn", "reachability", "chatgpt_reachability"]
         return .init(observed_at: Date().timeIntervalSince1970, expires_at: Date().timeIntervalSince1970 + 30,
@@ -1838,7 +1838,7 @@ final class SwitcherStore: ObservableObject {
          ("ip", "出口 IP", proposed ? "8.8.8.8" : "未知", proposed ? "Cloudflare + IPinfo" : "未联网检测"),
          ("timezone", "系统时区", "Asia/Tokyo", "/etc/localtime"),
          ("locale", "地区与日期格式", "ja_JP", "Foundation / AppleLocale"),
-         ("language", "Claude 语言", "en-JP", "系统 AppleLanguages（Claude 未单独设置）")].map { key, title, current, source in
+         ("language", "系统语言", "en-JP", "系统 AppleLanguages")].map { key, title, current, source in
             ["id": key, "title": title, "current": current, "target": (settings[key] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? "未配置",
              "proposed": proposed ? current : "", "source": source, "target_source": "尚未确认",
              "proposed_source": proposed ? source : ""]

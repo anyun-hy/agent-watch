@@ -24,7 +24,7 @@ pub const CHECKS: [(&str, &str); 15] = [
     ("stun", "UDP/STUN 出口"),
     ("guard", "保护后台"),
     ("routing", "代理规则覆盖"),
-    ("language", "Claude 语言"),
+    ("language", "系统语言"),
     ("asn", "ASN 属性"),
     ("reachability", "Claude 服务"),
     ("chatgpt_reachability", "ChatGPT 服务"),
@@ -527,7 +527,7 @@ pub fn evaluate_target(
             } else {
                 "fail"
             },
-            "Claude 应用语言或系统首选语言",
+            "系统首选语言（AppleLanguages）",
             config.require_english,
             "本机环境",
         ));

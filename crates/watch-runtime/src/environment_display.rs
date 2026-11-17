@@ -292,7 +292,7 @@ fn present_rows(audit: &Value) -> Vec<Value> {
                 claude_watch_core::audit::preferred_language(&local["language"])
                     .unwrap_or_else(|| "未取得".into()),
                 "英文偏好；与国家分开判断".into(),
-                "Claude AppleLanguages / 系统 AppleLanguages".into(),
+                "系统 AppleLanguages / 应用语言设置".into(),
             ),
             "asn" => (
                 if let Some(number) = asn["number"].as_i64().filter(|value| *value > 0) {

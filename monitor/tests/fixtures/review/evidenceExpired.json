@@ -152,7 +152,7 @@
       },
       {
         "id": "language",
-        "name": "Claude 语言",
+        "name": "系统语言",
         "state": "ok",
         "detail": "Claude 应用语言或系统首选语言",
         "required": false,
@@ -429,7 +429,7 @@
         },
         {
           "id": "language",
-          "name": "Claude 语言",
+          "name": "系统语言",
           "state": "ok",
           "detail": "Claude 应用语言或系统首选语言",
           "required": true,

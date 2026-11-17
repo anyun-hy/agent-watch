@@ -30,7 +30,7 @@ const VALUE_IDS: [(&str, &str); 11] = [
     ("ip", "出口 IP"),
     ("timezone", "系统时区"),
     ("locale", "地区格式"),
-    ("language", "Claude 语言"),
+    ("language", "系统语言"),
 ];
 
 fn missing<'a>(
@@ -76,8 +76,8 @@ fn source(id: &str, local: &Value, network: &Value, candidate: bool) -> String {
         "country" | "ip" => "未联网检测".into(),
         "timezone" => "/etc/localtime".into(),
         "locale" => "defaults AppleLocale / Foundation 日期模板".into(),
-        "language" if !text(local, "app_language").is_empty() => "Claude AppleLanguages".into(),
-        "language" => "系统 AppleLanguages（Claude 未单独设置）".into(),
+        "language" if !text(local, "app_language").is_empty() => "应用专属 AppleLanguages".into(),
+        "language" => "系统 AppleLanguages".into(),
         _ => String::new(),
     }
 }
