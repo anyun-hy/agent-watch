@@ -25,12 +25,18 @@ final class FirstRunChecks: InitializationChecking {
          accessibilityTrusted: (() -> Bool)? = nil,
          requestAccessibility: (() -> Void)? = nil,
          connectionNow: @escaping () -> Double = { Date().timeIntervalSince1970 },
-         waitForConnectionPoll: @escaping () async -> Void = { try? await Task.sleep(nanoseconds: 1_000_000_000) },
+         waitForConnectionPoll: (() async -> Void)? = nil,
          startSnapshotPolling: Bool = true,
          connectionLog: InitializationConnectionLog? = nil) {
         self.store = store
         self.connectionNow = connectionNow
-        self.waitForConnectionPoll = waitForConnectionPoll
+        self.waitForConnectionPoll = waitForConnectionPoll ?? { [weak store] in
+            if let store {
+                await store.waitForNextSnapshot()
+            } else {
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+            }
+        }
         self.startSnapshotPolling = startSnapshotPolling
         self.connectionLog = connectionLog ?? (store.switcher.isFixture
             ? InitializationConnectionLog(directory: nil) : InitializationConnectionLog())
@@ -100,7 +106,15 @@ final class FirstRunChecks: InitializationChecking {
                 guard now < deadline else { return finish(failure ?? lastFailure) }
                 if let failure {
                     lastFailure = failure
-                    candidate = nil; candidateSample = nil
+                    let code: String
+                    if case .failed(let c, _) = failure { code = c } else { code = "" }
+                    let candidateExpired = candidateSample.map { now - $0 >= MonitorSnapshotTiming.proxyMaximumAge } ?? false
+                    let contextChanged = candidate != nil && store.initializationContext != nil && store.initializationContext != candidate
+                    let fatal = ["backend_unverified", "collector_registration_unverified", "proxy_entry_unverified", "proxy_api_unverified"].contains(code)
+                    if candidateExpired || contextChanged || fatal {
+                        candidate = nil
+                        candidateSample = nil
+                    }
                 } else if let context = store.initializationContext, let sampled = store.snapshot?.proxy?.observedAt {
                     if candidate == context, let previous = candidateSample, sampled > previous {
                         boundContext = context

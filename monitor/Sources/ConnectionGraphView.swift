@@ -121,8 +121,6 @@ struct ConnectionGraphView: View {
                         launchProgressView
                     }
                     HStack(spacing: 8) {
-                        ControlledRestartButton(product: selectedProduct, monitor: store, switcher: store.switcher,
-                                                processControl: store.processControl, p: p)
                         GraphLaunchButton(product: selectedProduct, monitor: store, switcher: store.switcher,
                                           processControl: store.processControl, p: p)
                         AIProcessCloseButton(product: selectedProduct, store: store, control: store.processControl,
@@ -229,7 +227,7 @@ struct ConnectionGraphView: View {
                 ? "（\(channelState.processDispositionLabel(now: now))）" : ""
             let previous = channelState.previousProcessDispositionLabel(now: now).map { "\n\($0)" } ?? ""
             if channelState.managedMemberCount == 0 && !channelState.unmanagedPids.isEmpty {
-                text = "检测到外部运行实例（走系统代理隧道出海，未接入受控网关沙箱）\(disposition)\n受控网关活动连接 0（可通过‘以受控网关重启’接入断流保护）\(previous)"
+                text = "检测到外部运行实例（走系统代理隧道出海，未接入受控网关沙箱）\(disposition)\n受控网关活动连接 0\(previous)"
             } else {
                 text = "\(channelState.protectionScopeLabel)\(disposition) · \(channelState.scopeSummary)\n\(channelState.gatewayCountsLabel)\(previous)"
             }

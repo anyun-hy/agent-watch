@@ -47,13 +47,19 @@ bash monitor/package-dmg.sh
 
 打包完成会生成带 SHA-256 校验文件的 DMG；脚本拒绝覆盖同名安装包。**打包不会安装**；安装、删除数据或调整系统权限必须单独授权。
 
-统一自动测试入口（在已登录桌面的 macOS 终端执行，不加 `sudo`）：
+默认测试入口（Level 1，不要求图形桌面）：
 
 ```sh
 bash tools/test-all.sh
 ```
 
-覆盖 Rust 工作区、Python/JS 契约、全部独立 Swift 测试文件的显式配方，以及有专门准备的三个 ignored 用例。逐项日志、退出码与汇总保存在新的 `.agent/test-runs/` 目录；失败后继续独立项目，前置失败和排除项不计通过。会打开临时夹具窗口并清理自建进程，不启动真实 AI、不改 VPN、不安装服务。范围、前置依赖和排除项见 [统一测试说明](docs/TESTING.md)。
+默认只运行 `watch-core` 的纯 Rust 规则与契约测试，并保存本次运行报告；不代表整个 Rust 工作区、Python/JS 或 Swift 回归通过。
+
+- **Level 2**：`bash tools/test-all.sh --level 2` 单独运行原生网关与 Seatbelt 隔离测试，不安装服务。
+- **Level 3**：`bash tools/test-all.sh --level 3 --list` 只列出实机验收项目，不执行。安装版生命周期、真实账号和保护效果需要另行授权验证。
+- 如需查看跨语言混合夹具的范围，使用 `bash tools/test-all.sh --all-fixtures --list`。列清单不是运行测试；实际执行混合夹具会构建临时应用。
+
+各层的环境要求、覆盖范围与排除项见[分层测试说明](docs/TESTING.md)。
 
 只需运行原有选定回归时，仍可使用：
 

@@ -179,9 +179,9 @@
         "state": "ok"
       },
       {
-        "detail": "Claude 应用语言或系统首选语言",
+        "detail": "系统首选语言（AppleLanguages）",
         "id": "language",
-        "name": "Claude 语言",
+        "name": "系统语言",
         "required": true,
         "scope": "本机环境",
         "state": "ok"
@@ -411,9 +411,9 @@
         "state": "ok"
       },
       {
-        "detail": "Claude 应用语言或系统首选语言",
+        "detail": "系统首选语言（AppleLanguages）",
         "id": "language",
-        "name": "Claude 语言",
+        "name": "系统语言",
         "required": true,
         "scope": "本机环境",
         "state": "ok"
@@ -643,9 +643,9 @@
         "state": "ok"
       },
       {
-        "detail": "Claude 应用语言或系统首选语言",
+        "detail": "系统首选语言（AppleLanguages）",
         "id": "language",
-        "name": "Claude 语言",
+        "name": "系统语言",
         "required": true,
         "scope": "本机环境",
         "state": "ok"
@@ -875,9 +875,9 @@
         "state": "ok"
       },
       {
-        "detail": "Claude 应用语言或系统首选语言",
+        "detail": "系统首选语言（AppleLanguages）",
         "id": "language",
-        "name": "Claude 语言",
+        "name": "系统语言",
         "required": true,
         "scope": "本机环境",
         "state": "ok"
@@ -1107,9 +1107,9 @@
         "state": "ok"
       },
       {
-        "detail": "Claude 应用语言或系统首选语言",
+        "detail": "系统首选语言（AppleLanguages）",
         "id": "language",
-        "name": "Claude 语言",
+        "name": "系统语言",
         "required": true,
         "scope": "本机环境",
         "state": "ok"
@@ -1185,7 +1185,7 @@
       "risks": [],
       "state": "ok"
     },
-    "message": "启动预检未通过：Claude 语言：Claude 应用语言或系统首选语言",
+    "message": "启动预检未通过：系统语言：系统首选语言（AppleLanguages）",
     "netcoffee_lookup": null,
     "observed_at": 1700000000.0,
     "policy": "test-policy",
@@ -1339,9 +1339,9 @@
         "state": "ok"
       },
       {
-        "detail": "Claude 应用语言或系统首选语言",
+        "detail": "系统首选语言（AppleLanguages）",
         "id": "language",
-        "name": "Claude 语言",
+        "name": "系统语言",
         "required": true,
         "scope": "本机环境",
         "state": "fail"
@@ -1571,9 +1571,9 @@
         "state": "ok"
       },
       {
-        "detail": "Claude 应用语言或系统首选语言",
+        "detail": "系统首选语言（AppleLanguages）",
         "id": "language",
-        "name": "Claude 语言",
+        "name": "系统语言",
         "required": true,
         "scope": "本机环境",
         "state": "ok"
@@ -1801,9 +1801,9 @@
         "state": "ok"
       },
       {
-        "detail": "Claude 应用语言或系统首选语言",
+        "detail": "系统首选语言（AppleLanguages）",
         "id": "language",
-        "name": "Claude 语言",
+        "name": "系统语言",
         "required": true,
         "scope": "本机环境",
         "state": "ok"
@@ -2031,9 +2031,9 @@
         "state": "unknown"
       },
       {
-        "detail": "Claude 应用语言或系统首选语言",
+        "detail": "系统首选语言（AppleLanguages）",
         "id": "language",
-        "name": "Claude 语言",
+        "name": "系统语言",
         "required": true,
         "scope": "本机环境",
         "state": "ok"
@@ -2261,9 +2261,9 @@
         "state": "ok"
       },
       {
-        "detail": "Claude 应用语言或系统首选语言",
+        "detail": "系统首选语言（AppleLanguages）",
         "id": "language",
-        "name": "Claude 语言",
+        "name": "系统语言",
         "required": true,
         "scope": "本机环境",
         "state": "ok"
@@ -2491,9 +2491,9 @@
         "state": "ok"
       },
       {
-        "detail": "Claude 应用语言或系统首选语言",
+        "detail": "系统首选语言（AppleLanguages）",
         "id": "language",
-        "name": "Claude 语言",
+        "name": "系统语言",
         "required": true,
         "scope": "本机环境",
         "state": "ok"
@@ -2721,9 +2721,9 @@
         "state": "ok"
       },
       {
-        "detail": "Claude 应用语言或系统首选语言",
+        "detail": "系统首选语言（AppleLanguages）",
         "id": "language",
-        "name": "Claude 语言",
+        "name": "系统语言",
         "required": true,
         "scope": "本机环境",
         "state": "ok"
@@ -2901,9 +2901,9 @@
         "state": "ok"
       },
       {
-        "detail": "Claude 应用语言或系统首选语言",
+        "detail": "系统首选语言（AppleLanguages）",
         "id": "language",
-        "name": "Claude 语言",
+        "name": "系统语言",
         "required": true,
         "scope": "本机环境",
         "state": "ok"
@@ -3131,9 +3131,9 @@
         "state": "ok"
       },
       {
-        "detail": "Claude 应用语言或系统首选语言",
+        "detail": "系统首选语言（AppleLanguages）",
         "id": "language",
-        "name": "Claude 语言",
+        "name": "系统语言",
         "required": true,
         "scope": "本机环境",
         "state": "ok"
@@ -3361,9 +3361,9 @@
         "state": "ok"
       },
       {
-        "detail": "Claude 应用语言或系统首选语言",
+        "detail": "系统首选语言（AppleLanguages）",
         "id": "language",
-        "name": "Claude 语言",
+        "name": "系统语言",
         "required": true,
         "scope": "本机环境",
         "state": "ok"
@@ -3573,9 +3573,9 @@
         "state": "ok"
       },
       {
-        "detail": "Claude 应用语言或系统首选语言",
+        "detail": "系统首选语言（AppleLanguages）",
         "id": "language",
-        "name": "Claude 语言",
+        "name": "系统语言",
         "required": true,
         "scope": "本机环境",
         "state": "ok"
@@ -3815,9 +3815,9 @@
         "state": "ok"
       },
       {
-        "detail": "Claude 应用语言或系统首选语言",
+        "detail": "系统首选语言（AppleLanguages）",
         "id": "language",
-        "name": "Claude 语言",
+        "name": "系统语言",
         "required": true,
         "scope": "本机环境",
         "state": "ok"
@@ -4057,9 +4057,9 @@
         "state": "ok"
       },
       {
-        "detail": "Claude 应用语言或系统首选语言",
+        "detail": "系统首选语言（AppleLanguages）",
         "id": "language",
-        "name": "Claude 语言",
+        "name": "系统语言",
         "required": true,
         "scope": "本机环境",
         "state": "ok"
@@ -4292,9 +4292,9 @@
         "state": "ok"
       },
       {
-        "detail": "Claude 应用语言或系统首选语言",
+        "detail": "系统首选语言（AppleLanguages）",
         "id": "language",
-        "name": "Claude 语言",
+        "name": "系统语言",
         "required": true,
         "scope": "本机环境",
         "state": "ok"
@@ -4530,9 +4530,9 @@
         "state": "ok"
       },
       {
-        "detail": "Claude 应用语言或系统首选语言",
+        "detail": "系统首选语言（AppleLanguages）",
         "id": "language",
-        "name": "Claude 语言",
+        "name": "系统语言",
         "required": true,
         "scope": "本机环境",
         "state": "ok"
@@ -4770,9 +4770,9 @@
         "state": "ok"
       },
       {
-        "detail": "Claude 应用语言或系统首选语言",
+        "detail": "系统首选语言（AppleLanguages）",
         "id": "language",
-        "name": "Claude 语言",
+        "name": "系统语言",
         "required": true,
         "scope": "本机环境",
         "state": "ok"
@@ -5010,9 +5010,9 @@
         "state": "ok"
       },
       {
-        "detail": "Claude 应用语言或系统首选语言",
+        "detail": "系统首选语言（AppleLanguages）",
         "id": "language",
-        "name": "Claude 语言",
+        "name": "系统语言",
         "required": true,
         "scope": "本机环境",
         "state": "ok"
@@ -5244,9 +5244,9 @@
         "state": "unknown"
       },
       {
-        "detail": "Claude 应用语言或系统首选语言",
+        "detail": "系统首选语言（AppleLanguages）",
         "id": "language",
-        "name": "Claude 语言",
+        "name": "系统语言",
         "required": true,
         "scope": "本机环境",
         "state": "ok"
@@ -5474,9 +5474,9 @@
         "state": "ok"
       },
       {
-        "detail": "Claude 应用语言或系统首选语言",
+        "detail": "系统首选语言（AppleLanguages）",
         "id": "language",
-        "name": "Claude 语言",
+        "name": "系统语言",
         "required": true,
         "scope": "本机环境",
         "state": "ok"
@@ -5704,9 +5704,9 @@
         "state": "ok"
       },
       {
-        "detail": "Claude 应用语言或系统首选语言",
+        "detail": "系统首选语言（AppleLanguages）",
         "id": "language",
-        "name": "Claude 语言",
+        "name": "系统语言",
         "required": true,
         "scope": "本机环境",
         "state": "ok"
@@ -5934,9 +5934,9 @@
         "state": "ok"
       },
       {
-        "detail": "Claude 应用语言或系统首选语言",
+        "detail": "系统首选语言（AppleLanguages）",
         "id": "language",
-        "name": "Claude 语言",
+        "name": "系统语言",
         "required": true,
         "scope": "本机环境",
         "state": "ok"
@@ -6164,9 +6164,9 @@
         "state": "ok"
       },
       {
-        "detail": "Claude 应用语言或系统首选语言",
+        "detail": "系统首选语言（AppleLanguages）",
         "id": "language",
-        "name": "Claude 语言",
+        "name": "系统语言",
         "required": true,
         "scope": "本机环境",
         "state": "ok"
@@ -6394,9 +6394,9 @@
         "state": "ok"
       },
       {
-        "detail": "Claude 应用语言或系统首选语言",
+        "detail": "系统首选语言（AppleLanguages）",
         "id": "language",
-        "name": "Claude 语言",
+        "name": "系统语言",
         "required": true,
         "scope": "本机环境",
         "state": "ok"
@@ -6624,9 +6624,9 @@
         "state": "ok"
       },
       {
-        "detail": "Claude 应用语言或系统首选语言",
+        "detail": "系统首选语言（AppleLanguages）",
         "id": "language",
-        "name": "Claude 语言",
+        "name": "系统语言",
         "required": false,
         "scope": "本机环境",
         "state": "ok"
@@ -6710,7 +6710,7 @@
       "risks": [],
       "state": "ok"
     },
-    "message": "启动预检未通过：代理内核：检测期间网络上下文变化，请重新检测；TUN 网卡：检测期间网络上下文变化，请重新检测；出口国家：检测期间网络上下文变化，请重新检测；时区：检测期间网络上下文变化，请重新检测；地区与日期格式：检测期间网络上下文变化，请重新检测；IPv6 策略：检测期间网络上下文变化，请重新检测；保护后台：检测期间网络上下文变化，请重新检测；Claude 语言：检测期间网络上下文变化，请重新检测；Claude 服务：检测期间网络上下文变化，请重新检测",
+    "message": "启动预检未通过：代理内核：检测期间网络上下文变化，请重新检测；TUN 网卡：检测期间网络上下文变化，请重新检测；出口国家：检测期间网络上下文变化，请重新检测；时区：检测期间网络上下文变化，请重新检测；地区与日期格式：检测期间网络上下文变化，请重新检测；IPv6 策略：检测期间网络上下文变化，请重新检测；保护后台：检测期间网络上下文变化，请重新检测；系统语言：检测期间网络上下文变化，请重新检测；Claude 服务：检测期间网络上下文变化，请重新检测",
     "netcoffee_lookup": null,
     "observed_at": 1700000000.0,
     "policy": "test-policy",
@@ -6866,7 +6866,7 @@
       {
         "detail": "检测期间网络上下文变化，请重新检测",
         "id": "language",
-        "name": "Claude 语言",
+        "name": "系统语言",
         "required": true,
         "scope": "本机环境",
         "state": "unknown"
@@ -7108,9 +7108,9 @@
         "state": "ok"
       },
       {
-        "detail": "Claude 应用语言或系统首选语言",
+        "detail": "系统首选语言（AppleLanguages）",
         "id": "language",
-        "name": "Claude 语言",
+        "name": "系统语言",
         "required": true,
         "scope": "本机环境",
         "state": "ok"
@@ -7338,9 +7338,9 @@
         "state": "ok"
       },
       {
-        "detail": "Claude 应用语言或系统首选语言",
+        "detail": "系统首选语言（AppleLanguages）",
         "id": "language",
-        "name": "Claude 语言",
+        "name": "系统语言",
         "required": true,
         "scope": "本机环境",
         "state": "ok"

@@ -18,6 +18,14 @@ pub fn capabilities(gateway: SocketAddr, denied_ports: &[u16]) -> Result<Capabil
         .block_dns()
         .platform_rule("(allow default)")
         .map_err(|error| error.to_string())?;
+    // Chromium / Electron applications (e.g. ChatGPT / Codex / Claude) require
+    // AF_UNIX bind in system temp folders for ProcessSingleton locking.
+    caps.add_platform_rule("(allow system-socket (socket-domain AF_UNIX))")
+        .map_err(|error| error.to_string())?;
+    caps.add_platform_rule(
+        "(allow network-bind (subpath \"/var/folders\") (subpath \"/private/var/folders\") (subpath \"/tmp\") (subpath \"/private/tmp\"))",
+    )
+    .map_err(|error| error.to_string())?;
     // Seatbelt only accepts `localhost` or `*` here, not a literal IP. Its
     // localhost grant includes more than the configured 127.0.0.1 spelling.
     // Production therefore requires the system broker to reserve this port

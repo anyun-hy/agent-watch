@@ -5,6 +5,7 @@ import AppKit
 
 @MainActor
 final class MonitorStore: ObservableObject {
+    static let snapshotUpdateNotification = Notification.Name("io.local.watchpanel.snapshot_update")
     let leakChecks: LeakCheckStore
     let aiChecks: AIProbeStore
     let netCoffee = NetCoffeeStore()
@@ -246,6 +247,7 @@ final class MonitorStore: ObservableObject {
         error = nil
         let transition = observeDiagnosticContext(from: value, at: receivedAt)
         snapshot = value
+        NotificationCenter.default.post(name: Self.snapshotUpdateNotification, object: self, userInfo: ["snapshot": value])
         if let channel = value.channelSupervision { channelSubscription.applySnapshot(channel) }
         else { channelSubscription.markReconnected() }
         // The UI observes authoritative receipts; it never reissues permits.
@@ -256,6 +258,40 @@ final class MonitorStore: ObservableObject {
         if automatic && transition == .changed { switcher.invalidateCurrentEnvironmentRequest() }
         if automatic && !initializing {
             refreshEnvironmentIfNeeded()
+        }
+    }
+    /// Suspends until the next snapshot is accepted by this store, or until timeout.
+    func waitForNextSnapshot(timeout: TimeInterval = 1.0) async {
+        let center = NotificationCenter.default
+        let target = self
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            final class WaitState: @unchecked Sendable {
+                var observer: NSObjectProtocol?
+                var resumed = false
+                let lock = NSLock()
+            }
+            let state = WaitState()
+            func resumeOnce() {
+                state.lock.lock()
+                defer { state.lock.unlock() }
+                guard !state.resumed else { return }
+                state.resumed = true
+                if let obs = state.observer {
+                    center.removeObserver(obs)
+                    state.observer = nil
+                }
+                continuation.resume()
+            }
+            state.observer = center.addObserver(
+                forName: MonitorStore.snapshotUpdateNotification,
+                object: target,
+                queue: .main
+            ) { _ in
+                resumeOnce()
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + timeout) {
+                resumeOnce()
+            }
         }
     }
     func channelState(for product: MonitoredProduct) -> FamilyChannelMonitorState? {

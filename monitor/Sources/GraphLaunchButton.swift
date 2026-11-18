@@ -119,7 +119,7 @@ struct GraphLaunchButton: View {
         let unmanaged = isExternalRunningUnmanaged(product: product, monitor: monitor, switcher: switcher, at: now)
         if monitor.desktopRunning[product] == true {
             return unmanaged
-                ? "\(target.title) 已在运行（未受保护；可点击旁侧「以受控网关重启」接管）。"
+                ? "\(target.title) 已在运行（未接入受控网关沙箱）。"
                 : "\(target.title) 已在受控运行。"
         }
         let sampleTime = switcher.isFixture ? monitor.now.timeIntervalSince1970 : now.timeIntervalSince1970
@@ -128,7 +128,7 @@ struct GraphLaunchButton: View {
            MonitorSnapshotTiming.isCurrent(capturedAt: snapshot.capturedAt, now: sampleTime),
            target.hasRunningDesktop(in: snapshot.processes) {
             return unmanaged
-                ? "\(target.title) 已在运行（未受保护；可点击旁侧「以受控网关重启」接管）。"
+                ? "\(target.title) 已在运行（未接入受控网关沙箱）。"
                 : "\(target.title) 已在受控运行。"
         }
         return nil
@@ -160,88 +160,3 @@ struct GraphLaunchButton: View {
     }
 }
 
-/// Independent restart-and-takeover button when an external unmanaged instance is detected.
-struct ControlledRestartButton: View {
-    let product: MonitoredProduct
-    @ObservedObject var monitor: MonitorStore
-    @ObservedObject var switcher: SwitcherStore
-    @ObservedObject var processControl: AIProcessControl
-    let p: Palette
-    @State private var confirming = false
-    @State private var resultTitle = ""
-    @State private var resultMessage = ""
-    @State private var showingResult = false
-
-    var body: some View {
-        TimelineView(.periodic(from: .now, by: 1)) { context in
-            if isExternalRunningUnmanaged(product: product, monitor: monitor, switcher: switcher, at: context.date) {
-                let target = GraphLaunchTarget(product: product)
-                let isEnabled = !switcher.busy && !processControl.busy
-                Button {
-                    confirming = true
-                } label: {
-                    Label(switcher.busy ? "正在接管…" : "以受控网关重启", systemImage: "arrow.triangle.2.circlepath")
-                        .font(WatchTypography.caption.weight(.medium)).padding(.horizontal, 12).frame(height: 32)
-                        .foregroundStyle(isEnabled ? (p.dark ? Color.black : Color.white) : p.secondary)
-                        .background(isEnabled ? p.blue : p.elevated, in: RoundedRectangle(cornerRadius: 8))
-                }
-                .buttonStyle(.plain)
-                .disabled(!isEnabled)
-                .help("检测到外部运行实例；点击将平稳退出外部实例并以受控网关沙箱环境重启接管。")
-                .accessibilityLabel("以受控网关重启 \(target.title)")
-            }
-        }
-        .confirmationDialog(
-            "以受控网关重启 \(product.title)？",
-            isPresented: $confirming,
-            titleVisibility: .visible
-        ) {
-            Button("退出外部实例并受控启动") {
-                Task {
-                    let target = GraphLaunchTarget(product: product)
-                    await restartWithControlledGateway(target)
-                }
-            }
-            Button("取消", role: .cancel) {}
-        } message: {
-            let multiWarning = monitor.managedEntryControl.hasMultipleSources
-                ? "\n\n⚠️ 提示：检测到系统中存在 \(monitor.managedEntryControl.candidateSources.count) 个安装版本，将平稳关闭外部实例并以系统官方安装启动接管。建议稍后处理多余版本。"
-                : ""
-            Text("检测到 \(product.title) 正在运行但尚未接入受控网关沙箱。\n将先平稳关闭当前外部实例，随后以受控网关环境重新启动建立保护。是否继续？\(multiWarning)")
-        }
-        .alert(resultTitle, isPresented: $showingResult) {
-            Button("知道了", role: .cancel) {}
-        } message: { Text(resultMessage) }
-    }
-
-    @MainActor
-    private func restartWithControlledGateway(_ target: GraphLaunchTarget) async {
-        switcher.dismissMessage()
-        do {
-            let sampled = monitor.snapshot?.processes ?? []
-            let plan = try await processControl.prepare(product, sampled: sampled, backendPID: monitor.snapshot?.proxy?.listenerPID)
-            _ = await processControl.execute(plan)
-            try? await Task.sleep(nanoseconds: 1_200_000_000)
-        } catch {
-            // 若优雅退出计划因非致命原因未完成，仍继续尝试受控拉起
-        }
-        await launch(target)
-    }
-
-    @MainActor
-    private func launch(_ target: GraphLaunchTarget) async {
-        if let reason = target.blockReason(store: switcher, at: Date()) {
-            resultTitle = "未启动 \(target.title)"
-            resultMessage = reason
-            showingResult = true
-            return
-        }
-        switcher.dismissMessage()
-        await switcher.perform(target.arguments)
-        resultTitle = switcher.failure ? "启动未完成" : "启动结果"
-        resultMessage = switcher.message.isEmpty ? switcher.auditOperationMessage : switcher.message
-        if resultMessage.isEmpty { resultMessage = "未取得启动结果，请查看环境状态。" }
-        showingResult = true
-        if !switcher.isFixture { monitor.refresh(full: true, manual: true) }
-    }
-}

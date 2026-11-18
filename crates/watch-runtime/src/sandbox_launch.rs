@@ -84,6 +84,7 @@ pub fn generate_nono_seatbelt_profile(
     sbpl.push_str(";; nono capability restriction: block all direct network, DNS, UDP/QUIC, and Unix socket relays\n");
     sbpl.push_str("(deny network*)\n");
     sbpl.push_str("(allow system-socket)\n");
+    sbpl.push_str("(allow network-bind (subpath \"/var/folders\") (subpath \"/private/var/folders\") (subpath \"/tmp\") (subpath \"/private/tmp\"))\n");
     for denied in extra_deny_ports {
         if *denied > 0 {
             sbpl.push_str(&format!(

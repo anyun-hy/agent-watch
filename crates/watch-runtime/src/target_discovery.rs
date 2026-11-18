@@ -2266,7 +2266,9 @@ fn make_spec(
         target_fingerprint: cache.fingerprint(executable)?,
         proxy_adaptation: if matches!(
             target,
-            LaunchTarget::ClaudeDesktop | LaunchTarget::CodexDesktop
+            LaunchTarget::ClaudeDesktop
+                | LaunchTarget::CodexDesktop
+                | LaunchTarget::ChatgptDesktop
         ) {
             ProxyAdaptationKind::EnvAndElectronSwitches
         } else {

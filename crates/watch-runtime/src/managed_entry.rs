@@ -105,7 +105,9 @@ impl DesktopManagedEntrySpec {
             CoreError::new("target_fingerprint_failed", "无法计算目标桌面应用主程序 SHA-256")
         })?;
         let adaptation = match target {
-            LaunchTarget::ClaudeDesktop | LaunchTarget::CodexDesktop => {
+            LaunchTarget::ClaudeDesktop
+            | LaunchTarget::CodexDesktop
+            | LaunchTarget::ChatgptDesktop => {
                 ProxyAdaptationKind::EnvAndElectronSwitches
             }
             _ => ProxyAdaptationKind::EnvOnly,
