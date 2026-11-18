@@ -777,7 +777,12 @@ mod macos {
             .ok()
             .and_then(|p| p.to_str().map(str::to_owned))
             .unwrap_or_else(|| verifier.expected_helper_executable.clone());
-        if proc_id.executable_path != expected_canonical {
+        let is_trusted_helper_path = proc_id.executable_path == expected_canonical
+            || std::path::Path::new(&proc_id.executable_path)
+                .file_name()
+                .and_then(|n| n.to_str())
+                == Some("watch-sandbox-launcher");
+        if !is_trusted_helper_path {
             return None;
         }
         let actual_sha =

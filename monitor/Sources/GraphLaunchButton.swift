@@ -94,9 +94,6 @@ struct GraphLaunchButton: View {
             .disabled(!isEnabled)
             .help(reason ?? "启动时会重新执行完整检查，通过后建立受控会话。")
             .accessibilityHint(reason ?? "启动前将重新检查当前环境。")
-            if switcher.busy {
-                launchProgress
-            }
         }
         .confirmationDialog("检查并启动 \(pending?.title ?? "应用")？", isPresented: $confirming, titleVisibility: .visible) {
             if let target = pending {
@@ -112,25 +109,6 @@ struct GraphLaunchButton: View {
         .alert(resultTitle, isPresented: $showingResult) {
             Button("知道了", role: .cancel) {}
         } message: { Text(resultMessage) }
-    }
-
-    private var launchProgress: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack(spacing: 8) {
-                ProgressView().controlSize(.small)
-                Text(switcher.activity.isEmpty ? "正在检查启动条件…" : switcher.activity)
-                    .font(WatchTypography.caption).foregroundStyle(p.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-            if let stage = switcher.activityStage {
-                ProgressView(value: Double(stage), total: Double(SetupProgressPhase.launchStageCount))
-                    .controlSize(.small)
-                Text("第 \(stage) / \(SetupProgressPhase.launchStageCount) 步：实测取样 → 核对策略 → 建立会话")
-                    .font(WatchTypography.small).foregroundStyle(p.secondary)
-            }
-        }
-        .padding(.top, 8)
-        .accessibilityLabel("启动检查进度")
     }
 
     @MainActor

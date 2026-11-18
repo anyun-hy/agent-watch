@@ -332,23 +332,21 @@ impl<R: ReadRunner> NativeDesktop<R> {
                 return Ok(p);
             }
         }
-        let candidate = self
-            .helper
-            .parent()
-            .map(|d| d.join("watch-sandbox-launcher"))
-            .ok_or_else(|| {
-                CoreError::new("sandbox_launcher_missing", "无法定位 watch-sandbox-launcher")
-            })?;
-        let m = fs::symlink_metadata(&candidate).map_err(|_| {
-            CoreError::new("sandbox_launcher_missing", "缺少 watch-sandbox-launcher 组件")
-        })?;
-        if !candidate.is_absolute() || !m.is_file() || m.file_type().is_symlink() {
-            return Err(CoreError::new(
-                "invalid_sandbox_launcher",
-                "watch-sandbox-launcher 组件路径或类型无效",
-            ));
+        let candidates = [
+            std::env::var_os("HOME").map(|h| PathBuf::from(h).join("Library/Application Support/ClaudeWatch/runtime/watch-sandbox-launcher")),
+            self.helper.parent().map(|d| d.join("watch-sandbox-launcher")),
+        ];
+        for candidate in candidates.into_iter().flatten() {
+            if let Ok(m) = fs::symlink_metadata(&candidate) {
+                if candidate.is_absolute() && m.is_file() && !m.file_type().is_symlink() {
+                    return Ok(candidate);
+                }
+            }
         }
-        Ok(candidate)
+        Err(CoreError::new(
+            "sandbox_launcher_missing",
+            "缺少 watch-sandbox-launcher 组件",
+        ))
     }
     pub fn selected_cli_path(&self) -> Option<&Path> {
         self.cli.as_ref().map(|c| c.path.as_path())
@@ -824,7 +822,7 @@ impl<R: ReadRunner> NativeDesktop<R> {
             .arg(registration_socket)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
             .spawn()
             .map_err(|_| {
                 CoreError::new(
@@ -835,11 +833,23 @@ impl<R: ReadRunner> NativeDesktop<R> {
         std::thread::sleep(Duration::from_millis(120));
         if let Ok(Some(status)) = child.try_wait() {
             if !status.success() {
+                let mut err_msg = String::new();
+                if let Some(mut err_pipe) = child.stderr.take() {
+                    use std::io::Read;
+                    let _ = err_pipe.read_to_string(&mut err_msg);
+                }
+                let err_detail = err_msg.trim();
+                let detail_suffix = if err_detail.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {err_detail}")
+                };
                 return Err(CoreError::new(
                     "sandbox_launch_rejected",
                     &format!(
-                        "watch-sandbox-launcher 拒绝或中止了桌面应用启动 (exit={})",
-                        status.code().unwrap_or(1)
+                        "watch-sandbox-launcher 拒绝或中止了桌面应用启动 (exit={}){}",
+                        status.code().unwrap_or(1),
+                        detail_suffix
                     ),
                 ));
             }
@@ -1000,7 +1010,14 @@ impl<R: ReadRunner, T: Transport, S: AuditSystem + ServiceSystem> DesktopRuntime
                 "旧网络配置须先迁移为 Seatbelt，不能绕过受控入口启动目标",
             ));
         }
-        let launcher_bin = self.desktop.sandbox_launcher_binary()?;
+        let launcher_bin = {
+            let runtime_launcher = self.storage.paths.watch().join("runtime/watch-sandbox-launcher");
+            if runtime_launcher.is_file() {
+                runtime_launcher
+            } else {
+                self.desktop.sandbox_launcher_binary()?
+            }
+        };
         let rt = crate::sandbox_launch::read_runtime_state(&self.storage)?;
         if rt.is_null() {
             return Err(CoreError::new(

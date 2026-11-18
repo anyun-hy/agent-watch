@@ -117,6 +117,9 @@ struct ConnectionGraphView: View {
                         }.menuStyle(.borderlessButton).frame(maxWidth: 148)
                     }
                     Spacer(minLength: 0)
+                    if store.switcher.busy {
+                        launchProgressView
+                    }
                     HStack(spacing: 8) {
                         ControlledRestartButton(product: selectedProduct, monitor: store, switcher: store.switcher,
                                                 processControl: store.processControl, p: p)
@@ -354,6 +357,27 @@ struct ConnectionGraphView: View {
         .padding(.horizontal, 23)
         .padding(.vertical, 6)
         .background(p.elevated.opacity(0.25))
+    }
+
+    private var launchProgressView: some View {
+        VStack(alignment: .trailing, spacing: 3) {
+            HStack(spacing: 6) {
+                ProgressView().controlSize(.small)
+                Text(store.switcher.activity.isEmpty ? "正在检查启动条件…" : store.switcher.activity)
+                    .font(WatchTypography.caption).foregroundStyle(p.secondary)
+                    .lineLimit(1)
+            }
+            if let stage = store.switcher.activityStage {
+                HStack(spacing: 6) {
+                    ProgressView(value: Double(stage), total: Double(SetupProgressPhase.launchStageCount))
+                        .controlSize(.small)
+                        .frame(width: 100)
+                    Text("第 \(stage)/\(SetupProgressPhase.launchStageCount) 步")
+                        .font(WatchTypography.small).foregroundStyle(p.secondary)
+                }
+            }
+        }
+        .accessibilityLabel("启动检查进度")
     }
 
     private var multipleSourcesBanner: some View {
