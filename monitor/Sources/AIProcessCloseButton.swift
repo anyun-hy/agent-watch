@@ -45,7 +45,7 @@ struct AIProcessCloseButton: View {
                 Button("强制结束 \(plan.targets.count) 个已核实进程", role: .destructive) {
                     Task {
                         message = await control.execute(plan); pending = nil; showingMessage = true
-                        if !control.isFixture { store.refresh(full: true, manual: true) }
+                        if !control.isFixture { store.refresh(manual: true) }
                     }
                 }
             }

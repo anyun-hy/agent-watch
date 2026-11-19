@@ -205,7 +205,7 @@ impl Health {
 struct Entry { diagnostic: ChannelDiagnostic, at: f64 }
 
 #[derive(Clone)]
-pub struct ChannelDiagnostics { sender: SyncSender<Entry>, health: Arc<Health> }
+pub struct ChannelDiagnostics { sender: SyncSender<Option<Entry>>, health: Arc<Health> }
 impl ChannelDiagnostics {
     pub fn new(storage: StateStore) -> Self {
         Self::with_writer(128, storage.clone(), move |diagnostic, at| {
@@ -214,7 +214,7 @@ impl ChannelDiagnostics {
     }
     fn with_writer<F>(capacity: usize, storage: StateStore, mut write: F) -> Self
     where F: FnMut(ChannelDiagnostic, f64) -> Result<()> + Send + 'static {
-        let (sender, receiver) = mpsc::sync_channel::<Entry>(capacity);
+        let (sender, receiver) = mpsc::sync_channel::<Option<Entry>>(capacity);
         let health = Arc::new(Health::default());
         let worker_health = health.clone();
         let writer_boot_id = format!("log-writer-{}", uuid::Uuid::new_v4());
@@ -222,16 +222,20 @@ impl ChannelDiagnostics {
             let mut last_health = None;
             let mut last_loss_record = (0, 0, 0, 0);
             let mut last_health_write = std::time::Instant::now();
+            let mut deadline = Some(last_health_write);
             loop {
-                let disconnected = match receiver.recv_timeout(Duration::from_millis(500)) {
-                    Ok(entry) => {
+                let message = if let Some(at) = deadline {
+                    receiver.recv_timeout(at.saturating_duration_since(std::time::Instant::now()))
+                } else { receiver.recv().map_err(|_| mpsc::RecvTimeoutError::Disconnected) };
+                let disconnected = match message {
+                    Ok(Some(entry)) => {
                         match write(entry.diagnostic, entry.at) {
                             Ok(()) => { worker_health.written.fetch_add(1, Ordering::Relaxed); }
                             Err(error) => { worker_health.failed.fetch_add(1, Ordering::Relaxed); worker_health.error(&error); }
                         }
                         false
                     }
-                    Err(mpsc::RecvTimeoutError::Timeout) => false,
+                    Ok(None) | Err(mpsc::RecvTimeoutError::Timeout) => false,
                     Err(mpsc::RecvTimeoutError::Disconnected) => true,
                 };
                 let snapshot = worker_health.snapshot();
@@ -245,14 +249,20 @@ impl ChannelDiagnostics {
                     if EventStore::new(storage.clone()).append("channel-diagnostic", diagnostic.event_fields(),
                         crate::native::now()).is_ok() { last_loss_record = losses; }
                 }
-                if last_health.as_ref() != Some(&snapshot)
-                    && (last_health.is_none() || losses != (0, 0, 0, 0) || last_health_write.elapsed() >= Duration::from_secs(1)) {
+                deadline = (last_loss_record != losses).then(|| std::time::Instant::now() + Duration::from_millis(500));
+                if last_health.as_ref() != Some(&snapshot) {
+                    let flush_at = last_health_write + Duration::from_secs(1);
+                    if !disconnected && last_health.is_some() && losses == (0, 0, 0, 0) && std::time::Instant::now() < flush_at {
+                        deadline = Some(flush_at);
+                        continue;
+                    }
                     let value = serde_json::json!({"captured_at":crate::native::now(),
                         "pid":std::process::id(),"writer_boot_id":writer_boot_id,"health":snapshot,
                         "scope":"current_writer_lifetime","shutdown_flush_guaranteed":false});
                     if let Err(error) = storage.atomic_json(&storage.paths.watch().join("state/channel-log-health.json"), &value) {
                         worker_health.health_failed.fetch_add(1, Ordering::Relaxed);
                         worker_health.error(&error);
+                        deadline = Some(std::time::Instant::now() + Duration::from_millis(500));
                     } else { last_health = Some(snapshot); last_health_write = std::time::Instant::now(); }
                 }
                 if disconnected { break; }
@@ -266,8 +276,9 @@ impl ChannelDiagnostics {
     }
     /// Never waits for disk, an available queue slot, or the writer's mutex.
     pub fn record(&self, diagnostic: ChannelDiagnostic, at: f64) {
-        if self.sender.try_send(Entry { diagnostic, at }).is_err() {
+        if self.sender.try_send(Some(Entry { diagnostic, at })).is_err() {
             self.health.dropped.fetch_add(1, Ordering::Relaxed);
+            let _ = self.sender.try_send(None);
         }
     }
     pub fn persistence_failed(&self, mut diagnostic: ChannelDiagnostic, error: &CoreError, at: f64) {

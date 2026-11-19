@@ -127,7 +127,7 @@ impl Request {
             "receipt-diagnostic" => (&[], &["apply"], &[]),
             "diagnose-proxy" => (&[], &["stdin-config"], &["proxy", "config"]),
             "observe" => (&[], &["json", "processes-only"], &["home"]),
-            "snapshot" => (&[], &["full"], &[]),
+            "snapshot" => (&[], &["full", "without-channel-events"], &[]),
             "ai-probe" => (&[], &[], &["service"]),
             "dns-probe" => (&[], &[], &[]),
             "server-reference" => (&[], &[], &["host", "ip"]),
@@ -225,6 +225,9 @@ impl Request {
             positionals.remove(0);
         }
         if !positionals.is_empty() {
+            return Err(invalid());
+        }
+        if command == "snapshot" && request.flag("full") && request.flag("without-channel-events") {
             return Err(invalid());
         }
         if command == "config"

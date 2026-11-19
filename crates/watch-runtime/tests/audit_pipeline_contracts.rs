@@ -196,6 +196,12 @@ fn environment_previews_both_desktop_targets_from_one_observation() {
         backend_flips: bool,
     }
     impl AuditSystem for IndependentGuard {
+        fn check_preview_compatibility(&self, target: LaunchTarget) -> Result<()> {
+            if target == LaunchTarget::ChatgptDesktop {
+                return Err(claude_watch_core::error::CoreError::new("desktop_sandbox_incompatible", "Aperitif"));
+            }
+            Ok(())
+        }
         fn now(&self) -> f64 {
             1_700_000_000.0
         }
@@ -283,6 +289,12 @@ fn environment_previews_both_desktop_targets_from_one_observation() {
         "Claude guard does not become a ChatGPT requirement"
     );
     assert_eq!(chatgpt["launch_target"], "chatgpt-desktop");
+    let compatibility = chatgpt["rows"].as_array().unwrap().iter().find(|r| r["id"] == "desktop_compatibility").unwrap();
+    assert_eq!(compatibility["code"], "desktop_sandbox_incompatible");
+    assert_eq!(compatibility["detail"], "Aperitif");
+    assert_eq!(chatgpt["ready"], false);
+    assert!(chatgpt["blocked"].as_array().unwrap().contains(&json!("desktop_compatibility")));
+    assert!(!claude["blocked"].as_array().unwrap().contains(&json!("desktop_compatibility")));
     assert_eq!(chatgpt["grants_launch_permission"], false);
     for key in ["observed_at", "expires_at", "context_id", "observation_id"] {
         assert_eq!(
@@ -291,6 +303,12 @@ fn environment_previews_both_desktop_targets_from_one_observation() {
         );
     }
     assert!(chatgpt.get("session_guard").is_none());
+    let explicit = AuditStore::new(storage.clone()).collect_launch_preview(
+        &mut system, &ZoneCatalog::new(), LaunchTarget::ChatgptDesktop,
+        AuditOptions { online: false, persist: false, launch: true },
+    ).unwrap();
+    assert!(explicit["blocked"].as_array().unwrap().contains(&json!("desktop_compatibility")));
+    assert_eq!(explicit["grants_launch_permission"], false);
     let mut flapping = IndependentGuard {
         online_calls: 0,
         local_calls: std::cell::Cell::new(0),

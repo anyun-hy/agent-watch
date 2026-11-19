@@ -4,10 +4,12 @@ import Foundation
 struct MonitorRefreshGate {
     private(set) var reading = false
     private(set) var manualVisible = false
+    private var queued = false
     private var manualQueued = false
 
     mutating func request(manual: Bool) -> Bool {
         if reading {
+            queued = true
             if manual {
                 manualQueued = true
                 manualVisible = true
@@ -19,14 +21,12 @@ struct MonitorRefreshGate {
         return true
     }
 
-    /// Returns true when one explicit refresh must run after the current read.
+    /// An event during a read needs one trailing read, even without a manual request.
     mutating func complete() -> Bool {
         reading = false
-        if manualQueued {
-            manualQueued = false
-            return true
-        }
-        manualVisible = false
-        return false
+        manualVisible = manualQueued
+        manualQueued = false
+        defer { queued = false }
+        return queued
     }
 }

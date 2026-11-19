@@ -4,7 +4,7 @@ mod hardened_helper;
 
 use super::{
     assemble_production_channel_stack, default_registration_socket_path, native,
-    GuardObservation, ProductionChannelStack, SupervisionEvent,
+    ProductionChannelStack, SupervisionEvent,
 };
 use claude_watch_core::{
     channel::{ChannelEnforcementState, ChannelPermitState, CLOCK_ROLLBACK_TOLERANCE_SECONDS},
@@ -408,7 +408,7 @@ fn queued_inventory_failure_keeps_other_family_and_ordinary_connections() {
     let mut vpn_sequence = 0;
     for _ in 0..3 {
         sample(stack, &cfg, &mut vpn_sequence);
-        stack.step_with_observations(vec![GuardObservation::Inventory {
+        stack.step_with_observations(vec![SupervisionEvent::ProcessInventoryUpdated {
             family:"claude".into(), desktops:vec![ordinary_desktop.clone()],
             processes:vec![ordinary_token.clone()], observed_at:native::now(),
         }], native::now()).unwrap();
@@ -457,7 +457,7 @@ fn queued_inventory_failure_keeps_other_family_and_ordinary_connections() {
         // the delayed event under test is the Claude-only failure below.
         let mut observed = tokens;
         let desktops = if family == "claude" { observed.push(ordinary_token.clone()); vec![ordinary_desktop.clone()] } else { vec![] };
-        stack.apply_guard_observation(GuardObservation::Inventory {
+        stack.deliver_event_at(SupervisionEvent::ProcessInventoryUpdated {
             family:family.into(), desktops, processes:observed, observed_at:now,
         }, native::now()).unwrap();
     }
@@ -473,21 +473,21 @@ fn queued_inventory_failure_keeps_other_family_and_ordinary_connections() {
     // A later timestamp for the identical managed set must keep this audit.
     let mut current_claude_observed = registry.verified_family_tokens("claude", native::now());
     current_claude_observed.push(ordinary_token.clone());
-    stack.apply_guard_observation(GuardObservation::Inventory {
+    stack.deliver_event_at(SupervisionEvent::ProcessInventoryUpdated {
         family:"claude".into(), desktops:vec![ordinary_desktop.clone()],
         processes:current_claude_observed, observed_at:native::now(),
     }, native::now()).unwrap();
-    assert!(!cancellation.load(Ordering::Acquire));
+    assert!(!cancellation.is_cancelled());
     assert!(inspect_process_identity(audit_child_pid).is_some());
     let removed_pid = claude.child.id();
     claude.finish();
     registry.reconcile_process_trees(native::now());
     let cancellation_started = Instant::now();
-    stack.apply_guard_observation(GuardObservation::Inventory {
+    stack.deliver_event_at(SupervisionEvent::ProcessInventoryUpdated {
         family:"claude".into(), desktops:vec![ordinary_desktop.clone()],
         processes:vec![ordinary_token.clone()], observed_at:native::now(),
     }, native::now()).unwrap();
-    assert!(cancellation.load(Ordering::Acquire));
+    assert!(cancellation.is_cancelled());
     assert_eq!(audit_cancelled_rx.recv_timeout(Duration::from_secs(2)).unwrap().as_deref(), Some("audit_cancelled"));
     assert!(!claude_watch_system::list_user_pids(claude_watch_system::effective_uid()).contains(&audit_child_pid),
         "removed target's real audit child must be waited for, not left alive or as a zombie");
@@ -499,7 +499,7 @@ fn queued_inventory_failure_keeps_other_family_and_ordinary_connections() {
     let now = native::now();
     let mut adoption_observed = registry.verified_family_tokens("claude", now);
     adoption_observed.push(ordinary_token.clone());
-    stack.apply_guard_observation(GuardObservation::Inventory {
+    stack.deliver_event_at(SupervisionEvent::ProcessInventoryUpdated {
         family:"claude".into(), desktops:vec![ordinary_desktop.clone()],
         processes:adoption_observed, observed_at:now,
     }, now).unwrap();

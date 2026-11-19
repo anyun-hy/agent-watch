@@ -148,8 +148,8 @@ final class FirstRunInitialization: ObservableObject {
     private var started = false
     private var approvalOperation: UUID?
     private var automaticRefreshEligible = false
-    private var nextAutomaticRefresh: Date?
-    private var nextAccessibilityPoll: Date?
+    @Published private var nextAutomaticRefresh: Date?
+    private var awaitingAccessibilityReturn = false
     private var accessibilityGeneration = 0
 
     init(checks: InitializationChecking, completed: Bool, diagnosticLog: BoundedDiagnosticLog? = nil,
@@ -193,7 +193,7 @@ final class FirstRunInitialization: ObservableObject {
         // settings, permission or receipt no longer holds, and every step
         // from the resume point onward is re-executed, so results from before
         // a network or permission change cannot merge into this round.
-        approval = nil; validUntil = nil; stopAccessibilityPolling()
+        approval = nil; validUntil = nil; cancelAccessibilityWait()
         automaticRefreshEligible = false; nextAutomaticRefresh = nil
         for index in rows.indices where rows[index].status != .passed {
             rows[index].status = .pending; rows[index].code = "pending"; rows[index].detail = ""
@@ -243,7 +243,7 @@ final class FirstRunInitialization: ObservableObject {
             let current = reconcilePassedEvidence()
             if current && rows[index].step == .verification && allPassed {
                 automaticRefreshEligible = true
-                nextAutomaticRefresh = Date().addingTimeInterval(EnvironmentRefreshScheduler.interval)
+                nextAutomaticRefresh = expiry.map(Date.init(timeIntervalSince1970:))
             }
             return current
         case .approval(let request):
@@ -314,9 +314,9 @@ final class FirstRunInitialization: ObservableObject {
             self.log("authorization_progress", index: index)
         })
         approvalOperation = nil
-        if request.action == .accessibility, case .approval(let pending) = result, pending.action == .accessibility {
-            nextAccessibilityPoll = Date().addingTimeInterval(3)
-        } else { nextAccessibilityPoll = nil }
+        if case .approval(let pending) = result {
+            awaitingAccessibilityReturn = pending.action == .accessibility && request.action == .accessibility
+        } else { awaitingAccessibilityReturn = false }
         let accepted = accept(result, at: index)
         running = false
         if accepted { await run(from: index + 1) }
@@ -334,15 +334,19 @@ final class FirstRunInitialization: ObservableObject {
         }
         let accepted = accept(result, at: index)
         running = false
-        if accepted { nextAccessibilityPoll = nil; await run(from: index + 1) }
-        else if approval?.action != .accessibility { nextAccessibilityPoll = nil }
+        if accepted { awaitingAccessibilityReturn = false; await run(from: index + 1) }
+        else if approval?.action != .accessibility { awaitingAccessibilityReturn = false }
     }
-    func stopAccessibilityPolling() { nextAccessibilityPoll = nil; accessibilityGeneration += 1 }
-    func pollAccessibility(at now: Date = Date()) async {
-        guard !entered, !running, approval?.action == .accessibility,
-              let nextAccessibilityPoll, now >= nextAccessibilityPoll else { return }
-        self.nextAccessibilityPoll = now.addingTimeInterval(3)
-        await recheckAuthorization()
+    func cancelAccessibilityWait() { awaitingAccessibilityReturn = false; accessibilityGeneration += 1 }
+    func returnedFromAccessibilitySettings() async {
+        if awaitingAccessibilityReturn { await recheckAuthorization() }
+    }
+    var nextReadinessDeadline: Date? {
+        guard !running, !entered else { return nil }
+        guard approval == nil else { return nil }
+        let expiry = allPassed ? validUntil.map(Date.init(timeIntervalSince1970:)) : nil
+        let retry = automaticRefreshEligible && (allPassed || canRetryAutomaticRefresh) ? nextAutomaticRefresh : nil
+        return [expiry, retry].compactMap { $0 }.min()
     }
     func refreshReadiness(at now: Date = Date()) {
         guard !entered, !running else { return }
@@ -365,6 +369,7 @@ final class FirstRunInitialization: ObservableObject {
         }
         if let expiry = validUntil, now.timeIntervalSince1970 >= expiry {
             accept(.failed(code: "evidence_expired", detail: "检查结果已过期，请重新检查。"), at: index)
+            if automaticRefreshEligible && canRetryAutomaticRefresh { beginAutomaticRefresh() }
         } else {
             let result = checks.validateCurrentEvidence()
             if case .failed = result { accept(result, at: index); return }

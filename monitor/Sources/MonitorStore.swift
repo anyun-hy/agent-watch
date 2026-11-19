@@ -5,26 +5,31 @@ import AppKit
 
 @MainActor
 final class MonitorStore: ObservableObject {
-    static let snapshotUpdateNotification = Notification.Name("io.local.watchpanel.snapshot_update")
+    private let connectionEvidenceUpdated = PassthroughSubject<Void, Never>()
+    let historyUpdated = PassthroughSubject<Void, Never>()
     let leakChecks: LeakCheckStore
     let aiChecks: AIProbeStore
     let netCoffee = NetCoffeeStore()
     let processControl = AIProcessControl()
-    let managedEntryControl = ManagedEntryControl()
+    let managedEntryControl: ManagedEntryControl
     let switcher: SwitcherStore
-    /// First-run owns diagnostic/mutation sequencing; the timer only reads snapshots.
+    /// First-run owns diagnostic/mutation sequencing; publication events request readback.
     @Published private(set) var initializing = false
     @Published var snapshot: MonitorSnapshot?
     @Published var error: String?
     @Published var refreshing = false
-    @Published var automatic = true
+    @Published var automatic = true {
+        didSet {
+            if automatic && !oldValue && started {
+                refreshBackgroundIfNeeded(at: Date(), force: true)
+                refresh()
+                historyUpdated.send()
+            }
+        }
+    }
     @Published private(set) var notificationAccess = WatchNotificationAccess.unknown
-    /// Live desktop-app presence, read every fast tick straight from AppKit
-    /// (`NSRunningApplication`) with no backend round-trip. This is the cheap
-    /// "fast lane" that keeps the launch/quit buttons accurate within ~2s even
-    /// though the full backend snapshot (CLI/daemon/connections) still arrives
-    /// on the relaxed ~20s cadence.
-    @Published private(set) var desktopRunning: [MonitoredProduct: Bool] = [:]
+    /// Native desktop presence is a display fact, not protection evidence.
+    @Published private(set) var desktopPresence: WorkspaceDesktopPresence?
     @Published var page: Page = .environment
     @Published var now = Date()
     @Published var networkSelection = NetworkGraphSelection()
@@ -33,11 +38,17 @@ final class MonitorStore: ObservableObject {
     @Published private(set) var channelSubscription = ChannelMonitorSubscriptionStore()
     private var referenceQueryRunning = false
     private var referenceQueriesEnabled = false
-    private var timer: Timer?
+    private var started = false
+    private var publications: MonitorPublicationObserver?
+    private var expiryTask: DispatchWorkItem?
+    private var rereadExpiredSnapshot: Double?
+    private var wakeToken: NSObjectProtocol?
     private var workspaceObserver: WorkspaceAppObserver?
-    private var lastFull: Date = .distantPast
     private var lastBackgroundRead: Date = .distantPast
     private var backgroundReadRunning = false
+    private var pendingBackgroundRead = false
+    private var backgroundRetry: DispatchWorkItem?
+    private var switcherReady: AnyCancellable?
     private var environmentRefreshScheduler = EnvironmentRefreshScheduler()
     private var diagnosticContext = DiagnosticContextTracker()
     private var refreshGate = MonitorRefreshGate()
@@ -46,6 +57,16 @@ final class MonitorStore: ObservableObject {
         self.leakChecks = leakChecks ?? LeakCheckStore()
         self.aiChecks = aiChecks ?? AIProbeStore()
         self.switcher = switcher ?? SwitcherStore()
+        self.managedEntryControl = ManagedEntryControl(isFixture: self.switcher.isFixture)
+        switcherReady = self.switcher.$busy.combineLatest(self.switcher.$readingEnvironment)
+            .filter { busy, _ in !busy }.receive(on: DispatchQueue.main)
+            .sink { [weak self] _, readingEnvironment in
+                guard let self else { return }
+                self.drainPendingBackgroundRead()
+                if !readingEnvironment && self.started && self.automatic && !self.initializing {
+                    self.refreshEnvironmentIfNeeded()
+                }
+            }
         let bindingContext: () -> String? = { [weak self] in self?.retainedDiagnosticContext() }
         let currentContext: () -> String? = { [weak self] in self?.currentDiagnosticContext() }
         self.leakChecks.contextProvider = bindingContext
@@ -53,6 +74,7 @@ final class MonitorStore: ObservableObject {
         self.switcher.diagnosticContextProvider = bindingContext
         self.leakChecks.onEvidenceReceived = { [weak self] kind, reply, item in
             self?.switcher.acceptEvidence(kind, reply: reply, item: item)
+            self?.scheduleEvidenceExpiry()
         }
         self.leakChecks.onEvidenceFailed = { [weak self] kind, detail in
             self?.switcher.acceptEvidenceFailure(kind, detail: detail)
@@ -64,13 +86,18 @@ final class MonitorStore: ObservableObject {
             guard let self, !self.initializing else { return }
             self.refreshBackgroundIfNeeded(at: Date())
         }
+        self.switcher.onBackgroundUpdated = { [weak self] in
+            self?.connectionEvidenceUpdated.send()
+            self?.scheduleEvidenceExpiry()
+        }
         self.switcher.onConfigUpdated = { [weak self] in
             guard let self else { return }
             self.channelSubscription.markReconnected()
-            self.refresh(full: true, manual: true)
+            self.refresh(manual: true)
         }
         self.aiChecks.contextProvider = bindingContext
         self.aiChecks.onResult = { [weak self] result in
+            self?.scheduleEvidenceExpiry()
             let ip = result.exitIP
             guard !ip.isEmpty else { return }
             self?.netCoffee.fetchAI(ip)
@@ -104,29 +131,50 @@ final class MonitorStore: ObservableObject {
         let center = CFNotificationCenterGetDarwinNotifyCenter()
         let observer = Unmanaged.passUnretained(self).toOpaque()
         CFNotificationCenterRemoveEveryObserver(center, observer)
+        expiryTask?.cancel()
+        backgroundRetry?.cancel()
+        if let wakeToken { NSWorkspace.shared.notificationCenter.removeObserver(wakeToken) }
     }
     func start() {
-        guard timer == nil else { return }
-        if !initializing { refreshBackgroundIfNeeded(at: Date()) }
+        guard !started else { return }
+        started = true
+        if !switcher.isFixture {
+            observePublications()
+            wakeToken = NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didWakeNotification,
+                object: nil, queue: .main) { [weak self] _ in
+                Task { @MainActor in
+                    guard let self else { return }
+                    self.advanceClock(at: Date())
+                    if self.automatic || self.initializing {
+                        self.refreshBackgroundIfNeeded(at: Date(), force: true)
+                        self.refresh()
+                        self.historyUpdated.send()
+                    }
+                }
+            }
+        }
+        refreshBackgroundIfNeeded(at: Date())
         referenceQueriesEnabled = !initializing
-        refresh(full: true)
-        // Desktop app launches/terminations are now event-driven: the moment
-        // macOS posts a launch/quit notification for a supervised app, the
-        // snapshot re-reads immediately (no polling lag). The timer below is
-        // only the coarse fallback for CLI processes and health freshness.
-        if workspaceObserver == nil {
-            workspaceObserver = WorkspaceAppObserver { [weak self] in
+        refresh()
+        if workspaceObserver == nil && !switcher.isFixture {
+            let observer = WorkspaceAppObserver { [weak self] presence in
                 guard let self else { return }
-                self.refresh(full: true, manual: true)
+                for product in MonitoredProduct.allCases where self.desktopPresence?.processIDs(for: product) != presence.processIDs(for: product) {
+                    self.switcher.forgetManualAccount(product)
+                }
+                self.desktopPresence = presence
+                self.refresh(manual: true)
             }
-            workspaceObserver?.start()
+            workspaceObserver = observer
+            desktopPresence = observer.start()
         }
-        timer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
-            Task { @MainActor in
-                guard let self else { return }
-                self.monitorTick(at: Date())
-            }
-        }
+        scheduleEvidenceExpiry()
+    }
+    private func observePublications() {
+        guard publications == nil && !switcher.isFixture else { return }
+        let root = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/ClaudeWatch")
+        let observer = MonitorPublicationObserver(root: root) { [weak self] changes in self?.publicationsDidChange(changes) }
+        if observer.start() { publications = observer }
     }
     func refreshNotificationAccess() async {
         guard !switcher.isFixture else { return }
@@ -148,79 +196,94 @@ final class MonitorStore: ObservableObject {
         await readNotificationAccess(reader)
     }
     #endif
-    func monitorTick(at date: Date) {
+    func advanceClock(at date: Date) {
         now = date
         leakChecks.now = date
         aiChecks.now = date
-        // The cheap desktop-presence fast lane runs every tick regardless of
-        // automatic detection state, so launch/quit buttons stay accurate even
-        // when background network detection is paused.
-        refreshDesktopState()
-        // Login freshness is a display fact and must age even while automatic
-        // network/environment detection is paused.
         switcher.advanceLoginClock(date)
-        guard automatic else {
-            if case .rustCandidate? = BundledBackendVariant.current() { LeakDiagnosticTrace.shared.schedule(kind: "all", event: "schedule_disabled") }
-            return
-        }
-        if initializing {
-            if case .rustCandidate? = BundledBackendVariant.current() { LeakDiagnosticTrace.shared.schedule(kind: "all", event: "schedule_initializing") }
-            // Initialization also validates the service receipt while waiting
-            // for the user. Keep it fresh using the same read-only scheduler as
-            // the main view; otherwise a healthy service always appears stale
-            // 30 seconds after the final check.
-            refreshBackgroundIfNeeded(at: date)
-            refresh(full: date.timeIntervalSince(lastFull) >= 20)
-            return
-        }
-        refreshBackgroundIfNeeded(at: date)
-        // AX reading is independent and must not delay the snapshot scheduler.
-        Task { @MainActor [weak switcher] in
-            await switcher?.refreshCurrentLogin()
-        }
-        // Desktop app changes arrive via WorkspaceAppObserver; this interval is
-        // the coarse fallback for CLI processes (no .app launch event) and for
-        // general health freshness, so it can stay relaxed.
-        refresh(full: date.timeIntervalSince(lastFull) >= 20)
+        connectionEvidenceUpdated.send()
+        scheduleEvidenceExpiry()
     }
-    /// Reads the supervised desktop apps' presence straight from AppKit. This is
-    /// the fast lane: `NSRunningApplication` answers in microseconds and never
-    /// touches the Rust backend, so it can run on the 2s tick while the full
-    /// snapshot (which also resolves CLI/daemon/connections) stays at ~20s.
-    /// The bundle-id → product mapping mirrors `WorkspaceAppObserver` and the
-    /// Rust's desktop classification used for the exit plan.
-    private func refreshDesktopState() {
-        let claudeBundles = Set(["com.anthropic.claudefordesktop"])
-        let openAIBundles = Set(["com.openai.codex", "com.openai.chat"])
-        let running = NSWorkspace.shared.runningApplications
-        let claudeRunning = running.contains { app in
-            app.bundleIdentifier.map(claudeBundles.contains) ?? false
+
+    private func scheduleEvidenceExpiry() {
+        expiryTask?.cancel()
+        guard started else { return }
+        let time = Date().timeIntervalSince1970
+        var deadlines = leakChecks.evidenceDeadlines
+        if automatic && !initializing, let due = environmentRefreshScheduler.nextCheck {
+            deadlines.append(due.timeIntervalSince1970)
         }
-        let openAIRunning = running.contains { app in
-            app.bundleIdentifier.map(openAIBundles.contains) ?? false
+        if let last = diagnosticContext.lastVerifiedAt {
+            deadlines.append(last.timeIntervalSince1970 + DiagnosticContextTracker.grace)
         }
-        let next: [MonitoredProduct: Bool] = [
-            .claude: claudeRunning,
-            .openAI: openAIRunning,
-        ]
-        if next != desktopRunning { desktopRunning = next }
+        if let value = snapshot {
+            if let age = value.health.heartbeatAge { deadlines.append(value.capturedAt + 30 - age) }
+            deadlines.append(value.capturedAt + MonitorSnapshotTiming.snapshotMaximumAge)
+            if let proxy = value.proxy { deadlines.append(proxy.observedAt + MonitorSnapshotTiming.proxyMaximumAge) }
+            for state in value.channelSupervision?.families.values ?? [:].values {
+                deadlines += [state.valid_until, state.blocked_evidence_valid_until,
+                              state.process_disposition_receipt.map { $0.observed_at + 15 }].compactMap { $0 }
+                deadlines += (state.previous_process_disposition_receipts ?? []).map { $0.observed_at + 15 }
+            }
+            deadlines += value.processes.compactMap { $0.protection?.valid_until }
+        }
+        if let background = switcher.background { deadlines += [background.observed_at + 30, background.observed_at + 35] }
+        if let session = switcher.sessionDisplayEvidence {
+            deadlines.append(session.observedAt + 35)
+            if let until = session.session.valid_until { deadlines.append(until) }
+        }
+        deadlines += AIService.allCases.compactMap { aiChecks.state($0).result.map { $0.finishedAt + AIProbePolicy.maximumAge } }
+        deadlines += serverReferences.values.map(\.expiresAt)
+        // A failed watcher can recover on the next evidence check.
+        if publications == nil && !switcher.isFixture { deadlines.append(time + MonitorSnapshotTiming.snapshotMaximumAge) }
+        guard let next = deadlines.filter({ $0.isFinite && $0 > time }).min() else { return }
+        let task = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            let date = Date()
+            self.observePublications()
+            self.advanceClock(at: date)
+            guard self.automatic || self.initializing else { return }
+            let expired = self.snapshot.flatMap { value in
+                value.health.state == "running" && value.capturedAt + MonitorSnapshotTiming.snapshotMaximumAge <= date.timeIntervalSince1970
+                    ? value.capturedAt : nil
+            }
+            if self.publications == nil || (expired != nil && expired != self.rereadExpiredSnapshot) {
+                self.rereadExpiredSnapshot = expired
+                self.refresh()
+            }
+            if self.publications == nil || self.switcher.background.map({ date.timeIntervalSince1970 >= $0.observed_at + 30 }) == true {
+                self.refreshBackgroundIfNeeded(at: date)
+            }
+            self.refreshServerReference()
+            if self.automatic, self.environmentRefreshScheduler.nextCheck.map({ $0 <= date }) == true {
+                self.refreshEnvironmentIfNeeded()
+            }
+        }
+        expiryTask = task
+        DispatchQueue.main.asyncAfter(deadline: .now() + max(0, next - time), execute: task)
     }
+
+    func publicationsDidChange(_ changes: MonitorPublications, at date: Date = Date()) {
+        guard automatic || initializing else { return }
+        if changes.contains(.service) { refreshBackgroundIfNeeded(at: date) }
+        if changes.contains(.snapshot) { refresh() }
+        if changes.contains(.history) { historyUpdated.send() }
+    }
+
     func handleChannelUpdate() {
-        refresh(full: false)
+        if automatic || initializing { refresh() }
     }
-    func refresh(full: Bool, manual: Bool = false) {
+    func refresh(manual: Bool = false) {
         guard !switcher.isFixture else { return }
         if manual { refreshBackgroundIfNeeded(at: Date(), force: true) }
         let shouldRead = refreshGate.request(manual: manual)
         if refreshing != refreshGate.manualVisible { refreshing = refreshGate.manualVisible }
         guard shouldRead else { return }
-        if full { lastFull = Date() }
         Task {
             let result = await Task.detached(priority: .utility) {
-                SnapshotRunner.run(full: full)
+                SnapshotRunner.run()
             }.value
-            // A newly captured snapshot may be newer than the previous timer
-            // tick. Advance the display clock before deriving `live` through
+            // Advance the display clock before deriving `live` through
             // `proxy` or starting any context-bound diagnostic.
             let completedAt = Date()
             switch result {
@@ -230,69 +293,45 @@ final class MonitorStore: ObservableObject {
                 if case .rustCandidate? = BundledBackendVariant.current() { LeakDiagnosticTrace.shared.schedule(kind: "all", event: "snapshot_failed") }
                 error = message
                 channelSubscription.markReconnected()
-                now = completedAt
-                leakChecks.now = completedAt
-                aiChecks.now = completedAt
+                advanceClock(at: completedAt)
             }
             synchronizeNetworkSelection()
-            let repeatManual = refreshGate.complete()
+            let followUp = refreshGate.complete()
             if refreshing != refreshGate.manualVisible { refreshing = refreshGate.manualVisible }
-            if repeatManual { refresh(full: true, manual: true) }
+            if followUp && (refreshGate.manualVisible || automatic || initializing) { refresh(manual: refreshGate.manualVisible) }
         }
     }
     func acceptSnapshot(_ value: MonitorSnapshot, receivedAt: Date) {
-        // A single publication path is shared by first-run and normal polling.
+        // First-run and normal observation share this publication path.
         // Backend capture time remains authoritative; rereads cannot renew it.
         now = max(receivedAt, Date(timeIntervalSince1970: value.capturedAt))
         error = nil
         let transition = observeDiagnosticContext(from: value, at: receivedAt)
         snapshot = value
-        NotificationCenter.default.post(name: Self.snapshotUpdateNotification, object: self, userInfo: ["snapshot": value])
         if let channel = value.channelSupervision { channelSubscription.applySnapshot(channel) }
         else { channelSubscription.markReconnected() }
         // The UI observes authoritative receipts; it never reissues permits.
         // Re-evaluate only after both the tracker and snapshot describe this
         // observation. Otherwise a recovered sampler can leave a fresh
         // receipt marked incomplete until an unrelated later clock tick.
-        leakChecks.now = now; aiChecks.now = now
+        advanceClock(at: now)
         if automatic && transition == .changed { switcher.invalidateCurrentEnvironmentRequest() }
         if automatic && !initializing {
             refreshEnvironmentIfNeeded()
         }
     }
-    /// Suspends until the next snapshot is accepted by this store, or until timeout.
-    func waitForNextSnapshot(timeout: TimeInterval = 1.0) async {
-        let center = NotificationCenter.default
-        let target = self
-        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-            final class WaitState: @unchecked Sendable {
-                var observer: NSObjectProtocol?
-                var resumed = false
-                let lock = NSLock()
-            }
-            let state = WaitState()
-            func resumeOnce() {
-                state.lock.lock()
-                defer { state.lock.unlock() }
-                guard !state.resumed else { return }
-                state.resumed = true
-                if let obs = state.observer {
-                    center.removeObserver(obs)
-                    state.observer = nil
-                }
-                continuation.resume()
-            }
-            state.observer = center.addObserver(
-                forName: MonitorStore.snapshotUpdateNotification,
-                object: target,
-                queue: .main
-            ) { _ in
-                resumeOnce()
-            }
-            DispatchQueue.main.asyncAfter(deadline: .now() + timeout) {
-                resumeOnce()
-            }
-        }
+    /// A read completion is not itself new evidence. Observe the same main-actor
+    /// store the check just evaluated, without requesting any reads from it.
+    func waitForConnectionChange(until deadline: Date, changed: @escaping () -> Bool) async {
+        guard !Task.isCancelled, !changed(), deadline.timeIntervalSinceNow > 0 else { return }
+        let (stream, continuation) = AsyncStream<Void>.makeStream()
+        let subscription = connectionEvidenceUpdated.first { changed() }.sink { continuation.finish() }
+        // No periodic wake: expiry is the check's original evidence boundary.
+        let expiry = DispatchWorkItem { continuation.finish() }
+        DispatchQueue.main.asyncAfter(deadline: .now() + max(0, deadline.timeIntervalSinceNow), execute: expiry)
+        defer { subscription.cancel(); expiry.cancel() }
+        var iterator = stream.makeAsyncIterator()
+        _ = await iterator.next()  // also returns immediately on task cancellation
     }
     func channelState(for product: MonitoredProduct) -> FamilyChannelMonitorState? {
         let family = product == .claude ? "claude" : "openai"
@@ -332,20 +371,37 @@ final class MonitorStore: ObservableObject {
         return state.isConfirmedFlowBlocked(at: now.timeIntervalSince1970)
     }
     private func refreshBackgroundIfNeeded(at date: Date, force: Bool = false) {
-        guard !backgroundReadRunning, !switcher.busy,
-              force || date.timeIntervalSince(lastBackgroundRead) >= 5 else { return }
+        pendingBackgroundRead = true
+        guard !backgroundReadRunning, !switcher.busy else { return }
+        backgroundRetry?.cancel()
+        let remaining = lastBackgroundRead.addingTimeInterval(5).timeIntervalSince(date)
+        if !force && remaining > 0 {
+            let retry = DispatchWorkItem { [weak self] in self?.drainPendingBackgroundRead() }
+            backgroundRetry = retry
+            DispatchQueue.main.asyncAfter(deadline: .now() + remaining, execute: retry)
+            return
+        }
+        pendingBackgroundRead = false
         backgroundReadRunning = true
         lastBackgroundRead = date
         Task { @MainActor in
             await switcher.refreshBackground()
             backgroundReadRunning = false
+            drainPendingBackgroundRead()
+            scheduleEvidenceExpiry()
         }
+    }
+    private func drainPendingBackgroundRead() {
+        guard pendingBackgroundRead else { return }
+        guard automatic || initializing else { pendingBackgroundRead = false; return }
+        refreshBackgroundIfNeeded(at: Date())
     }
     private func refreshEnvironmentIfNeeded() {
         guard !initializing else { return }
         let usableContext = currentDiagnosticContext()
         let busy = switcher.readingEnvironment || switcher.busy
-        guard environmentRefreshScheduler.claim(context: usableContext, now: Date(), switcherBusy: busy) != nil else {
+        guard environmentRefreshScheduler.claim(context: usableContext, now: Date(), switcherBusy: busy,
+              observedAt: snapshot?.proxy.map { Date(timeIntervalSince1970: $0.observedAt) }) != nil else {
             if case .rustCandidate? = BundledBackendVariant.current() {
                 LeakDiagnosticTrace.shared.schedule(kind: "dns", event: usableContext == nil ? "schedule_context_missing" : busy ? "schedule_busy" : "schedule_deferred")
             }
@@ -353,6 +409,7 @@ final class MonitorStore: ObservableObject {
         }
         Task { @MainActor [weak self] in
             guard let self else { return }
+            defer { self.scheduleEvidenceExpiry() }
             guard self.currentDiagnosticContext() == usableContext else {
                 self.environmentRefreshScheduler.complete(context: usableContext, accepted: false, now: Date())
                 return
@@ -365,7 +422,8 @@ final class MonitorStore: ObservableObject {
                 self.environmentRefreshScheduler.complete(context: usableContext, accepted: false, now: Date())
                 return
             }
-            self.environmentRefreshScheduler.complete(context: usableContext, accepted: accepted, now: Date())
+            self.environmentRefreshScheduler.complete(context: usableContext, accepted: accepted, now: Date(),
+                validUntil: self.switcher.currentEnvironment?.expires_at)
         }
     }
     private func context(from value: ProxySnapshot?) -> String? {
@@ -396,7 +454,8 @@ final class MonitorStore: ObservableObject {
     func finishInitialization() {
         // Preserve the exact receipts just checked; normal polling adopts them
         // instead of clearing or immediately recollecting all page data.
-        environmentRefreshScheduler.complete(context: currentDiagnosticContext(), accepted: true, now: Date())
+        environmentRefreshScheduler.complete(context: currentDiagnosticContext(), accepted: true, now: Date(),
+            validUntil: switcher.currentEnvironment?.expires_at)
         initializing = false
         referenceQueriesEnabled = true
     }
@@ -483,6 +542,7 @@ final class MonitorStore: ObservableObject {
             serverReferences.removeValue(forKey: oldest)
         }
         serverReferences[request.key] = value
+        scheduleEvidenceExpiry()
         // Only a still-current selected connection may capture this reference.
         // Late answers never mutate a historical path from an ended connection.
         rememberGraphPath()

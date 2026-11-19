@@ -4,10 +4,13 @@
 #![allow(dead_code)] // Also compiled by the engine's ordinary libtest target.
 #[path = "../../../watch-runtime/tests/support/hardened_helper.rs"]
 mod hardened_helper;
+#[path = "../../../watch-runtime/tests/support/published_events.rs"]
+mod published_events;
 
+use claude_watch_runtime::channel_supervisor::SupervisionEvent;
 use super::{
     channel_audit,
-    daemon_run::{assemble_production_channel_stack_with_vpn_reader, GuardObservation, ProductionChannelStack},
+    daemon_run::{assemble_production_channel_stack_with_vpn_reader, ProductionChannelStack},
     runtime::{self, OperationOutcome},
 };
 use claude_watch_core::{
@@ -191,14 +194,14 @@ fn step_fixture(stack: &mut ProductionChannelStack,
     let mut observations=Vec::new();
     if let Ok(round)=&round {
         let (egress,local_guard)=system.sample_guard_environment(&stack.enforcer,&families,round);
-        observations.push(GuardObservation::Environment { egress:json!({"families":egress}),local_guard,observed_at:now });
+        observations.push(SupervisionEvent::EnvironmentUpdated { egress:json!({"families":egress}),local_guard,observed_at:now });
     }
     for family in specs {
         let target=PolicyCatalog::guard_target(family).unwrap();
         observations.push(match round.as_ref().ok().and_then(|round|
             claude_watch_runtime::desktop_native::supervision_inventory(round,target.provider()).ok()) {
-            Some((desktops,processes))=>GuardObservation::Inventory { family:family.id.into(),desktops,processes,observed_at:now },
-            None=>GuardObservation::InventoryUnavailable { family:family.id.into(),observed_at:now },
+            Some((desktops,processes))=>SupervisionEvent::ProcessInventoryUpdated { family:family.id.into(),desktops,processes,observed_at:now },
+            None=>SupervisionEvent::ProcessInventoryUnavailable { family:family.id.into(),observed_at:now },
         });
     }
     stack.step_with_observations(observations,native::now())
@@ -343,7 +346,8 @@ pub fn run_contract() {
     assert!(output("compile production AppKit wrapper", Command::new("xcrun").args([
         "--sdk", "macosx", "swiftc", "-parse-as-library", "-target", "arm64-apple-macosx26.0", "-module-cache-path"
     ]).arg(root.0.join("swift-cache")).arg(repo.join("monitor/ControlledEntry/ControlledEntryApp.swift"))
-        .arg(repo.join("monitor/Sources/BoundedDiagnosticLog.swift")).arg("-o").arg(&wrapper_component).output().unwrap()).status.success());
+        .arg(repo.join("monitor/Sources/BoundedDiagnosticLog.swift"))
+        .arg(repo.join("monitor/Sources/MonitorPublicationObserver.swift")).arg("-o").arg(&wrapper_component).output().unwrap()).status.success());
     let hashes = ["watch-engine","watch-sandbox-launcher","watch-process-control","ControlledEntry"].into_iter()
         .map(|name| (name, sha256_file_hex(&runtime_dir.join(name)).unwrap())).collect::<std::collections::BTreeMap<_,_>>();
     plist(&runtime_dir.join("BuildInfo.plist"), &json!({"Architecture":"arm64","NetworkBackend":"seatbelt","RuntimeHashes":hashes,"RuntimeCDHashes":{"watch-sandbox-launcher":helper_cdhash}}));
@@ -397,7 +401,7 @@ pub fn run_contract() {
         move |req| {
             let until = Instant::now() + Duration::from_secs(3);
             while !release_audit.load(Ordering::Acquire) {
-                if Instant::now() >= until || req.cancellation.as_ref().is_some_and(|flag| flag.load(Ordering::Acquire)) {
+                if Instant::now() >= until || req.is_cancelled() {
                     return Err(CoreError::new("fixture_audit_cancelled", "等待夹具观察待验证状态超时"));
                 }
                 thread::sleep(Duration::from_millis(5));
@@ -532,7 +536,7 @@ pub fn run_contract() {
         };
         assert_eq!(pending.families["claude"].permit_state, ChannelPermitState::PendingVerification, "{pending:?}");
         assert!(sessions.load(native::now()).unwrap().is_none_or(|s| s.state == Phase::Ended));
-        stack.supervisor.drain_emitted_events();
+        let mut sequence = pending.snapshot_seq;
         audit_ready.store(true, Ordering::Release);
         // Wait for the worker's real result, then leave it queued while the
         // executor's deadline clock advances. No event or session is injected.
@@ -556,7 +560,10 @@ pub fn run_contract() {
         let mut refresh = None;
         let projection = loop {
             let snapshot = step_fixture(stack, &mut system).unwrap();
-            events.extend(stack.supervisor.drain_emitted_events());
+            if snapshot.snapshot_seq > sequence {
+                events.extend(published_events::after(&storage, sequence));
+                sequence = snapshot.snapshot_seq;
+            }
             let state = &snapshot.families["claude"];
             if refresh.is_none() {
                 if let Some(adoption) = events.iter().find(|event| event.family_state.family == "claude"

@@ -157,17 +157,30 @@ enum SnapshotProcessTransport {
     }
 
     private static func reap(_ pid: pid_t, until deadline: UInt64) -> ReapState {
-        var status: Int32 = 0
-        while true {
-            let result = waitpid(pid, &status, WNOHANG)
-            if result == pid { return .exited(status) }
-            if result == -1 {
-                if errno == EINTR { continue }
-                return .gone
+        func collect() -> ReapState {
+            var status: Int32 = 0
+            while true {
+                let result = waitpid(pid, &status, WNOHANG)
+                if result == pid { return .exited(status) }
+                if result == 0 { return .running }
+                if errno != EINTR { return .gone }
             }
-            if monotonicNow() >= deadline { return .running }
-            usleep(5_000)
         }
+        let initial = collect()
+        guard case .running = initial, monotonicNow() < deadline else { return initial }
+        let exited = DispatchSemaphore(value: 0)
+        let source = DispatchSource.makeProcessSource(identifier: pid, eventMask: .exit, queue: .global())
+        source.setEventHandler { exited.signal() }
+        // Recheck once the kernel watch is installed even if the child exited
+        // between the first waitpid and registration.
+        source.setRegistrationHandler { exited.signal() }
+        source.activate()
+        defer { source.cancel() }
+        while exited.wait(timeout: DispatchTime(uptimeNanoseconds: deadline)) == .success {
+            let state = collect()
+            guard case .running = state else { return state }
+        }
+        return .running
     }
 
     /// Signals only the direct, still-unreaped child. A PID is never signalled

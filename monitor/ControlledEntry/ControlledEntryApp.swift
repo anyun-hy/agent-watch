@@ -644,6 +644,59 @@ final class ControlledEntryDelegate: NSObject, NSApplicationDelegate {
         return code
     }
 
+    private func waitForVerifiedInstance() async -> (pid: pid_t, instanceId: String)? {
+        let deadline = DispatchTime.now() + .seconds(3)
+        let (changes, signal) = AsyncStream<Void>.makeStream(bufferingPolicy: .bufferingNewest(1))
+        let state = MonitorPublicationObserver(root: URL(fileURLWithPath: watchStateDir, isDirectory: true),
+            files: ["managed-launch-instances.json": .managedInstance, "seatbelt-runtime.json": .managedInstance]) { _ in
+                signal.yield(())
+            }
+        _ = state.start()
+        let workspace = NSWorkspace.shared.notificationCenter
+        let bundle = targetBundleId, executable = targetExecutable
+        let tokens = [NSWorkspace.didLaunchApplicationNotification, NSWorkspace.didTerminateApplicationNotification].map { name in
+            workspace.addObserver(forName: name, object: nil, queue: .main) { notice in
+                guard let app = notice.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication else { return }
+                if app.bundleIdentifier == bundle || app.executableURL?.resolvingSymlinksInPath().path == executable {
+                    signal.yield(())
+                }
+            }
+        }
+        var exits: [pid_t: DispatchSourceProcess] = [:]
+        let timeout = DispatchWorkItem { signal.finish() }
+        DispatchQueue.main.asyncAfter(deadline: deadline, execute: timeout)
+        defer {
+            withExtendedLifetime(state) {}
+            tokens.forEach(workspace.removeObserver)
+            exits.values.forEach { $0.cancel() }
+            timeout.cancel()
+            signal.finish()
+        }
+        signal.yield(()) // Check after subscribing, including a launch already completed.
+        for await _ in changes {
+            guard !Task.isCancelled, DispatchTime.now() < deadline else { break }
+            switch auditRunningInstances() {
+            case .verifiedManaged(let pid, let id):
+                return (pid, id)
+            case .noneRunning:
+                exits.values.forEach { $0.cancel() }
+                exits.removeAll()
+            case .unmanagedRunning(let pids):
+                // A non-AppKit process can also stop blocking this launch.
+                let current = Set(pids)
+                for pid in exits.keys.filter({ !current.contains($0) }) { exits.removeValue(forKey: pid)?.cancel() }
+                for pid in current where exits[pid] == nil {
+                    let exit = DispatchSource.makeProcessSource(identifier: pid, eventMask: .exit, queue: .main)
+                    exits[pid] = exit
+                    exit.setEventHandler { signal.yield(()) }
+                    exit.setRegistrationHandler { signal.yield(()) }
+                    exit.activate()
+                }
+            }
+        }
+        return nil
+    }
+
     @discardableResult
     private func handleInitialOrPendingAction(trigger: String, batch: EntryActionBatch) async -> Bool {
         switch auditRunningInstances() {
@@ -667,19 +720,9 @@ final class ControlledEntryDelegate: NSObject, NSApplicationDelegate {
                 return false
             }
             if !batch.urls.isEmpty || !batch.files.isEmpty {
-                let deadline = Date().addingTimeInterval(3.0)
-                while Date() < deadline {
-                    if case .verifiedManaged(let pid, let instanceId) = auditRunningInstances() {
-                        return await forwardItemsToVerifiedInstance(
-                            pid: pid,
-                            instanceId: instanceId,
-                            urls: batch.urls,
-                            files: batch.files
-                        )
-                    }
-                    try? await Task.sleep(nanoseconds: 50_000_000)
-                }
-                return false
+                guard let verified = await waitForVerifiedInstance() else { return false }
+                return await forwardItemsToVerifiedInstance(pid: verified.pid, instanceId: verified.instanceId,
+                                                           urls: batch.urls, files: batch.files)
             }
             return true
         }

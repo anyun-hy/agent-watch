@@ -133,7 +133,7 @@ impl Controller {
                     "message":"已启动并登记目标进程，联网状态以监管执行回执为准"}),
                 );
             }
-            system.wait(Duration::from_millis(200));
+            system.wait(deadline.saturating_sub(system.monotonic()));
         }
         Err(CoreError::new(
             "target_start_unconfirmed",

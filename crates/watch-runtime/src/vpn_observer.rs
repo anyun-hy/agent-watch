@@ -26,6 +26,7 @@ use url::Url;
 use uuid::Uuid;
 
 pub const DEFAULT_VPN_OBSERVATION_TTL_SECONDS: f64 = 3.5;
+pub const VPN_OBSERVATION_RENEWAL_LEAD_SECONDS: f64 = 1.2;
 /// Leave time for publication and consumption inside the unchanged evidence TTL.
 pub const VPN_OBSERVATION_BUDGET: Duration = Duration::from_millis(2500);
 pub const RULES_CACHE_TTL_SECONDS: f64 = 5.0;
@@ -117,7 +118,7 @@ impl VpnObservationState {
                 if now.is_finite()
                     && cached.cached_at.is_finite()
                     && now >= cached.cached_at
-                    && (now - cached.cached_at) < RULES_CACHE_TTL_SECONDS =>
+                    && now + VPN_OBSERVATION_RENEWAL_LEAD_SECONDS < cached.cached_at + RULES_CACHE_TTL_SECONDS =>
             {
                 if let Some(ref prev) = self.current {
                     if prev.source_instance != cached.source_instance
@@ -134,21 +135,6 @@ impl VpnObservationState {
 
     pub fn invalidate_rules_cache(&mut self) {
         self.cached_rules_digest = None;
-    }
-
-    /// Touches an existing healthy observation if still fresh and valid,
-    /// advancing sample_seq, observed_at, and valid_until without rotating epoch.
-    pub fn touch_liveness(&mut self, now: f64) -> Option<VpnObservation> {
-        let obs = self.current.as_mut()?;
-        if !Self::healthy(obs) {
-            return None;
-        }
-        self.last_sample_seq = self.last_sample_seq.saturating_add(1);
-        obs.sample_seq = self.last_sample_seq;
-        obs.sample_started_at = now;
-        obs.observed_at = now;
-        obs.valid_until = now + DEFAULT_VPN_OBSERVATION_TTL_SECONDS;
-        Some(obs.clone())
     }
 
     /// Marks the current VPN observation as invalidated due to a network change,
@@ -313,6 +299,7 @@ impl VpnObservationState {
             if let Some(ref cached) = self.cached_rules_digest {
                 if now >= cached.cached_at && (now - cached.cached_at) < RULES_CACHE_TTL_SECONDS {
                     sample.rules_digest = ObservedField::Known(cached.digest.clone());
+                    sample.valid_until = sample.valid_until.min(cached.cached_at + RULES_CACHE_TTL_SECONDS);
                 }
             } else if source_identity_changed {
                 sample.rules_digest =
@@ -523,20 +510,25 @@ impl HttpControllerVpnReader {
         None
     }
 
-    fn bind_snapshot_owner(&self, snapshot: &KernelListenerSnapshot, upstream: Option<&str>) -> Option<(u16, u32, u64, u32)> {
-        let mut ports = Vec::new();
+    fn listener_owners(&self, snapshot: &KernelListenerSnapshot, upstream: Option<&str>) -> Vec<(u16, Option<ListenerOwner>)> {
+        let mut owners = Vec::new();
         for endpoint in [Some(self.client.base().as_str()), upstream].into_iter().flatten() {
-            let url = Url::parse(endpoint).ok()?;
-            if url.host_str().is_some_and(is_loopback_host) {
-                if let Some(port) = url.port() { if !ports.contains(&port) { ports.push(port); } }
-            }
+            let Some(port) = Url::parse(endpoint).ok().filter(|url| url.host_str().is_some_and(is_loopback_host))
+                .and_then(|url| url.port()) else { continue };
+            if owners.iter().any(|(previous, _)| *previous == port) { continue; }
+            let owner = kernel_listener_owner(&snapshot.evidence, port).and_then(|pid| {
+                let (seconds, micros) = claude_watch_system::process_start_time_any_user(pid)?;
+                Some((pid, seconds, micros))
+            });
+            owners.push((port, owner));
         }
-        for port in ports {
-            let Some(pid) = kernel_listener_owner(&snapshot.evidence, port) else { continue };
-            let Some((seconds, micros)) = claude_watch_system::process_start_time_any_user(pid) else { continue };
-            return Some((port, pid, seconds, micros));
-        }
-        None
+        owners
+    }
+
+    fn bind_snapshot_owner(&self, snapshot: &KernelListenerSnapshot, upstream: Option<&str>) -> Option<(u16, u32, u64, u32)> {
+        self.listener_owners(snapshot, upstream).into_iter().find_map(|(port, owner)| {
+            owner.map(|(pid, seconds, micros)| (port, pid, seconds, micros))
+        })
     }
 
     fn verify_snapshot_pair(
@@ -702,14 +694,8 @@ fn read_kernel_listeners_checked<R: ReadRunner + ?Sized>(runner: &R, timeout: Du
     })
 }
 
-/// Resolves read-only Clash/Mihomo controller credentials from the user's local VPN config files
-/// without modifying any VPN/TAG configuration.
-pub fn resolve_vpn_controller_credentials(
-    storage: &StateStore,
-    proxy_mode: &str,
-) -> claude_watch_core::error::Result<claude_watch_core::tag_config::Credentials> {
-    let home = &storage.paths.home;
-    let candidates = match proxy_mode {
+pub fn vpn_controller_config_paths(home: &std::path::Path, proxy_mode: &str) -> Vec<std::path::PathBuf> {
+    match proxy_mode {
         "tag" => vec![
             home.join("Library/Application Support/com.tag.lab.v2/config.yaml"),
             home.join("Library/Application Support/com.tag.lab.v2/verge.yaml"),
@@ -731,7 +717,17 @@ pub fn resolve_vpn_controller_credentials(
             home.join(".config/clash/config.yaml"),
             home.join(".config/mihomo/config.yaml"),
         ],
-    };
+    }
+}
+
+/// Resolves read-only Clash/Mihomo controller credentials from the user's local VPN config files
+/// without modifying any VPN/TAG configuration.
+pub fn resolve_vpn_controller_credentials(
+    storage: &StateStore,
+    proxy_mode: &str,
+) -> claude_watch_core::error::Result<claude_watch_core::tag_config::Credentials> {
+    let home = &storage.paths.home;
+    let candidates = vpn_controller_config_paths(home, proxy_mode);
     let uid = claude_watch_system::effective_uid();
     let socket_candidates = vec![
         std::path::PathBuf::from(format!("/var/run/tag-service/users/{uid}/tag-mihomo.sock")),
@@ -903,7 +899,7 @@ impl VpnSourceReader for HttpControllerVpnReader {
         self.read_observation_with_probes(
             expectation, include_rules, sample_seq, epoch, now,
             self.listener_owner_probe.as_deref().map(|probe| probe as &dyn Fn(u16, Duration) -> Option<u32>),
-            self.listener_snapshot_probe.as_deref().map(|probe| probe as &dyn Fn(Duration) -> Result<KernelListenerSnapshot>),
+            self.listener_snapshot_probe.as_deref().map(|probe| probe as &dyn Fn(Duration) -> Result<KernelListenerSnapshot>), None,
         )
     }
 }
@@ -916,7 +912,7 @@ impl HttpControllerVpnReader {
         epoch: VpnEpoch, now: f64, probe: &dyn Fn(Duration) -> Option<KernelListenerSnapshot>,
     ) -> VpnObservation {
         self.read_observation_with_probes(expectation, include_rules, sample_seq, epoch, now, None,
-            Some(&|timeout| probe(timeout).ok_or_else(|| CoreError::new("vpn_listener_unavailable", "系统监听采样不可用"))))
+            Some(&|timeout| probe(timeout).ok_or_else(|| CoreError::new("vpn_listener_unavailable", "系统监听采样不可用"))), None)
     }
 
     fn read_observation_with_probes(
@@ -928,8 +924,9 @@ impl HttpControllerVpnReader {
         now: f64,
         probe: Option<&dyn Fn(u16, Duration) -> Option<u32>>,
         snapshot_probe: Option<&dyn Fn(Duration) -> Result<KernelListenerSnapshot>>,
+        prefetched: Option<(Instant, KernelListenerSnapshot)>,
     ) -> VpnObservation {
-        let started = Instant::now();
+        let started = prefetched.as_ref().map_or_else(Instant::now, |(start, _)| *start);
         let deadline = started + VPN_OBSERVATION_BUDGET;
         let parsed_proxy = normalize_loopback_http_endpoint(&expectation.proxy_url)
             .and_then(|u| Url::parse(&u).ok());
@@ -939,11 +936,12 @@ impl HttpControllerVpnReader {
             .unwrap_or_else(|| "127.0.0.1".into());
         let expected_port = parsed_proxy.as_ref().and_then(Url::port);
 
-        let before_result = snapshot_probe.map(|probe| probe(deadline.saturating_duration_since(Instant::now())));
+        let before_result = prefetched.map(|(_, frame)| Ok(frame))
+            .or_else(|| snapshot_probe.map(|probe| probe(deadline.saturating_duration_since(Instant::now()))));
         let before_listener = before_result.as_ref().and_then(|result| result.as_ref().ok());
-        let before_owner = before_listener.as_ref().and_then(|snapshot| {
-            self.bind_snapshot_owner(snapshot, Some(&expectation.proxy_url))
-        });
+        let before_owners = before_listener.map(|snapshot| self.listener_owners(snapshot, Some(&expectation.proxy_url)));
+        let before_owner = before_owners.as_ref().and_then(|owners| owners.iter()
+            .find_map(|(port, owner)| owner.map(|(pid, seconds, micros)| (*port, pid, seconds, micros))));
 
         let pre_sys_proxy = if let Some(ref ov) = self.system_proxy_override {
             Some(ov.clone())
@@ -972,6 +970,10 @@ impl HttpControllerVpnReader {
                         .or_else(|| after.as_ref().and_then(|result| result.as_ref().err()));
                     let verified = match failure {
                         Some(error) => Err(error.code.clone()),
+                        None if after.as_ref().and_then(|result| result.as_ref().ok()).is_some_and(|frame|
+                            before_owners.as_ref().is_some_and(|owners|
+                                *owners != self.listener_owners(frame, Some(&expectation.proxy_url)))) =>
+                            Err("vpn_listener_owner_changed_during_sample".into()),
                         None => self.verify_snapshot_pair(before_listener, before_owner,
                             after.as_ref().and_then(|result| result.as_ref().ok()), snap.upstream_endpoint.as_deref(),
                             now + started.elapsed().as_secs_f64()),
@@ -1082,15 +1084,28 @@ impl HttpControllerVpnReader {
     }
 }
 
+type ListenerOwner = (u32, u64, u32);
+
+struct VpnListenerFrame {
+    origin: Option<String>,
+    sequence: Option<u64>,
+    captured_at: f64,
+    owners: Vec<(u16, Option<ListenerOwner>)>,
+}
+
 pub struct VpnObserver {
     pub state: VpnObservationState,
     pub storage: Option<StateStore>,
+    listener_frame: Option<VpnListenerFrame>,
+    listener_not_before: Option<f64>,
 }
 
 impl VpnObserver {
     pub fn new(observer_boot_id: impl Into<String>, storage: Option<StateStore>) -> Self {
         Self {
             state: VpnObservationState::new(observer_boot_id),
+            listener_frame: None,
+            listener_not_before: None,
             storage,
         }
     }
@@ -1111,6 +1126,80 @@ impl VpnObserver {
         Ok(transition)
     }
 
+    /// An authenticated frame wakes the observer. Only owner/source changes, recovery,
+    /// explicit invalidation or the existing evidence deadline need controller reads.
+    pub fn observe_listener_event(
+        &mut self, reader: &HttpControllerVpnReader, expectation: &VpnExpectation,
+        refresh: bool, now: f64, mut collector_loss: impl FnMut() -> Option<CoreError>,
+        mut publish: impl FnMut(&VpnObservation) -> Result<()>,
+    ) -> Result<()> {
+        let started = Instant::now();
+        let probe = reader.listener_snapshot_probe.as_deref()
+            .ok_or_else(|| CoreError::new("vpn_listener_unavailable", "缺少监听证据来源"))?;
+        let frame = probe(VPN_OBSERVATION_BUDGET)?;
+        let received = now + started.elapsed().as_secs_f64();
+        if !frame.captured_at.is_finite() || frame.captured_at <= 0.0
+            || frame.captured_at > received + CLOCK_ROLLBACK_TOLERANCE_SECONDS
+            || frame.captured_at + DEFAULT_VPN_OBSERVATION_TTL_SECONDS <= received {
+            return Err(CoreError::new("vpn_listener_snapshot_stale", "监听证据已过期"));
+        }
+        if self.listener_not_before.is_some_and(|boundary| frame.captured_at < boundary) {
+            // A file/network/wake event already withdrew this evidence. Wait for
+            // the collector to supply a frame captured on the new side of it.
+            return Ok(());
+        }
+        let owners = reader.listener_owners(&frame, Some(&expectation.proxy_url));
+        if owners.iter().all(|(_, owner)| owner.is_none()) {
+            return Err(CoreError::new("vpn_listener_owner_unavailable", "无法确认监听进程身份"));
+        }
+        let mut changed = false;
+        if let Some(previous) = &self.listener_frame {
+            let same_origin = previous.origin == frame.origin_id;
+            let same_ports = owners.iter().map(|(port, _)| port).eq(previous.owners.iter().map(|(port, _)| port));
+            if same_origin && previous.sequence.zip(frame.sequence).is_some_and(|(old, new)| {
+                new < old || (frame.captured_at < previous.captured_at
+                    && previous.captured_at <= received + CLOCK_ROLLBACK_TOLERANCE_SECONDS)
+                    || (new == old && (frame.captured_at != previous.captured_at || (same_ports && owners != previous.owners)))
+            }) {
+                return Err(CoreError::new("vpn_listener_snapshot_out_of_order", "监听证据顺序无效"));
+            }
+            changed = !same_origin || owners != previous.owners;
+        }
+        self.listener_frame = Some(VpnListenerFrame {
+            origin: frame.origin_id.clone(), sequence: frame.sequence, captured_at: frame.captured_at, owners,
+        });
+        if changed && self.state.current_observation().is_some_and(VpnObservationState::healthy) {
+            publish(&self.handle_invalidation_event("vpn_listener_identity_changed", expectation, received).observation)?;
+        } else if !refresh && self.state.current_observation()
+            .is_some_and(|obs| VpnObservationState::healthy(obs) && obs.is_fresh(received)) {
+            return Ok(());
+        }
+        let sample = reader.read_observation_with_probes(expectation, self.state.needs_rules_refresh(expectation, now),
+            self.state.last_sample_seq().saturating_add(1), self.state.current_epoch(), now, None,
+            Some(probe), Some((started, frame)));
+        // A complete frame and a failure can arrive while HTTP is outstanding.
+        // Consume the sticky failure before accepting or persisting the result.
+        if let Some(error) = collector_loss() { return Err(error); }
+        let received = now + started.elapsed().as_secs_f64();
+        let transition = self.state.apply_sample(sample, expectation, received)?;
+        publish(&transition.observation)?;
+        self.persist_observation(&transition.observation);
+        Ok(())
+    }
+
+    pub fn invalidate_network_event(&mut self, reason: &str, expectation: &VpnExpectation, now: f64) -> Option<VpnObservation> {
+        self.listener_not_before = Some(now);
+        self.invalidate_if_changed(reason, expectation, now)
+    }
+
+    pub fn invalidate_if_changed(&mut self, reason: &str, expectation: &VpnExpectation, now: f64) -> Option<VpnObservation> {
+        if self.state.current_observation().is_some_and(|obs| obs.source_error.as_deref() == Some(reason)
+            && obs.source_instance.is_none()) {
+            return None;
+        }
+        Some(self.handle_invalidation_event(reason, expectation, now).observation)
+    }
+
     pub fn handle_invalidation_event(
         &mut self,
         reason: impl Into<String>,
@@ -1122,38 +1211,6 @@ impl VpnObserver {
         transition
     }
 
-    pub fn touch_liveness(&mut self, now: f64) -> Option<VpnObservation> {
-        let obs = self.state.touch_liveness(now)?;
-        self.persist_observation(&obs);
-        Some(obs)
-    }
-
-    pub fn is_observation_liveness_intact(&self, creds: Option<&Credentials>) -> bool {
-        let Some(obs) = self.state.current_observation() else {
-            return false;
-        };
-        if !VpnObservationState::healthy(obs) {
-            return false;
-        }
-        if let Some(ref inst) = obs.source_instance {
-            if let Some((pid, sec, mic)) = parse_source_instance_pid(inst) {
-                if !verify_proxy_pid_alive(pid, (sec, mic)) {
-                    return false;
-                }
-            } else {
-                return false;
-            }
-        } else {
-            return false;
-        }
-        if let Some(creds) = creds {
-            if !check_controller_liveness(creds) {
-                return false;
-            }
-        }
-        true
-    }
-
     fn persist_observation(&self, observation: &VpnObservation) {
         if let Some(ref store) = self.storage {
             if let Ok(val) = serde_json::to_value(observation) {
@@ -1162,33 +1219,6 @@ impl VpnObserver {
             }
         }
     }
-}
-
-pub fn parse_source_instance_pid(instance: &str) -> Option<(u32, u64, u32)> {
-    let mut parts = instance.split(':');
-    if parts.next()? != "pid" {
-        return None;
-    }
-    let pid = parts.next()?.parse::<u32>().ok()?;
-    let seconds = parts.next()?.parse::<u64>().ok()?;
-    let micros = parts.next()?.parse::<u32>().ok()?;
-    Some((pid, seconds, micros))
-}
-
-pub fn verify_proxy_pid_alive(pid: u32, expected_start: (u64, u32)) -> bool {
-    if pid <= 1 {
-        return false;
-    }
-    claude_watch_system::process_start_time_any_user(pid) == Some(expected_start)
-}
-
-pub fn check_controller_liveness(creds: &Credentials) -> bool {
-    if let Some(sock) = creds.unix_socket() {
-        if sock.exists() && std::os::unix::net::UnixStream::connect(sock).is_ok() {
-            return true;
-        }
-    }
-    std::net::TcpStream::connect_timeout(&creds.endpoint(), Duration::from_millis(100)).is_ok()
 }
 
 #[cfg(test)]

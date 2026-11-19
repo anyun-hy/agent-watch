@@ -132,6 +132,9 @@ enum AIProcessInventory {
         guard flags >= 0, fcntl(descriptor, F_SETFL, flags | O_NONBLOCK) >= 0 else {
             throw AIProcessInventoryFailure.readFailed
         }
+        let exited = DispatchGroup()
+        exited.enter()
+        task.terminationHandler = { _ in exited.leave() }
         try task.run()
         try? pipe.fileHandleForWriting.close()
         defer {
@@ -139,6 +142,18 @@ enum AIProcessInventory {
             if task.isRunning { _ = Darwin.kill(task.processIdentifier, SIGKILL) }
             task.waitUntilExit()
             try? handle.close()
+        }
+        func waitForPipe(_ descriptor: Int32, _ events: Int16) throws {
+            var interest = pollfd(fd: descriptor, events: events, revents: 0)
+            while true {
+                let remaining = deadline - ProcessInfo.processInfo.systemUptime
+                guard remaining > 0 else { throw AIProcessInventoryFailure.timeout }
+                let milliseconds = Int32(min(Double(Int32.max), ceil(remaining * 1_000)))
+                let ready = poll(&interest, 1, milliseconds)
+                if ready > 0 { return }
+                if ready == 0 { throw AIProcessInventoryFailure.timeout }
+                if errno != EINTR { throw AIProcessInventoryFailure.readFailed }
+            }
         }
         if let input, let inputPipe {
             let writer = inputPipe.fileHandleForWriting
@@ -152,35 +167,29 @@ enum AIProcessInventory {
                 guard ProcessInfo.processInfo.systemUptime < deadline else { throw AIProcessInventoryFailure.timeout }
                 let count = input.withUnsafeBytes { Darwin.write(fd, $0.baseAddress!.advanced(by: sent), input.count - sent) }
                 if count > 0 { sent += count; continue }
-                guard count < 0 && (errno == EAGAIN || errno == EINTR) else { throw AIProcessInventoryFailure.readFailed }
-                var writable = pollfd(fd: fd, events: Int16(POLLOUT), revents: 0)
-                _ = poll(&writable, 1, 20)
+                if count < 0 && errno == EINTR { continue }
+                guard count < 0 && errno == EAGAIN else { throw AIProcessInventoryFailure.readFailed }
+                try waitForPipe(fd, Int16(POLLOUT))
             }
         }
         var data = Data(), buffer = [UInt8](repeating: 0, count: 65_536)
-        var eof = false
-        while !eof || task.isRunning {
+        while true {
             guard ProcessInfo.processInfo.systemUptime < deadline else {
                 throw AIProcessInventoryFailure.timeout
             }
-            if !eof {
-                let count = buffer.withUnsafeMutableBytes { Darwin.read(descriptor, $0.baseAddress, $0.count) }
-                if count > 0 {
-                    guard data.count + count <= maxBytes else { throw AIProcessInventoryFailure.outputTooLarge }
-                    data.append(contentsOf: buffer.prefix(count))
-                    continue
-                }
-                if count == 0 { eof = true }
-                else if errno != EAGAIN && errno != EINTR { throw AIProcessInventoryFailure.readFailed }
+            let count = buffer.withUnsafeMutableBytes { Darwin.read(descriptor, $0.baseAddress, $0.count) }
+            if count > 0 {
+                guard data.count + count <= maxBytes else { throw AIProcessInventoryFailure.outputTooLarge }
+                data.append(contentsOf: buffer.prefix(count))
+                continue
             }
-            if eof && !task.isRunning { break }
-            var pollfd = pollfd(fd: eof ? -1 : descriptor, events: Int16(POLLIN), revents: 0)
-            let remaining = max(1, min(100, Int((deadline - ProcessInfo.processInfo.systemUptime) * 1_000)))
-            if poll(&pollfd, 1, Int32(remaining)) < 0 && errno != EINTR {
-                throw AIProcessInventoryFailure.readFailed
-            }
+            if count == 0 { break }
+            if errno == EINTR { continue }
+            guard errno == EAGAIN else { throw AIProcessInventoryFailure.readFailed }
+            try waitForPipe(descriptor, Int16(POLLIN))
         }
-        task.waitUntilExit()
+        let remaining = max(0, deadline - ProcessInfo.processInfo.systemUptime)
+        guard exited.wait(timeout: .now() + remaining) == .success else { throw AIProcessInventoryFailure.timeout }
         guard task.terminationStatus == 0 else { throw AIProcessInventoryFailure.commandFailed }
         return data
     }

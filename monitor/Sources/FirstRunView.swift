@@ -24,7 +24,6 @@ struct FirstRunView: View {
     @State private var showingReport = false
     @State private var showingPolicyDetails = false
     @State private var lastPresentedApproval: String?
-    private let clock = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
 
     init(store: MonitorStore, initialization: FirstRunInitialization) {
         self.store = store; self.initialization = initialization; self.switcher = store.switcher
@@ -86,8 +85,8 @@ struct FirstRunView: View {
                     Surface(p) {
                         VStack(alignment: .leading, spacing: 8) {
                             Text("当前保护后台核对").font(WatchTypography.section)
-                            TimelineView(.periodic(from: .now, by: 1)) { context in
-                                let now = context.date.timeIntervalSince1970
+                            Group {
+                                let now = max(Date(), store.now).timeIntervalSince1970
                                 let background = switcher.background
                                 let ready = FirstRunChecks.backendEvidenceIsCurrent(background, error: switcher.backgroundError, now: now)
                                     && background?.services.first(where: { $0.id == "guard" }).map { $0.healthy && $0.desired == true } == true
@@ -119,12 +118,16 @@ struct FirstRunView: View {
             else { presentApprovalIfNeeded() }
         }
         .onAppear { presentApprovalIfNeeded() }
-        .onReceive(clock) { now in
-            initialization.refreshReadiness(at: now)
-            Task { await initialization.pollAccessibility(at: now) }
+        .onChange(of: store.now) { initialization.refreshReadiness() }
+        .onChange(of: switcher.background?.observed_at) { initialization.refreshReadiness() }
+        .task(id: initialization.nextReadinessDeadline) {
+            guard let deadline = initialization.nextReadinessDeadline else { return }
+            do { try await Task.sleep(for: .seconds(max(0, deadline.timeIntervalSinceNow))) } catch { return }
+            guard !Task.isCancelled else { return }
+            initialization.refreshReadiness()
         }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
-            Task { await initialization.recheckAuthorization() }
+            Task { await initialization.returnedFromAccessibilitySettings() }
         }
         .sheet(item: $showingApproval) { request in authorization(request) }
         .sheet(isPresented: $showingReport) { report }
@@ -192,11 +195,9 @@ struct FirstRunView: View {
             Spacer()
             Button("重新检查") { Task { await initialization.retry() } }
                 .frame(minHeight: 44).disabled(initialization.running)
-            TimelineView(.periodic(from: .now, by: 1)) { context in
-                Button("进入 Claude Watch") { Task { await initialization.enter() } }
-                    .buttonStyle(.borderedProminent).tint(p.mint).frame(minHeight: 44)
-                    .disabled(!initialization.canEnter(at: context.date.timeIntervalSince1970))
-            }
+            Button("进入 Claude Watch") { Task { await initialization.enter() } }
+                .buttonStyle(.borderedProminent).tint(p.mint).frame(minHeight: 44)
+                .disabled(!initialization.canEnter(at: Date().timeIntervalSince1970))
         }.padding(.horizontal, 32).padding(.vertical, 12).background(p.surface)
             .overlay(alignment: .top) { Divider() }
     }
@@ -216,7 +217,7 @@ struct FirstRunView: View {
                 .font(WatchTypography.caption).foregroundStyle(p.secondary)
             HStack {
                 Button(request.action == .accessibility ? "暂不授权" : "暂不应用") {
-                    if request.action == .accessibility { initialization.stopAccessibilityPolling() }
+                    if request.action == .accessibility { initialization.cancelAccessibilityWait() }
                     showingApproval = nil
                 }.frame(minHeight: 44)
                 Spacer()

@@ -6,6 +6,9 @@ enum GraphLaunchTarget: Equatable {
     init(product: MonitoredProduct) {
         self = product == .claude ? .claude : .chatgpt
     }
+    func hasRunningDesktop(in presence: WorkspaceDesktopPresence) -> Bool {
+        presence.contains(bundle: self == .claude ? "com.anthropic.claudefordesktop" : "com.openai.chat")
+    }
     var title: String { self == .claude ? "Claude" : "ChatGPT" }
     var arguments: [String] {
         self == .claude ? ["launch", "--apply"] : ["launch", "--target", "chatgpt-desktop", "--apply"]
@@ -47,23 +50,6 @@ enum GraphLaunchTarget: Equatable {
     }
 }
 
-@MainActor
-func isExternalRunningUnmanaged(product: MonitoredProduct, monitor: MonitorStore, switcher: SwitcherStore, at now: Date) -> Bool {
-    let target = GraphLaunchTarget(product: product)
-    let running: Bool
-    if monitor.desktopRunning[product] == true {
-        running = true
-    } else {
-        let sampleTime = switcher.isFixture ? monitor.now.timeIntervalSince1970 : now.timeIntervalSince1970
-        running = monitor.error == nil && (monitor.snapshot?.health.state == "running") &&
-            MonitorSnapshotTiming.isCurrent(capturedAt: monitor.snapshot?.capturedAt ?? 0, now: sampleTime) &&
-            target.hasRunningDesktop(in: monitor.snapshot?.processes ?? [])
-    }
-    guard running else { return false }
-    let channel = monitor.channelState(for: product)
-    return (channel?.managedMemberCount ?? 0) == 0
-}
-
 struct GraphLaunchButton: View {
     let product: MonitoredProduct
     @ObservedObject var monitor: MonitorStore
@@ -77,9 +63,9 @@ struct GraphLaunchButton: View {
     @State private var showingResult = false
 
     var body: some View {
-        TimelineView(.periodic(from: .now, by: 1)) { context in
+        Group {
             let target = GraphLaunchTarget(product: product)
-            let reason = buttonBlockReason(for: target, at: context.date)
+            let reason = buttonBlockReason(for: target, at: monitor.now)
             let isEnabled = reason == nil && !switcher.busy && !processControl.busy
             Button {
                 pending = target
@@ -115,22 +101,16 @@ struct GraphLaunchButton: View {
     private func buttonBlockReason(for target: GraphLaunchTarget, at now: Date) -> String? {
         if processControl.busy { return "正在核对或关闭进程，请稍后再启动。" }
         if let reason = target.capabilityBlockReason(store: switcher) { return reason }
-        let product: MonitoredProduct = target == .claude ? .claude : .openAI
-        let unmanaged = isExternalRunningUnmanaged(product: product, monitor: monitor, switcher: switcher, at: now)
-        if monitor.desktopRunning[product] == true {
-            return unmanaged
-                ? "\(target.title) 已在运行（未接入受控网关沙箱）。"
-                : "\(target.title) 已在受控运行。"
+        let running: Bool
+        if let presence = monitor.desktopPresence {
+            running = target.hasRunningDesktop(in: presence)
+        } else {
+            let sampleTime = switcher.isFixture ? monitor.now : now
+            running = monitor.error == nil && monitor.snapshot.map { snapshot in
+                snapshot.health.state == "running" && MonitorSnapshotTiming.isCurrent(capturedAt: snapshot.capturedAt, now: sampleTime.timeIntervalSince1970) && target.hasRunningDesktop(in: snapshot.processes)
+            } == true
         }
-        let sampleTime = switcher.isFixture ? monitor.now.timeIntervalSince1970 : now.timeIntervalSince1970
-        if monitor.error == nil, let snapshot = monitor.snapshot,
-           snapshot.health.state == "running",
-           MonitorSnapshotTiming.isCurrent(capturedAt: snapshot.capturedAt, now: sampleTime),
-           target.hasRunningDesktop(in: snapshot.processes) {
-            return unmanaged
-                ? "\(target.title) 已在运行（未接入受控网关沙箱）。"
-                : "\(target.title) 已在受控运行。"
-        }
+        if running { return "\(target.title) 已在运行；保护范围请以通道回执为准。" }
         return nil
     }
 
@@ -156,7 +136,7 @@ struct GraphLaunchButton: View {
         resultMessage = switcher.message.isEmpty ? switcher.auditOperationMessage : switcher.message
         if resultMessage.isEmpty { resultMessage = "未取得启动结果，请查看环境状态。" }
         showingResult = true
-        if !switcher.isFixture { monitor.refresh(full: true, manual: true) }
+        if !switcher.isFixture { monitor.refresh(manual: true) }
     }
 }
 

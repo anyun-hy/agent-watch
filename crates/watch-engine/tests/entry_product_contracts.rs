@@ -294,6 +294,7 @@ fn v2_product_entry_uses_selected_source_and_native_component_with_no_system_wri
         .arg(root.0.join("swift-cache"))
         .arg(repo.join("monitor/ControlledEntry/ControlledEntryApp.swift"))
         .arg(repo.join("monitor/Sources/BoundedDiagnosticLog.swift"))
+        .arg(repo.join("monitor/Sources/MonitorPublicationObserver.swift"))
         .arg("-o")
         .arg(&wrapper_component)
         .output()

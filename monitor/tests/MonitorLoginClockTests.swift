@@ -11,10 +11,10 @@ struct MonitorLoginClockTests {
         let monitor = MonitorStore()
         monitor.automatic = false
         let tick = Date(timeIntervalSince1970: 1_792_900_000)
-        monitor.monitorTick(at: tick)
+        monitor.advanceClock(at: tick)
         expect(monitor.switcher.loginClock == tick, "disabled automatic refresh still advances login freshness clock")
-        monitor.monitorTick(at: tick.addingTimeInterval(2))
-        expect(monitor.switcher.loginClock == tick.addingTimeInterval(2), "each timer tick advances login clock without AX work")
+        monitor.advanceClock(at: tick.addingTimeInterval(2))
+        expect(monitor.switcher.loginClock == tick.addingTimeInterval(2), "each clock event advances login clock without AX work")
         let denied = WatchNotificationAccess.classify(.denied, alert: .disabled, style: .none)
         expect(denied == .denied && WatchNotificationAccess.summary(mode: "开启", access: denied).contains("系统未授权"),
                "enabled Watch alerts do not imply system notification permission")

@@ -616,9 +616,9 @@ impl SystemRunner {
     pub fn listener_channel_finished(&self) -> bool {
         self.listeners.as_ref().is_some_and(|s| s.is_finished())
     }
-    pub fn start_listener_publisher(self: &std::sync::Arc<Self>, store: crate::storage::StateStore,
-        stop: std::sync::Arc<std::sync::atomic::AtomicBool>) -> Result<Option<crate::native_listener::ListenerCachePublisher>> {
-        self.listeners.as_ref().map(|stream| stream.start_publisher(store, self.clone(), stop)).transpose()
+    pub fn start_listener_publisher(self: &std::sync::Arc<Self>, store: crate::storage::StateStore)
+        -> Result<Option<crate::native_listener::ListenerCachePublisher>> {
+        self.listeners.as_ref().map(|stream| stream.start_publisher(store, self.clone())).transpose()
     }
     fn reap_or_block(&self, key: Key) -> Result<()> {
         let mut pending = self

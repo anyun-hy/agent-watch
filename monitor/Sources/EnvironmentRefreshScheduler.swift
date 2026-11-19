@@ -8,24 +8,30 @@ struct EnvironmentRefreshScheduler {
     private(set) var stableContext: String?
     private var candidateContext: String?
     private var consecutiveCandidateCount = 0
-    private var lastSuccess: Date?
+    private var candidateSample: Date?
+    private var expiresAt: Date?
+    var nextCheck: Date? { inFlight ? nil : retryAfter ?? expiresAt }
     private var retryAfter: Date?
     private var failures = 0
     private(set) var inFlight = false
     var isInFlight: Bool { inFlight }
 
     mutating func requestRefresh() {
-        lastSuccess = nil
+        expiresAt = nil
     }
 
-    mutating func claim(context: String?, now: Date, switcherBusy: Bool) -> Trigger? {
+    mutating func claim(context: String?, now: Date, switcherBusy: Bool, observedAt: Date? = nil) -> Trigger? {
         guard !inFlight, !switcherBusy else { return nil }
         guard let context, !context.isEmpty else {
-            candidateContext = nil; consecutiveCandidateCount = 0
+            candidateContext = nil; candidateSample = nil; consecutiveCandidateCount = 0
             return nil
         }
-        if context == candidateContext { consecutiveCandidateCount += 1 }
-        else { candidateContext = context; consecutiveCandidateCount = 1 }
+        let sample = observedAt ?? now
+        if context != candidateContext {
+            candidateContext = context; candidateSample = sample; consecutiveCandidateCount = 1
+        } else if candidateSample.map({ sample > $0 }) ?? true {
+            candidateSample = sample; consecutiveCandidateCount = 2
+        }
         guard consecutiveCandidateCount >= 2 else { return nil }
         let trigger: Trigger
         if let retryAfter {
@@ -33,13 +39,13 @@ struct EnvironmentRefreshScheduler {
             trigger = .retry
         } else if stableContext == nil { trigger = .initial }
         else if stableContext != context { trigger = .changed }
-        else if lastSuccess.map({ now.timeIntervalSince($0) >= Self.interval }) ?? true { trigger = .interval }
+        else if expiresAt.map({ now >= $0 }) ?? true { trigger = .interval }
         else { return nil }
         inFlight = true
         return trigger
     }
 
-    mutating func complete(context: String?, accepted: Bool, now: Date) {
+    mutating func complete(context: String?, accepted: Bool, now: Date, validUntil: Double? = nil) {
         inFlight = false
         guard accepted, let context, !context.isEmpty else {
             failures += 1
@@ -49,7 +55,7 @@ struct EnvironmentRefreshScheduler {
         stableContext = context
         candidateContext = context
         consecutiveCandidateCount = max(consecutiveCandidateCount, 2)
-        lastSuccess = now
+        expiresAt = validUntil.flatMap { $0.isFinite ? Date(timeIntervalSince1970: $0) : nil } ?? now.addingTimeInterval(Self.interval)
         retryAfter = nil
         failures = 0
     }

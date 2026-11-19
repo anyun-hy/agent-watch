@@ -121,6 +121,7 @@ pub struct SnapshotPublisher<R: ReadRunner> {
     sampler: Sampler<R>,
     producer: Identity,
     last_network: Option<(std::time::Instant, Vec<Target>, Value, bool)>,
+    proxy_pending_write: bool,
     last_network_retry: Option<std::time::Instant>,
     last_activity: Value,
     last_traffic_event: Option<std::time::Instant>,
@@ -134,18 +135,24 @@ fn network_refresh_due(
     previous_complete: bool,
     last_retry_age: Option<Duration>,
 ) -> (bool, bool) {
-    let early_retry = !targets_changed
-        && !previous_complete
-        && age >= crate::daemon::PROCESS_INTERVAL
-        && age < crate::daemon::NETWORK_INTERVAL
-        && last_retry_age.is_none_or(|age| age >= crate::daemon::NETWORK_INTERVAL);
-    (
-        targets_changed || age >= crate::daemon::NETWORK_INTERVAL || early_retry,
-        early_retry,
-    )
+    let due = network_review_wait(age, previous_complete, last_retry_age).is_zero();
+    (targets_changed || due, !targets_changed && due && age < crate::daemon::NETWORK_INTERVAL)
+}
+
+fn network_review_wait(age: Duration, complete: bool, last_retry_age: Option<Duration>) -> Duration {
+    let regular = crate::daemon::NETWORK_INTERVAL.saturating_sub(age);
+    if complete { return regular; }
+    let retry = crate::daemon::PROCESS_INTERVAL.saturating_sub(age);
+    let cooldown = last_retry_age.map_or(Duration::ZERO, |age| crate::daemon::NETWORK_INTERVAL.saturating_sub(age));
+    regular.min(retry.max(cooldown))
 }
 
 impl<R: ReadRunner> SnapshotPublisher<R> {
+    pub fn next_network_review(&self) -> Option<std::time::Instant> {
+        let (started, _, _, complete) = self.last_network.as_ref()?;
+        let now = std::time::Instant::now();
+        Some(now + network_review_wait(now - *started, *complete, self.last_network_retry.map(|at| now - at)))
+    }
     pub fn new(store: StateStore, sampler: Sampler<R>, producer: Identity) -> Result<Self> {
         if !producer.valid() {
             return Err(CoreError::new(
@@ -158,6 +165,7 @@ impl<R: ReadRunner> SnapshotPublisher<R> {
             sampler,
             producer,
             last_network: None,
+            proxy_pending_write: false,
             last_network_retry: None,
             last_activity: json!({}),
             last_traffic_event: None,
@@ -172,6 +180,15 @@ impl<R: ReadRunner> SnapshotPublisher<R> {
         self.poll_with_inventory(group, pin, force_network, false, |_| {})
     }
     pub fn poll_with_inventory(
+        &mut self, group: &str, pin: &str, force_network: bool, guard_context: bool,
+        observe: impl FnOnce(std::result::Result<&crate::sampler::ProcessRound, &CoreError>),
+    ) -> Result<Value> {
+        let snapshot = self.collect_with_inventory(group, pin, force_network, guard_context, observe)?;
+        monitor_snapshot::publish(&self.store, &snapshot, &self.producer)?;
+        Ok(snapshot)
+    }
+    /// DaemonOwner adds log health and publishes the final snapshot once.
+    pub fn collect_with_inventory(
         &mut self, group: &str, pin: &str, force_network: bool, guard_context: bool,
         observe: impl FnOnce(std::result::Result<&crate::sampler::ProcessRound, &CoreError>),
     ) -> Result<Value> {
@@ -205,8 +222,9 @@ impl<R: ReadRunner> SnapshotPublisher<R> {
                 });
         let refresh = force_network || due;
         if refresh {
+            let started = std::time::Instant::now();
             if early_retry {
-                self.last_network_retry = Some(std::time::Instant::now());
+                self.last_network_retry = Some(started);
             }
             let sockets = self.sampler.sockets(&processes)?;
             let tag = self.sampler.tag_report(&processes, &sockets, group, pin);
@@ -216,11 +234,12 @@ impl<R: ReadRunner> SnapshotPublisher<R> {
                     Some("ok" | "empty" | "no_targets")
                 );
             self.last_network = Some((
-                std::time::Instant::now(),
+                started,
                 processes.targets.clone(),
                 tag,
                 quality,
             ));
+            self.proxy_pending_write = true;
         }
         let (_, _, tag, network_quality) = self
             .last_network
@@ -329,13 +348,12 @@ impl<R: ReadRunner> SnapshotPublisher<R> {
         } else {
             "静默"
         });
-        let mut raw_tag = tag.clone();
-        raw_tag["producer"] = json!({"pid":self.producer.pid,"started":self.producer.start_stamp});
-        self.store.atomic_json(
-            &self.store.paths.watch().join("state/proxy-snapshot.json"),
-            &raw_tag,
-        )?;
-        monitor_snapshot::publish(&self.store, &snapshot, &self.producer)?;
+        if self.proxy_pending_write {
+            let mut raw_tag = tag.clone();
+            raw_tag["producer"] = json!({"pid":self.producer.pid,"started":self.producer.start_stamp});
+            self.store.atomic_json(&self.store.paths.watch().join("state/proxy-snapshot.json"), &raw_tag)?;
+            self.proxy_pending_write = false;
+        }
         Ok(snapshot)
     }
 
@@ -568,6 +586,76 @@ mod tests {
         }
     }
     #[test]
+    fn monitor_view_omits_only_incremental_channel_history() {
+        let (path, store) = temp();
+        let fake = Fake { wrong: AtomicBool::new(false) };
+        let published = json!({"capturedAt":native::now(), "channelEvents":[{"event_seq":3}],
+            "events":[{"category":"diagnostic"}], "channelSupervision":{"snapshot_seq":3},
+            "health":{"state":"running"}});
+        monitor_snapshot::publish(&store, &published, &identity()).unwrap();
+        let current = read(&store, &fake, false).unwrap();
+        let mut full = read(&store, &fake, true).unwrap();
+        assert_eq!(full.as_object_mut().unwrap().remove("channelEvents"), Some(published["channelEvents"].clone()));
+        full["health"]["heartbeatAge"] = current["health"]["heartbeatAge"].clone();
+        assert_eq!(current, full);
+        assert_eq!(current["channelSupervision"], published["channelSupervision"]);
+        assert_eq!(current["events"], published["events"]);
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn full_snapshot_keeps_its_pinned_history_across_supervisor_restart() {
+        use crate::channel_supervisor::{ChannelSupervisor, SupervisionEvent};
+        use std::os::unix::fs::MetadataExt;
+        let (path, store) = temp();
+        let fake = Fake { wrong: AtomicBool::new(false) };
+        let mut first = ChannelSupervisor::new(store.clone(), None, None).unwrap();
+        let at = native::now();
+        first.handle_event(SupervisionEvent::ProcessInventoryUnavailable { family:"claude".into(), observed_at:at }).unwrap();
+        let frame = crate::channel_history::runtime_frame(&store);
+        let window = crate::channel_history::events(&store, &frame, false).unwrap();
+        assert!(window.as_array().unwrap().len() > 0);
+        let dir = store.paths.watch().join("state/runtime-channel-events");
+        let pinned = fs::read_dir(&dir).unwrap().next().unwrap().unwrap().path();
+        let ino = fs::metadata(&pinned).unwrap().ino();
+        let live = store.paths.watch().join("state/channel-events").join(pinned.file_name().unwrap());
+        assert_eq!(fs::metadata(&live).unwrap().ino(), ino);
+        monitor_snapshot::publish(&store, &json!({"capturedAt":at,"channelSupervision":frame,"health":{"state":"running"}}), &identity()).unwrap();
+        let mut second = ChannelSupervisor::new(store.clone(), None, None).unwrap();
+        second.handle_event(SupervisionEvent::ProcessInventoryUnavailable { family:"openai".into(), observed_at:at }).unwrap();
+        let next = crate::channel_history::runtime_frame(&store);
+        assert_ne!(next["producer_boot_id"],frame["producer_boot_id"]);
+        assert_eq!(next["snapshot_seq"],frame["snapshot_seq"]);
+        let mut third = ChannelSupervisor::new(store.clone(), None, None).unwrap();
+        third.handle_event(SupervisionEvent::ProcessInventoryUnavailable { family:"claude".into(), observed_at:at }).unwrap();
+        for pid in 4100..4170 {
+            third.set_family_unmanaged_pids("claude", vec![pid], at);
+        }
+        third.handle_event(SupervisionEvent::ProcessInventoryUnavailable { family:"claude".into(), observed_at:at }).unwrap();
+        let latest = crate::channel_history::runtime_frame(&store);
+        let rows = crate::channel_history::events(&store, &latest, true).unwrap();
+        let rows = rows.as_array().unwrap();
+        assert_eq!(rows.len(), crate::channel_supervisor::MAX_PERSISTED_EVENTS);
+        assert_eq!(rows.last().unwrap()["event_seq"], latest["snapshot_seq"]);
+        assert!(rows[0]["event_seq"].as_u64().unwrap() > 1);
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 2);
+        let authority_path = store.paths.watch().join(crate::channel_policy_status::FRAME_PATH);
+        println!("private fixture: {} history events, {} history bytes, {} current authority bytes",
+            rows.len(), serde_json::to_vec(rows).unwrap().len() + 1, fs::metadata(authority_path).unwrap().len());
+        assert_eq!(read(&store,&fake,true).unwrap()["channelEvents"],window);
+        assert!(!live.exists());
+        fs::remove_file(pinned).unwrap();
+        let light = read(&store,&fake,false).unwrap();
+        assert!(light.get("channelEvents").is_none() && light.get("channelEventsError").is_none());
+        let gap = read(&store,&fake,true).unwrap();
+        assert_eq!(gap["channelEvents"],json!([]));
+        assert_eq!(gap["channelEventsError"],"channel_history_unavailable");
+        assert_eq!(gap["health"]["state"],"running");
+        assert_eq!(gap["channelSupervision"]["producer_boot_id"],frame["producer_boot_id"]);
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
     fn readback_rejects_stale_and_reused_producer_identity() {
         let (path, store) = temp();
         let id = identity();
@@ -576,13 +664,13 @@ mod tests {
         };
         monitor_snapshot::publish(&store, &json!({"capturedAt":native::now()-31.0}), &id).unwrap();
         assert_eq!(
-            read(&store, &fake).unwrap()["health"]["state"],
+            read(&store, &fake, true).unwrap()["health"]["state"],
             "unavailable"
         );
         monitor_snapshot::publish(&store, &json!({"capturedAt":native::now()}), &id).unwrap();
         fake.wrong.store(true, Ordering::Relaxed);
         assert_eq!(
-            read(&store, &fake).unwrap()["health"]["state"],
+            read(&store, &fake, true).unwrap()["health"]["state"],
             "unavailable"
         );
         fs::remove_dir_all(path).unwrap();
@@ -599,7 +687,7 @@ mod tests {
         assert!(!monitor_snapshot::published_path(&store).exists());
         owner.publish_initial_inventory(&inventory, native::now()).unwrap();
         let fake = Fake { wrong: AtomicBool::new(false) };
-        let snapshot = read(&store, &fake).unwrap();
+        let snapshot = read(&store, &fake, true).unwrap();
         assert_eq!(snapshot["health"]["state"], "degraded");
         assert_eq!(snapshot["health"]["pid"], id.pid);
         assert_eq!(snapshot["health"]["started"], id.start_stamp);
@@ -614,12 +702,12 @@ mod tests {
         let heartbeat = String::from_utf8(store.read_bytes(&store.paths.watch().join("state/heartbeat"), 4096).unwrap().unwrap()).unwrap();
         assert!(heartbeat.contains("|error|UNKNOWN"), "initial inventory is not a healthy network heartbeat");
         fake.wrong.store(true, Ordering::Relaxed);
-        assert_eq!(read(&store, &fake).unwrap()["health"]["state"], "unavailable", "startup must use the existing producer verifier");
+        assert_eq!(read(&store, &fake, true).unwrap()["health"]["state"], "unavailable", "startup must use the existing producer verifier");
         fake.wrong.store(false, Ordering::Relaxed);
         let mut stale = snapshot;
         stale["capturedAt"] = json!(native::now() - 31.0);
         monitor_snapshot::publish(&store, &stale, &id).unwrap();
-        assert_eq!(read(&store, &fake).unwrap()["health"]["state"], "unavailable", "startup evidence cannot remain current indefinitely");
+        assert_eq!(read(&store, &fake, true).unwrap()["health"]["state"], "unavailable", "startup evidence cannot remain current indefinitely");
         drop(owner);
         fs::remove_dir_all(path).unwrap();
     }
@@ -684,8 +772,17 @@ mod tests {
         assert_eq!(next["proxy"]["connectionObservation"]["collectorState"], "empty");
         assert_eq!(next["samplingDiagnostics"]["bytes_state"], "empty");
         assert_eq!(next["health"]["state"], "degraded");
+        let network_deadline = publisher.next_network_review().unwrap();
         std::thread::sleep(Duration::from_millis(10));
-        let cached = publisher.poll("", "", false).unwrap();
+        let proxy_file = store.paths.watch().join("state/proxy-snapshot.json");
+        let proxy_before = fs::File::open(&proxy_file).unwrap();
+        let runtime_file = monitor_snapshot::published_path(&store);
+        let runtime_before = fs::File::open(&runtime_file).unwrap();
+        let cached = publisher.collect_with_inventory("", "", false, false, |_| {}).unwrap();
+        assert_eq!(publisher.next_network_review(), Some(network_deadline), "an inventory-only round cannot extend network evidence");
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(fs::metadata(proxy_file).unwrap().ino(), proxy_before.metadata().unwrap().ino());
+        assert_eq!(fs::metadata(runtime_file).unwrap().ino(), runtime_before.metadata().unwrap().ino());
         assert_eq!(cached["samplingDiagnostics"]["network_reused"], true);
         assert_eq!(cached["samplingDiagnostics"]["network_round_id"], next["samplingDiagnostics"]["network_round_id"]);
         assert_eq!(cached["samplingDiagnostics"]["network_sampled_at"], next["samplingDiagnostics"]["network_sampled_at"]);

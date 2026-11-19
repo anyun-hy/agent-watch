@@ -6,7 +6,7 @@ enum ReadOutcome: Sendable {
 }
 
 enum SnapshotRunner {
-    static func run(full: Bool) -> ReadOutcome {
+    static func run() -> ReadOutcome {
         guard let variant = BundledBackendVariant.current() else {
             return .failure("构建包未声明后台类型，请重新构建界面。")
         }
@@ -16,7 +16,7 @@ enum SnapshotRunner {
                 return .failure("找不到 Rust 数据读取组件，请重新构建。")
             }
             let result = SnapshotProcessTransport.run(
-                executable: engine, arguments: ["snapshot"] + (full ? ["--full"] : []))
+                executable: engine, arguments: ["snapshot", "--without-channel-events"])
             switch result {
             case .launchFailed:
                 return .failure("数据读取组件未能启动。")

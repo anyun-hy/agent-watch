@@ -84,10 +84,10 @@ pub fn initialize_native_listener(request: &Request) -> Result<()> {
     let exe = std::env::current_exe()
         .map_err(|_| CoreError::new("executable_unavailable", "无法定位原生组件"))?;
     let stream =
-        claude_watch_runtime::native_listener::ListenerStream::start(runner.as_ref(), &exe)?;
+        claude_watch_runtime::native_listener::ListenerStream::start(runner, &exe)?;
     LISTENER_STREAM
         .set(stream)
-        .map_err(|_| CoreError::new("native_listener_already_initialized", "采样管道已初始化"))
+        .map_err(|_| CoreError::new("native_listener_already_initialized", "采样通道已初始化"))
 }
 pub fn host(paths: Paths, authority: Authority) -> Result<Host> {
     let storage = StateStore::new(paths);
@@ -329,7 +329,7 @@ pub fn dispatch_read(request: &Request, paths: Paths) -> Result<Option<Value>> {
         "snapshot" => {
             let at = native::now();
             Ok(Some(
-                monitor_snapshot::read(&host.storage, host.runner.as_ref())
+                monitor_snapshot::read(&host.storage, host.runner.as_ref(), !request.flag("without-channel-events"))
                     .unwrap_or_else(|e| monitor_snapshot::empty(&host.storage, at, &e.message)),
             ))
         }

@@ -130,6 +130,23 @@ fn fresh(store: &StateStore, kind: ProbeKind, ctx: &str, current_ip: Option<&str
     ReceiptStore { storage: store.clone() }.probe_is_fresh(kind, ctx, current_ip, now, since)
 }
 
+/// Use the stored source timestamps. Same-network receipts remain reusable
+/// until the route or verified egress changes; that egress has its own lifetime.
+fn next_review(store: &StateStore, ctx: &str, local: &Value) -> Option<f64> {
+    let ip = local["evidence_egress_ip"].as_str();
+    let (dns, rtc) = ReceiptStore { storage: store.clone() }.probe_receipts();
+    let mut deadline = local["evidence_egress_observed_at"].as_f64()
+        .map(|at| at + claude_watch_core::session::GUARD_EGRESS_TTL);
+    for (kind, value, sampled_at) in [(ProbeKind::Dns, dns, "finished_at"), (ProbeKind::WebRtc, rtc, "sampled_at")] {
+        if !claude_watch_core::receipts::network_reusable(&value, ctx, ip) {
+            if let Some(due) = value[sampled_at].as_f64().map(|at| at + kind.refresh_age()) {
+                deadline = Some(deadline.map_or(due, |previous| previous.min(due)));
+            }
+        }
+    }
+    deadline
+}
+
 /// A notice does not stop supervision. Only warn-only locks may refresh;
 /// mandatory close/force locks stay latched and are never resumed here.
 fn refreshable(session: &Session, config: &Config, provider: Provider) -> bool {
@@ -193,11 +210,12 @@ pub fn refresh_supervised_sessions<S: EvidenceSystem>(store: &StateStore, system
             v[key].as_array().is_some_and(|names| names.iter().any(|name| name.as_str() == Some(*kind)))
         })).collect()
     };
-    Ok(json!({"status":status,"count":count,"failed_probes":probes("failed_probes"),
+    let next_review = reports.iter().filter_map(|v| v["next_review_at"].as_f64()).min_by(f64::total_cmp);
+    Ok(json!({"status":status,"count":count,"next_review_at":next_review,"failed_probes":probes("failed_probes"),
         "risk_probes":probes("risk_probes"),"families":reports}))
 }
 
-/// Called by one independent worker on a bounded cadence. GUI-produced fresh
+/// Called by the independent worker on an invalidation or evidence deadline. GUI-produced fresh
 /// receipts are reused, so opening the window does not double probe frequency.
 pub fn refresh_active_session<S: EvidenceSystem>(
     store: &StateStore,
@@ -244,7 +262,8 @@ pub fn refresh_active_session<S: EvidenceSystem>(
             .iter()
             .all(|kind| fresh(store, *kind, &session.context_id, current_local["evidence_egress_ip"].as_str(), system.now(), None))
     {
-        return Ok(json!({"status":"ok","count":0,"failed_probes":[]}));
+        return Ok(json!({"status":"ok","count":0,"failed_probes":[],
+            "next_review_at":next_review(store, &session.context_id, &current_local)}));
     }
     if !matching_desktops(system, &session)? {
         return Ok(json!({"status":"idle","count":0}));
@@ -399,7 +418,8 @@ pub fn refresh_active_session<S: EvidenceSystem>(
         }
     }
     Ok(
-        json!({"status":if !risks.is_empty(){"risk"}else if errors.is_empty(){"ok"}else{"incomplete"},"count":count,"failed_probes":errors,"risk_probes":risks}),
+        json!({"status":if !risks.is_empty(){"risk"}else if errors.is_empty(){"ok"}else{"incomplete"},"count":count,"next_review_at":next_review(store, &evidence_context, &current_local),
+            "failed_probes":errors,"risk_probes":risks}),
     )
 }
 

@@ -222,7 +222,7 @@ fn setup_active_session_and_supervisor(
 
     let (tx, rx) = mpsc::channel();
     let mut supervisor =
-        ChannelSupervisor::new(store.clone(), Some(enforcer.clone()), Some(tx)).unwrap();
+        ChannelSupervisor::new(store.clone(), Some(enforcer.clone()), Some(tx.into())).unwrap();
 
     let sessions = SessionStore::for_family(store.clone(), "claude");
     let mut obs = sample_vpn_observation(now, 1);
@@ -432,9 +432,8 @@ fn stable_vpn_cutoff_refreshes_live_execution_evidence_without_reissuing_command
         assert_eq!(receipt.observed_at, now + elapsed, "read live state, never renew a stored receipt");
         assert!(receipt.new_connections_blocked && receipt.active_flows_closed);
         assert_eq!(receipt.active_flows_count, 0);
-        let disk = store.read_json(&store.paths.watch().join("state/channel-receipt-claude.json"), Value::Null).unwrap();
-        assert_eq!(disk["observed_at"], json!(now + elapsed));
-        assert_eq!(disk["command_seq"], json!(command_seq));
+        assert_eq!(receipt.command_seq, command_seq);
+        assert!(!store.paths.watch().join("state/channel-receipt-claude.json").exists());
     }
 
     // A later read must reflect lost confinement, not just stamp the old blocked receipt.
@@ -1155,7 +1154,7 @@ fn r1_r2_seatbelt_missing_vpn_expectation_corrupt_config_or_legacy_migration_fai
         resolved_fresh.config.clone(),
         resolved_fresh.blocking_reason(),
         Some(enforcer1),
-        Some(tx1),
+        Some(tx1.into()),
     )
     .unwrap();
     let snap1 = sup1
@@ -1214,7 +1213,7 @@ fn r1_r2_seatbelt_missing_vpn_expectation_corrupt_config_or_legacy_migration_fai
     let enforcer2: Arc<dyn ChannelEnforcer> =
         Arc::new(LocalTunnelEnforcer::new("boot-r1-corrupt"));
     let (tx2, _rx2) = mpsc::channel();
-    let mut sup2 = ChannelSupervisor::new(store2.clone(), Some(enforcer2), Some(tx2)).unwrap();
+    let mut sup2 = ChannelSupervisor::new(store2.clone(), Some(enforcer2), Some(tx2.into())).unwrap();
     let snap2 = sup2
         .handle_event(SupervisionEvent::ProcessInventoryUpdated {
             family: "claude".into(),
@@ -1597,7 +1596,6 @@ fn f02_f03_gateway_process_crash_preserves_target_for_5s_and_stalled_supervisor_
         let watchdog = enforcer
             .spawn_lease_watchdog(
                 stop.clone(),
-                Duration::from_millis(25),
                 move || read_clock.load(Ordering::Acquire) as f64 / 1000.0,
             )
             .unwrap();
@@ -1690,13 +1688,17 @@ fn f02_f03_gateway_process_crash_preserves_target_for_5s_and_stalled_supervisor_
             )
             .unwrap();
         fs::write(root.join("permit-ready"), b"ready").unwrap();
+        let mut expired = false;
         while target.try_wait().unwrap().is_none() {
-            if root.join("expire-lease").exists() {
+            if !expired && root.join("expire-lease").exists() {
                 clock.store(((now + 61.0) * 1000.0) as u64, Ordering::Release);
+                watchdog.thread().unpark();
+                expired = true;
             }
             thread::sleep(Duration::from_millis(10));
         }
         stop.store(true, Ordering::Release);
+        watchdog.thread().unpark();
         watchdog.join().unwrap();
         listener.join().unwrap();
         registration.join().unwrap();

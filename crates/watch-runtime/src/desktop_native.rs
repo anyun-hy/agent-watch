@@ -18,8 +18,11 @@ use claude_watch_core::{
     session::{Desktop, Launcher},
 };
 use serde_json::Value;
+use claude_watch_system::process_events::ProcessEvents;
 use std::{
     fs,
+    os::fd::AsFd,
+    os::unix::net::UnixStream,
     os::unix::fs::{MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
     sync::{
@@ -93,10 +96,32 @@ fn with_controlled_path_evidence(
 /// The launcher command is constructed only by the controlled-entry path.
 /// Keep terminal I/O, exit status and explicit user signals shared with fixtures.
 fn start_cli_process(command: Exec, state: &NativeCliState) -> Result<Box<dyn CliProcess>> {
+    let signal_input = state.signal_input.clone().ok_or_else(|| CoreError::new("cli_signal_unavailable", "CLI中断处理尚未就绪"))?;
+    let events = ProcessEvents::new().and_then(|events| {
+        events.watch_read(signal_input.as_fd())?;
+        Ok(events)
+    }).map_err(|_| CoreError::new("cli_signal_unavailable", "无法订阅 CLI 中断事件"))?;
     let job = command.start().map_err(|_| {
         CoreError::new("cli_spawn_failed", "受控沙箱启动器无法启动CLI子进程")
     })?;
-    Ok(Box::new(NativeCliProcess { job, flag: state.flag.clone() }))
+    let exit_subscribed = events.watch_exit(job.pid()).is_ok();
+    Ok(Box::new(NativeCliProcess { job, flag: state.flag.clone(), events, exit_subscribed, _signal_input: signal_input }))
+}
+
+fn wait_for_script_approval(store: &StateStore, boot: &str, combo: &Value, deadline: Instant) -> Result<()> {
+    let mut changes = claude_watch_system::network_events::NetworkEventWatcher::new(&[]);
+    changes.watch_file(store.paths.watch().join("state/target-discovery.json"));
+    loop {
+        let state = crate::target_discovery::read_runtime_snapshot(store)?;
+        if state["approval_executor_boot_id"] == boot
+            && state["script_launch_approvals"].as_array().is_some_and(|rows| rows.contains(combo)) {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(CoreError::new("script_approval_pending", "后台尚未确认本次脚本和解释器的同一来源修订"));
+        }
+        changes.wait(deadline.saturating_duration_since(Instant::now()));
+    }
 }
 
 fn execute_output(program: &Path, args: &[&str], timeout: Duration) -> Result<Vec<u8>> {
@@ -158,6 +183,7 @@ pub struct NativeDesktop<R: ReadRunner> {
     selected: Option<SelectedApplication>,
     applications: PathBuf,
     cli: Option<SelectedCli>,
+    launch_events: Option<ProcessEvents>,
     discovery: std::sync::Mutex<Option<crate::target_discovery::DiscoveryHandle>>,
 }
 #[derive(Clone, PartialEq, Eq)]
@@ -189,6 +215,7 @@ pub struct NativeCliState {
     proxy: Option<String>,
     flag: Arc<AtomicUsize>,
     handlers: Vec<signal_hook::SigId>,
+    signal_input: Option<Arc<UnixStream>>,
 }
 impl NativeCliState {
     fn new(proxy: Option<String>) -> Self {
@@ -196,17 +223,23 @@ impl NativeCliState {
             proxy,
             flag: Arc::new(AtomicUsize::new(0)),
             handlers: Vec::new(),
+            signal_input: None,
         }
     }
     fn prepare(&mut self) -> Result<()> {
-        if !self.handlers.is_empty() {
+        if self.signal_input.is_some() {
             return Ok(());
         }
+        let (reader, writer) = UnixStream::pair().map_err(|_| CoreError::new("cli_signal_unavailable", "无法准备 CLI 中断通道"))?;
         for (signal, code) in [
             (signal_hook::consts::SIGINT, 130),
             (signal_hook::consts::SIGTERM, 143),
         ] {
-            match signal_hook::flag::register_usize(signal, self.flag.clone(), code) {
+            let registration = signal_hook::flag::register_usize(signal, self.flag.clone(), code).and_then(|id| {
+                self.handlers.push(id);
+                signal_hook::low_level::pipe::register(signal, writer.try_clone()?)
+            });
+            match registration {
                 Ok(id) => self.handlers.push(id),
                 Err(_) => {
                     for id in self.handlers.drain(..) {
@@ -219,6 +252,7 @@ impl NativeCliState {
                 }
             }
         }
+        self.signal_input = Some(Arc::new(reader));
         Ok(())
     }
 }
@@ -232,6 +266,9 @@ impl Drop for NativeCliState {
 struct NativeCliProcess {
     job: Job,
     flag: Arc<AtomicUsize>,
+    events: ProcessEvents,
+    exit_subscribed: bool,
+    _signal_input: Arc<UnixStream>,
 }
 impl CliProcess for NativeCliProcess {
     fn wait(&mut self) -> Result<i32> {
@@ -255,7 +292,7 @@ impl CliProcess for NativeCliProcess {
                 }
                 return Ok(code as i32);
             }
-            match self.job.wait_timeout(Duration::from_millis(50)) {
+            match self.job.wait_timeout(Duration::ZERO) {
                 Ok(Some(status)) => {
                     return status
                         .code()
@@ -268,8 +305,8 @@ impl CliProcess for NativeCliProcess {
                             )
                         })
                 }
-                Ok(None) => {}
-                Err(_) => {
+                Ok(None) if self.exit_subscribed && self.events.wait(None).is_ok() => {}
+                _ => {
                     self.job.detach();
                     return Err(CoreError::new(
                         "cli_wait_failed",
@@ -313,6 +350,7 @@ impl<R: ReadRunner> NativeDesktop<R> {
             selected: None,
             applications,
             cli: None,
+            launch_events: None,
             discovery: std::sync::Mutex::new(None),
         })
     }
@@ -525,7 +563,7 @@ impl<R: ReadRunner> NativeDesktop<R> {
                 "预检期间CLI文件发生变化，未启动",
             ));
         }
-        if state.handlers.len() != 2 {
+        if state.signal_input.is_none() {
             return Err(CoreError::new(
                 "cli_signal_unavailable",
                 "CLI中断处理尚未就绪",
@@ -547,18 +585,7 @@ impl<R: ReadRunner> NativeDesktop<R> {
             // a different interpreter or attempting an unapproved launch.
             // Registration still performs the authoritative recheck.
             let store = StateStore::new(crate::storage::Paths { home: selected.home.clone() });
-            let deadline = Instant::now() + Duration::from_secs(2);
-            let exact = serde_json::json!(combo);
-            loop {
-                let state = crate::target_discovery::read_runtime_snapshot(&store)?;
-                if state["approval_executor_boot_id"] == executor_boot_id
-                    && state["script_launch_approvals"].as_array().is_some_and(|rows| rows.contains(&exact))
-                { break; }
-                if Instant::now() >= deadline {
-                    return Err(CoreError::new("script_approval_pending", "后台尚未确认本次脚本和解释器的同一来源修订"));
-                }
-                std::thread::sleep(Duration::from_millis(25));
-            }
+            wait_for_script_approval(&store, executor_boot_id, &serde_json::json!(combo), Instant::now() + Duration::from_secs(2))?;
         }
         let req = claude_watch_core::controlled_launch::ControlledLaunchRequest {
             entry_id: crate::managed_entry::DesktopManagedEntrySpec::entry_bundle_id_for(
@@ -1131,7 +1158,10 @@ impl<R: ReadRunner, T: Transport, S: AuditSystem + ServiceSystem> DesktopSystem
         self.started.elapsed()
     }
     fn wait(&mut self, d: Duration) {
-        std::thread::sleep(d)
+        let deadline = Instant::now() + d;
+        if self.desktop.launch_events.as_ref().is_none_or(|events| events.wait(Some(deadline)).is_err()) {
+            std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
+        }
     }
 
 

@@ -18,6 +18,7 @@ pub mod audit_process;
 pub mod background_evidence;
 pub mod build_identity;
 pub mod channel_enforcer;
+mod channel_history;
 mod gateway_budget;
 pub mod channel_diagnostics;
 pub mod channel_policy_status;

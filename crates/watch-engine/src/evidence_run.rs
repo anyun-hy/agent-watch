@@ -19,6 +19,7 @@ use claude_watch_runtime::{
 };
 use serde_json::Value;
 use std::{
+    os::{fd::AsFd, unix::net::UnixStream},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -33,13 +34,20 @@ struct NativeEvidence {
     stop: Arc<AtomicBool>,
     executor: background_evidence::ProbeExecutor,
 }
-fn next_interval(failures: &mut u32, incomplete: bool) -> Duration {
+fn next_review_delay(failures: &mut u32, incomplete: bool, due: Option<f64>, now: f64) -> Option<Duration> {
+    let remaining = due.map(|at| {
+        // A corrupt future stamp must not overflow a Duration or postpone
+        // verification beyond the longest supported receipt lifetime.
+        Duration::from_secs_f64((at - now).clamp(0.0, ProbeKind::WebRtc.refresh_age()))
+    });
     if incomplete {
         *failures = failures.saturating_add(1).min(3);
-        Duration::from_secs((5u64 << *failures).min(30))
+        let retry = Duration::from_secs((5u64 << *failures).min(30));
+        // Another family's fresh evidence may expire before this retry.
+        Some(remaining.filter(|delay| !delay.is_zero()).map_or(retry, |delay| retry.min(delay)))
     } else {
         *failures = 0;
-        Duration::from_secs(5)
+        remaining
     }
 }
 fn evidence_error_code(code: &str) -> &str {
@@ -72,6 +80,7 @@ impl EvidenceSystem for NativeEvidence {
             let ip = egress.data.as_ref().and_then(|v| v["ip"].as_str())
                 .ok_or_else(|| CoreError::new("evidence_egress_unavailable", "出口采样未完成；已通过检测记录保留"))?;
             local["evidence_egress_ip"] = Value::String(ip.into());
+            local["evidence_egress_observed_at"] = serde_json::json!(egress.finished_at);
         }
         Ok(local)
     }
@@ -136,7 +145,35 @@ impl EvidenceSystem for NativeEvidence {
         Ok(())
     }
 }
-pub fn spawn(paths: Paths, stop: Arc<AtomicBool>) -> Result<thread::JoinHandle<()>> {
+/// Session heartbeats can replace the file without changing which probes
+/// it needs. Keep only the inputs consumed by refresh_active_session.
+fn session_inputs(store: &StateStore, path: &std::path::Path) -> Value {
+    match store.read_json(path, Value::Null) {
+        Ok(value) if value.is_object() => serde_json::json!([
+            value["schema"], value["session_id"], value["state"], value["context_id"],
+            value["created_at"], value["reason"]["code"], value["desktop"],
+            value["baseline"]["ip"], value["last_check"]["ip"],
+            value[claude_watch_core::session::GROUP_KEY], value[claude_watch_core::session::GROUP_RECHECK_KEY],
+            value["channel_processes_v1"],
+        ]),
+        Ok(value) => value,
+        Err(error) => serde_json::json!({"error":error.code}),
+    }
+}
+
+pub struct EvidenceWorker {
+    cancel: UnixStream,
+    worker: thread::JoinHandle<()>,
+}
+impl EvidenceWorker {
+    pub fn is_finished(&self) -> bool { self.worker.is_finished() }
+    pub fn join(self) -> thread::Result<()> {
+        drop(self.cancel);
+        self.worker.join()
+    }
+}
+
+pub fn spawn(paths: Paths, stop: Arc<AtomicBool>) -> Result<EvidenceWorker> {
     let store = StateStore::new(paths.clone());
     let mut host = super::runtime::host(paths, Authority::ReadOnly)?;
     host.request_evidence = false;
@@ -145,7 +182,8 @@ pub fn spawn(paths: Paths, stop: Arc<AtomicBool>) -> Result<thread::JoinHandle<(
         super::runtime::process_component()?,
         Authority::ReadOnly,
     )?;
-    thread::Builder::new()
+    let (cancel, cancellation) = UnixStream::pair().map_err(|_| CoreError::new("evidence_worker_failed", "保护证据停止通道无法启动"))?;
+    let worker = thread::Builder::new()
         .name("claude-background-evidence".into())
         .spawn(move || {
             let executor = background_evidence::ProbeExecutor::new(stop.clone())
@@ -167,6 +205,14 @@ pub fn spawn(paths: Paths, stop: Arc<AtomicBool>) -> Result<thread::JoinHandle<(
                 }
             };
 
+            let mut changes = claude_watch_system::network_events::NetworkEventWatcher::default();
+            changes.watch_file(store.paths.config());
+            let mut sessions = std::collections::BTreeMap::new();
+            for family in PolicyCatalog::families() {
+                let path = store.paths.session_for(family.id);
+                changes.watch_file(&path);
+                sessions.insert(path.clone(), session_inputs(&store, &path));
+            }
             let mut last_report = String::new();
             let mut last_report_at = Instant::now();
             let mut failures = 0;
@@ -221,15 +267,36 @@ pub fn spawn(paths: Paths, stop: Arc<AtomicBool>) -> Result<thread::JoinHandle<(
                     last_report_at = Instant::now();
                 }
                 last_report = signature;
-                let interval = next_interval(&mut failures, status == "incomplete");
-                while !stop.load(Ordering::Acquire) && started.elapsed() < interval {
-                    let _ = server.poll(&store, &mut system);
-                    thread::sleep(Duration::from_millis(50));
+                let due = outcome.as_ref().ok().and_then(|report| report["next_review_at"].as_f64());
+                let delay = next_review_delay(&mut failures, status == "incomplete", due, native::now());
+                let deadline = delay.map(|delay| Instant::now() + delay);
+                loop {
+                    if stop.load(Ordering::Acquire) { return; }
+                    let remaining = deadline.map(|end| end.saturating_duration_since(Instant::now()));
+                    let (events, ready) = changes.wait_with_readers(remaining, &[cancellation.as_fd(), server.as_fd()]);
+                    if ready == Some(0) { return; }
+                    let mut invalidated = ready == Some(1)
+                        && server.poll_with_update(&store, &mut system).ok().flatten() == Some(true);
+                    for event in events {
+                        use claude_watch_system::network_events::NetworkEventKind;
+                        match event {
+                            NetworkEventKind::Timeout => {}
+                            NetworkEventKind::WatchedFileChanged(path) if sessions.contains_key(&path) => {
+                                let next = session_inputs(&store, &path);
+                                let previous = sessions.get_mut(&path).unwrap();
+                                invalidated |= next != *previous;
+                                *previous = next;
+                            }
+                            _ => invalidated = true,
+                        }
+                    }
+                    if invalidated || deadline.is_some_and(|end| Instant::now() >= end) { break; }
                 }
             }
 
         })
-        .map_err(|_| CoreError::new("evidence_worker_failed", "保护证据更新线程无法启动"))
+        .map_err(|_| CoreError::new("evidence_worker_failed", "保护证据更新线程无法启动"))?;
+    Ok(EvidenceWorker { cancel, worker })
 }
 
 #[cfg(test)]
@@ -240,11 +307,12 @@ mod tests {
         let mut failures = 0;
         for seconds in [10, 20, 30, 30, 30] {
             assert_eq!(
-                next_interval(&mut failures, true),
+                next_review_delay(&mut failures, true, None, 100.0).unwrap(),
                 Duration::from_secs(seconds)
             );
         }
-        assert_eq!(next_interval(&mut failures, false), Duration::from_secs(5));
-        assert_eq!(next_interval(&mut failures, true), Duration::from_secs(10));
+        assert_eq!(next_review_delay(&mut failures, false, None, 100.0), None, "idle waits for a state change");
+        assert_eq!(next_review_delay(&mut failures, false, Some(108.0), 100.0), Some(Duration::from_secs(8)));
+        assert_eq!(next_review_delay(&mut failures, true, None, 100.0).unwrap(), Duration::from_secs(10));
     }
 }

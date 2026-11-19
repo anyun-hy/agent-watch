@@ -628,7 +628,9 @@ pub fn assemble(
     quality: bool,
     at: f64,
 ) -> Value {
-    assemble_with_active(store, round, tag, producer, mode, quality, at, &[])
+    let mut snapshot = assemble_with_active(store, round, tag, producer, mode, quality, at, &[]);
+    load_channel_events(store, &mut snapshot);
+    snapshot
 }
 
 pub(crate) fn assemble_with_active(
@@ -641,19 +643,35 @@ pub(crate) fn assemble_with_active(
         .join("Library/LaunchAgents/io.local.claudewatch.agent.plist");
     let installed = store.paths.watch().join("runtime/watch-engine").is_file() && agent.is_file();
     let (events, event_error) = match events(store) { Ok(events) => (events, None), Err(_) => (Vec::new(), Some("事件日志不可读取")) };
-    let mut channel_supervision = crate::channel_policy_status::read_frame(store);
+    let mut channel_supervision = crate::channel_history::runtime_frame(store);
     let mut rows = process_rows(round, active);
     for (row, target) in rows.iter_mut().zip(&round.targets) {
         row["protection"] = crate::channel_policy_status::process_protection(store, &channel_supervision, &target.identity, target.kind, at);
     }
     append_live_failed_instances(store, &channel_supervision, round, &mut rows, at);
     let (channel_events, vpn_supervision) = channel_supervision.as_object_mut().map(|frame| (
-        frame.remove("events").unwrap_or_else(|| json!([])),
+        frame.remove("events"),
         frame.remove("vpn_supervision").unwrap_or(Value::Null),
-    )).unwrap_or_else(|| (json!([]), Value::Null));
-    json!({"capturedAt":at,"health":{"state":if quality{"running"}else{"degraded"},"mode":mode,"pid":producer.pid,"heartbeatAge":0.0,"started":producer.start_stamp,"detail":if quality{"后台进程存活，采样心跳正常"}else{"部分监控采样需要检查"},"alerts":"开启"},
+    )).unwrap_or((None, Value::Null));
+    let mut snapshot = json!({"capturedAt":at,"health":{"state":if quality{"running"}else{"degraded"},"mode":mode,"pid":producer.pid,"heartbeatAge":0.0,"started":producer.start_stamp,"detail":if quality{"后台进程存活，采样心跳正常"}else{"部分监控采样需要检查"},"alerts":"开启"},
         "installed":installed,"autoStart":false,"keepAlive":false,"hasBaseline":has_session_reference(store,at),"stderrBytes":0,
-        "processes":rows,"targetDiscovery":round.discovery,"events":events,"eventError":event_error,"proxy":proxy(tag),"proxyError":Value::Null,"channelSupervision":channel_supervision,"channelEvents":channel_events,"vpnSupervision":vpn_supervision,"backendVersion":VERSION,"monitoredApps":MONITORED,"logPath":store.paths.base().join("events.jsonl")})
+        "processes":rows,"targetDiscovery":round.discovery,"events":events,"eventError":event_error,"proxy":proxy(tag),"proxyError":Value::Null,"channelSupervision":channel_supervision,"vpnSupervision":vpn_supervision,"backendVersion":VERSION,"monitoredApps":MONITORED,"logPath":store.paths.base().join("events.jsonl")});
+    if snapshot["channelSupervision"].get("event_history").is_none() {
+        snapshot["channelEvents"] = channel_events.unwrap_or_else(|| json!([]));
+    }
+    snapshot
+}
+
+fn load_channel_events(store: &StateStore, snapshot: &mut Value) {
+    if snapshot["channelSupervision"].get("event_history").is_some() {
+        match crate::channel_history::events(store, &snapshot["channelSupervision"], true) {
+            Ok(events) => snapshot["channelEvents"] = events,
+            Err(error) => {
+                snapshot["channelEvents"] = json!([]);
+                snapshot["channelEventsError"] = json!(error.code);
+            }
+        }
+    }
 }
 /// Applies independently verified LaunchAgent registration facts without changing
 /// the legacy monitor snapshot shape or its sampling-health interpretation.
@@ -679,17 +697,38 @@ pub fn published_path(store: &StateStore) -> std::path::PathBuf {
     store.paths.watch().join("state/runtime-snapshot.json")
 }
 pub fn publish(store: &StateStore, snapshot: &Value, producer: &Identity) -> Result<()> {
-    store.atomic_json(
-        &published_path(store),
-        &json!({"schema":1,"producer":producer,"snapshot":snapshot}),
-    )
+    let mut frame = json!({"schema":1,"producer":producer,"snapshot":snapshot});
+    if snapshot["channelSupervision"].get("event_history").is_some() {
+        if let Some(object) = frame["snapshot"].as_object_mut() { object.remove("channelEvents"); }
+    }
+    store.atomic_json(&published_path(store), &frame)
 }
-pub fn read<R: ReadRunner>(store: &StateStore, runner: &R) -> Result<Value> {
+pub fn read<R: ReadRunner>(store: &StateStore, runner: &R, include_channel_events: bool) -> Result<Value> {
+    let mut result = read_verified_snapshot(store, runner)?;
+    if include_channel_events {
+        load_channel_events(store, &mut result);
+        if result["channelSupervision"]["event_history"] == "separate" && result.get("channelEventsError").is_some() {
+            // Multiple publications may retire this reader's window during its
+            // live identity checks. Reopen and verify the replacement once.
+            let mut latest = read_verified_snapshot(store, runner)?;
+            if latest["channelSupervision"]["snapshot_seq"] != result["channelSupervision"]["snapshot_seq"]
+                || latest["channelSupervision"]["producer_boot_id"] != result["channelSupervision"]["producer_boot_id"] {
+                load_channel_events(store, &mut latest);
+                return Ok(latest);
+            }
+        }
+    } else if let Some(object) = result.as_object_mut() {
+        object.remove("channelEvents");
+    }
+    Ok(result)
+}
+
+fn read_verified_snapshot<R: ReadRunner>(store: &StateStore, runner: &R) -> Result<Value> {
     let at = native::now();
     let Some(bytes) = store.read_bytes(&published_path(store), 8 * 1024 * 1024)? else {
         return Ok(empty(store, at, "后台尚未提供Rust采样快照"));
     };
-    let raw = strict_json(&bytes)?;
+    let mut raw = strict_json(&bytes)?;
     let snapshot = &raw["snapshot"];
     let producer: Identity = serde_json::from_value(raw["producer"].clone())
         .map_err(|_| CoreError::new("invalid_snapshot_producer", "快照生产者身份无效"))?;
@@ -724,8 +763,8 @@ pub fn read<R: ReadRunner>(store: &StateStore, runner: &R) -> Result<Value> {
     {
         return Ok(empty(store, at, "后台进程启动身份未通过核对"));
     }
-    let mut result = snapshot.clone();
     let age = at - snapshot["capturedAt"].as_f64().unwrap();
+    let mut result = raw["snapshot"].take();
     result["health"]["heartbeatAge"] = json!(age);
     Ok(result)
 }

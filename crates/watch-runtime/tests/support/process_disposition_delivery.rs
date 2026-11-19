@@ -1,3 +1,6 @@
+#[path = "published_events.rs"]
+mod published_events;
+
 #[path = "hardened_helper.rs"]
 mod hardened_helper;
 
@@ -50,11 +53,13 @@ struct Fixture {
     _upstream: TcpListener,
     stop: Arc<AtomicBool>,
     workers: Vec<JoinHandle<()>>,
+    listeners: Vec<claude_watch_system::ListenerWorker>,
 }
 
 impl Drop for Fixture {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
+        for listener in self.listeners.drain(..) { let _ = listener.join(); }
         for worker in self.workers.drain(..) { let _ = worker.join(); }
         let _ = fs::remove_dir_all(&self.root);
     }
@@ -95,7 +100,7 @@ impl Fixture {
             registry_for_gateway.attribute_accepted_connection(context, native::now())).unwrap();
         let (gateway, tunnel) = enforcer.start_local_proxy_listener("127.0.0.1:0", stop.clone(), now).unwrap();
         let registrations = registry.start_registration_listener(&root.join("reg.sock"), stop.clone()).unwrap();
-        Self { root, storage, config, policy, helper, registry, enforcer, gateway, _upstream: upstream, stop, workers: vec![tunnel, registrations] }
+        Self { root, storage, config, policy, helper, registry, enforcer, gateway, _upstream: upstream, stop, workers: Vec::new(), listeners: vec![tunnel, registrations] }
     }
 
     fn launch(&self, target: LaunchTarget, image: &Path, args: Vec<String>) -> Owned {
@@ -375,7 +380,7 @@ int main(int argc, char **argv) {
             } else {
                 upstream.write_all(b"b").unwrap(); upstream.read_exact(&mut byte).unwrap();
                 assert_eq!(&byte, b"b", "warn keeps the established flow working");
-                assert!(supervisor.drain_emitted_events().iter().any(|event|
+                assert!(published_events::after(&fixture.storage, 0).iter().any(|event|
                     event.family_state.family == family && event.family_state.reason_code == "egress_ip_changed"));
             }
             if vpn_mismatch || action == "warn" {
@@ -437,7 +442,6 @@ fn v1_worker_delivery_preserves_partial_result_in_both_policy_orders() {
         fixture.workers.push(worker);
         supervisor.install_process_disposition_dispatcher(dispatcher);
         supervisor.set_process_disposition_registry(fixture.registry.clone());
-        supervisor.drain_emitted_events();
         // The service intentionally keeps a stable command in the first half
         // of a lease. Reach its renewal window before pausing the force worker.
         let renewal_at = (before.captured_at + before.families["openai"].valid_until.unwrap()) / 2.0;
@@ -466,7 +470,7 @@ fn v1_worker_delivery_preserves_partial_result_in_both_policy_orders() {
         assert!(new.command_seq > old.command_seq && new.valid_until.unwrap() > old.valid_until.unwrap());
         let disk = fixture.storage.read_json(&fixture.storage.paths.watch().join("state/channel-supervision.json"), Value::Null).unwrap();
         assert_eq!(disk["enforcement_receipts"]["openai"]["command_seq"], new.command_seq);
-        assert!(supervisor.drain_emitted_events().iter().any(|e| e.family_state.family == "openai" && e.family_state.command_seq == new.command_seq));
+        assert!(published_events::after(&fixture.storage, before.snapshot_seq).iter().any(|e| e.family_state.family == "openai" && e.family_state.command_seq == new.command_seq));
 
         let mut warn = fixture.config.clone();
         warn.policy_actions.insert("claude_close_ip".into(), "warn".into());
@@ -502,10 +506,10 @@ fn v1_worker_delivery_preserves_partial_result_in_both_policy_orders() {
         assert_eq!(final_state.permit_state, ChannelPermitState::Revoked);
         assert!(final_state.process_disposition_action.is_none() && final_state.process_disposition_receipt.is_none());
         assert_eq!(final_state.previous_process_disposition_receipts.as_slice(), std::slice::from_ref(receipt));
-        let history = supervisor.drain_emitted_events();
+        let history = published_events::after(&fixture.storage, renewed.snapshot_seq);
         assert!(history.iter().any(|e| e.family_state.previous_process_disposition_receipts.as_slice() == std::slice::from_ref(receipt)));
-        supervisor.handle_event(event.clone()).unwrap();
-        assert!(supervisor.drain_emitted_events().is_empty(), "replay must not publish a second result");
+        let replay = supervisor.handle_event(event.clone()).unwrap();
+        assert_eq!(replay.snapshot_seq, snapshot.snapshot_seq, "replay must not publish a second result");
         assert_eq!(inspect_process_identity(second.pid), Some(second.clone()));
         assert_eq!(inspect_process_identity(other_identity.pid), Some(other_identity));
         assert_eq!(inspect_process_identity(ordinary_identity.pid), Some(ordinary_identity));

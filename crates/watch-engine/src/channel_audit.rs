@@ -14,9 +14,10 @@ use claude_watch_runtime::{
     storage::{Paths, StateStore},
 };
 use serde_json::{json, Value};
+use claude_watch_runtime::audit_process::AuditCancellation;
 use std::{
     process::Command,
-    sync::atomic::AtomicBool,
+
     time::{Duration, Instant},
 };
 
@@ -99,7 +100,7 @@ pub(crate) fn run_with_worker(
     paths: &Paths,
     enforcer: &LocalTunnelEnforcer,
     req: &AsyncAuditRequest,
-    worker: impl Fn(&str, &Value, Instant, &AtomicBool) -> Result<Value>,
+    worker: impl Fn(&str, &Value, Instant, &AuditCancellation) -> Result<Value>,
 ) -> Result<(Value, Value, f64)> {
     let start_now = native::now();
     let remaining = req.requested_at + req.timeout_seconds - start_now;
@@ -109,7 +110,7 @@ pub(crate) fn run_with_worker(
     let epoch_before = read_verified_vpn_epoch(paths, enforcer, &req.family, start_now);
     verify_audit_vpn_epoch_consistency(req, epoch_before.as_ref())?;
     let deadline = Instant::now() + Duration::from_secs_f64(remaining);
-    let fallback = AtomicBool::new(false);
+    let fallback = AuditCancellation::default();
     let cancel = req.cancellation.as_deref().unwrap_or(&fallback);
     let invoke = |kind: &str, mut input: Value| {
         input["home"] = json!(paths.home);

@@ -1,7 +1,10 @@
+#[path = "support/published_events.rs"]
+mod published_events;
+
 use claude_watch_core::{
     channel::{
         BoundProcessToken, ChannelEnforcementState, ChannelMonitorDisplayState,
-        ChannelMonitorSubscriber, PolicySyncState, SubscriptionApplyOutcome,
+        PolicySyncState,
     },
     config::Config,
     error::Result,
@@ -66,7 +69,7 @@ fn fixture_config() -> Config {
 fn fixture_supervisor(
     storage: StateStore,
     enforcer: Option<Arc<dyn ChannelEnforcer>>,
-    audit_tx: Option<mpsc::Sender<AsyncAuditRequest>>,
+    audit_tx: Option<claude_watch_runtime::channel_supervisor::AuditRequestSender>,
 ) -> Result<ChannelSupervisor> {
     use claude_watch_core::vpn::{ObservationConsistency, ObservedField, UpstreamProtocol, VpnObservation};
     let mut supervisor = ChannelSupervisor::new(storage, enforcer, audit_tx)?;
@@ -136,7 +139,7 @@ fn desktop_and_cli_share_continuity_baseline_and_risk_in_both_start_orders() {
             let enforcer = Arc::new(LocalTunnelEnforcer::new("mixed"));
             enforcer.activate_interception(now).unwrap();
             let (tx, rx) = mpsc::channel();
-            let mut supervisor = fixture_supervisor(store.clone(), Some(enforcer.clone()), Some(tx)).unwrap();
+            let mut supervisor = fixture_supervisor(store.clone(), Some(enforcer.clone()), Some(tx.into())).unwrap();
             supervisor.handle_event(environment(now)).unwrap();
             let cli = bound(7200, ProcessRole::Cli); let desktop = bound(7210, ProcessRole::DesktopMain);
             let first = if desktop_first { desktop.clone() } else { cli.clone() };
@@ -203,7 +206,7 @@ fn autonomous_rust_cutoffs_require_supervisor_recovery() {
         let enforcer = Arc::new(LocalTunnelEnforcer::new("autonomous"));
         enforcer.activate_interception(now).unwrap();
         let (tx, rx) = mpsc::channel();
-        let mut supervisor = fixture_supervisor(store.clone(), Some(enforcer.clone()), Some(tx)).unwrap();
+        let mut supervisor = fixture_supervisor(store.clone(), Some(enforcer.clone()), Some(tx.into())).unwrap();
         supervisor.handle_event(environment(now)).unwrap();
         supervisor.handle_event(inventory_event("claude", vec![bound(7200, ProcessRole::Cli)], now)).unwrap();
         let initial_request = rx.recv_timeout(Duration::from_secs(1)).unwrap();
@@ -250,7 +253,7 @@ fn standalone_cli_is_discovered_audited_and_rebound_after_exec_without_a_launche
         let enforcer = Arc::new(LocalTunnelEnforcer::new("cli-adoption"));
         enforcer.activate_interception(now).unwrap(); // In-memory executor fixture only.
         let (tx, rx) = mpsc::channel();
-        let mut supervisor = fixture_supervisor(store.clone(), Some(enforcer.clone()), Some(tx)).unwrap();
+        let mut supervisor = fixture_supervisor(store.clone(), Some(enforcer.clone()), Some(tx.into())).unwrap();
         supervisor.handle_event(SupervisionEvent::EnvironmentUpdated {
             egress: fixture_egress(now, "1.1.1.1", "JP"), local_guard: fixture_local(), observed_at: now,
         }).unwrap();
@@ -330,7 +333,7 @@ fn audit_completed_in_time_but_delivered_after_deadline_stays_revoked() {
     seed_receipts(&store, now, "JP");
     let (tx, rx) = mpsc::channel();
     let mut supervisor =
-        fixture_supervisor(store.clone(), Some(enforcer.clone()), Some(tx)).unwrap();
+        fixture_supervisor(store.clone(), Some(enforcer.clone()), Some(tx.into())).unwrap();
     supervisor.handle_event(environment(now)).unwrap();
     supervisor
         .handle_event(inventory_event(
@@ -395,7 +398,7 @@ fn fresh_audit_context_recovers_after_network_change_and_next_event_stays_permit
     enforcer.activate_interception(now).unwrap();
     seed_receipts(&store, now, "JP");
     let (tx, rx) = mpsc::channel();
-    let mut supervisor = fixture_supervisor(store.clone(), Some(enforcer), Some(tx)).unwrap();
+    let mut supervisor = fixture_supervisor(store.clone(), Some(enforcer), Some(tx.into())).unwrap();
     let sessions = SessionStore::for_family(store.clone(), "claude");
     let pending = sessions
         .begin_verified(
@@ -720,7 +723,7 @@ fn active_fixture_supervisor(
     family: &str, now: f64,
 ) -> ChannelSupervisor {
     let (tx, rx) = mpsc::channel();
-    let mut supervisor = fixture_supervisor(store.clone(), enforcer, Some(tx)).unwrap();
+    let mut supervisor = fixture_supervisor(store.clone(), enforcer, Some(tx.into())).unwrap();
     supervisor.handle_event(SupervisionEvent::EnvironmentUpdated {
         egress:configured_egress(store,now,"1.1.1.1","JP"), local_guard:fixture_local(), observed_at:now,
     }).unwrap();
@@ -1021,7 +1024,6 @@ fn active_lease_expiry_cuts_off_existing_long_lived_connection_with_zero_new_con
     let watchdog_handle = enforcer
         .spawn_lease_watchdog(
             watchdog_stop.clone(),
-            Duration::from_millis(20),
             move || *clock_for_thread.lock().unwrap(),
         )
         .unwrap();
@@ -1030,6 +1032,7 @@ fn active_lease_expiry_cuts_off_existing_long_lived_connection_with_zero_new_con
     // Advance the clock to exact inclusive boundary `valid_until`: the running
     // background watchdog thread autonomously fires and cuts off the connection!
     *watchdog_clock.lock().unwrap() = valid_until;
+    watchdog_handle.thread().unpark();
     let expired_receipt = expired_rx
         .recv_timeout(Duration::from_secs(2))
         .expect("background lease watchdog must autonomously emit expiry receipt");
@@ -1084,6 +1087,7 @@ fn active_lease_expiry_cuts_off_existing_long_lived_connection_with_zero_new_con
     assert_eq!(final_receipt.terminated_flows_count, 1);
 
     watchdog_stop.store(true, Ordering::Release);
+    watchdog_handle.thread().unpark();
     let _ = watchdog_handle.join();
 }
 
@@ -1134,7 +1138,6 @@ fn slow_async_audit_does_not_block_revocation_and_policy_hot_reload_discards_sta
 
     let mut supervisor =
         fixture_supervisor(store.clone(), Some(enforcer.clone()), Some(audit_req_tx)).unwrap();
-    let mut subscriber = ChannelMonitorSubscriber::default();
 
     let now = 1_710_000_000.0;
     seed_receipts(&store, now, "JP");
@@ -1207,8 +1210,6 @@ fn slow_async_audit_does_not_block_revocation_and_policy_hot_reload_discards_sta
         ChannelMonitorDisplayState::PendingVerification
     );
 
-    subscriber.apply_snapshot(snap_initial);
-    let _ = supervisor.drain_emitted_events();
 
     // WHILE OpenAI's slow audit is still blocked in the background worker:
     // 1. Trigger a confirmed CN exit risk -> Claude's channel is immediately revoked!
@@ -1246,18 +1247,12 @@ fn slow_async_audit_does_not_block_revocation_and_policy_hot_reload_discards_sta
         "执行器已应用"
     );
 
-    // Feed sequenced events into the subscriber and verify reconnect/gap resync
-    let events = supervisor.drain_emitted_events();
+    let events = published_events::after(&store, snap_initial.snapshot_seq);
     assert!(events.len() >= 2);
-    // Simulate a dropped first event -> subscriber detects sequence gap and requests resync
-    let gap_outcome = subscriber.apply_event(events.last().unwrap().clone());
-    assert!(matches!(
-        gap_outcome,
-        SubscriptionApplyOutcome::GapDetectedResyncRequired { .. }
-    ));
-    assert!(subscriber.needs_resync);
-    assert!(subscriber.apply_snapshot(snap_hot_reload.clone()));
-    assert!(!subscriber.needs_resync);
+    assert_eq!(events.first().unwrap().event_seq, snap_initial.snapshot_seq + 1);
+    assert!(events.windows(2).all(|pair| pair[0].event_seq + 1 == pair[1].event_seq));
+    assert_eq!(events.last().unwrap().event_seq, snap_hot_reload.snapshot_seq);
+    assert!(events.iter().all(|event| event.producer_boot_id == snap_hot_reload.producer_boot_id));
 
     // Now release the old in-flight OpenAI slow audit (started under the old policy version)
     release_audit_tx.send(()).unwrap();
@@ -1269,16 +1264,6 @@ fn slow_async_audit_does_not_block_revocation_and_policy_hot_reload_discards_sta
         snap_after_stale.families["openai"].display_state,
         ChannelMonitorDisplayState::Forwarding
     );
-
-    // Verify subscriber effective state degrades when disconnected or expired
-    let expired_view = subscriber
-        .effective_family_state("claude", now + 100.0, 30.0)
-        .unwrap();
-    assert_eq!(
-        expired_view.display_state,
-        ChannelMonitorDisplayState::PendingVerification
-    );
-    assert_eq!(expired_view.reason_code, "monitor_evidence_expired");
 
     stop.store(true, Ordering::Release);
     let _ = worker_handle.join();
@@ -1632,7 +1617,7 @@ fn completed_but_rejected_audits_back_off_without_authorizing_managed_desktops()
         let enforcer = Arc::new(LocalTunnelEnforcer::new("rejected-audit"));
         enforcer.activate_interception(now).unwrap();
         let (tx,rx) = mpsc::channel();
-        let mut supervisor = fixture_supervisor(store.clone(),Some(enforcer),Some(tx)).unwrap();
+        let mut supervisor = fixture_supervisor(store.clone(),Some(enforcer),Some(tx.into())).unwrap();
         supervisor.handle_event(environment(now)).unwrap();
         let process = bound(7300,ProcessRole::DesktopMain);
         supervisor.handle_event(inventory_event("claude",vec![process],now)).unwrap();
@@ -1677,7 +1662,7 @@ fn unmanaged_desktops_stay_visible_without_audit_or_permission() {
     let enforcer = Arc::new(LocalTunnelEnforcer::new("unmanaged-no-audit"));
     enforcer.activate_interception(now).unwrap();
     let (tx, rx) = mpsc::channel();
-    let mut supervisor = fixture_supervisor(store.clone(), Some(enforcer), Some(tx)).unwrap();
+    let mut supervisor = fixture_supervisor(store.clone(), Some(enforcer), Some(tx.into())).unwrap();
     let desktop = Desktop { pid: 7300, start_seconds: 900, start_microseconds: 1 };
     for delta in [0.0, 2.0, 20.0, 90.0] {
         supervisor.handle_event(environment(now + delta)).unwrap();
@@ -2051,95 +2036,6 @@ fn upstream_tag_connect_handshake_verifies_200_and_clears_read_timeout_or_reject
     .unwrap_err();
     assert_eq!(err.code, "upstream_connect_rejected");
     bad_server_thread.join().unwrap();
-}
-
-#[test]
-fn daemon_restart_resync_with_producer_boot_id() {
-    let mut subscriber = ChannelMonitorSubscriber::default();
-    let initial_now = 1_710_000_000.0;
-
-    let dummy_state = claude_watch_core::channel::FamilyChannelMonitorState {
-        producer_boot_id: "sup-boot-1".into(),
-        family: "claude".into(),
-        session_id: Some("sess-1".into()),
-        saved_policy_version: claude_watch_core::channel::PolicyVersion {
-            policy_digest: "p1".repeat(32),
-            guard_policy_digest: "g1".repeat(32),
-        },
-        applied_policy_version: Some(claude_watch_core::channel::PolicyVersion {
-            policy_digest: "p1".repeat(32),
-            guard_policy_digest: "g1".repeat(32),
-        }),
-        permit_generation: 1,
-        command_seq: 1,
-        permit_state: claude_watch_core::channel::ChannelPermitState::Permitted,
-        display_state: ChannelMonitorDisplayState::Forwarding,
-        display_label_zh: "受控放行中".into(),
-        policy_sync_state: PolicySyncState::Applied,
-        policy_sync_label_zh: "执行器已应用".into(),
-        reason_code: "active".into(),
-        process_preserved: true,
-        process_execution_state: None,
-        process_disposition_action: None,
-        process_disposition_receipt: None,
-        previous_process_disposition_receipts: Vec::new(),
-        active_member_pids: vec![4100],
-        active_members: vec![],
-        local_proxy_ready: true,
-        system_extension_active: false,
-        active_flows_count: 1,
-        terminated_flows_count: 0,
-        blocked_new_connections: 0,
-        local_proxy_port: Some(7890),
-        valid_until: Some(initial_now + 30.0),
-        updated_at: initial_now,
-        backend: claude_watch_core::channel::NetworkBackendKind::Seatbelt,
-        vpn_epoch: None,
-        vpn_match: None,
-        coverage_scope: claude_watch_core::channel::BackendCoverageScope::default(),
-        unmanaged_member_pids: vec![],
-        sandbox_ready: true,
-    };
-
-    let snap = claude_watch_core::channel::ChannelMonitorSnapshot {
-        producer_boot_id: "sup-boot-1".into(),
-        snapshot_seq: 0,
-        captured_at: initial_now,
-        saved_policy_version: claude_watch_core::channel::PolicyVersion {
-            policy_digest: "p1".repeat(32),
-            guard_policy_digest: "g1".repeat(32),
-        },
-        families: [("claude".into(), dummy_state.clone())].into_iter().collect(),
-    };
-    assert!(subscriber.apply_snapshot(snap));
-
-    let ev1 = claude_watch_core::channel::ChannelMonitorEvent {
-        producer_boot_id: "sup-boot-1".into(),
-        event_seq: 1,
-        family_state: dummy_state.clone(),
-    };
-    assert_eq!(
-        subscriber.apply_event(ev1),
-        SubscriptionApplyOutcome::Applied
-    );
-
-    // Daemon restarts: event_seq resets to 1, but producer_boot_id is different ("sup-boot-2")
-    let mut restart_state = dummy_state;
-    restart_state.producer_boot_id = "sup-boot-2".into();
-    let ev_restart = claude_watch_core::channel::ChannelMonitorEvent {
-        producer_boot_id: "sup-boot-2".into(),
-        event_seq: 1,
-        family_state: restart_state,
-    };
-    // Must recognize producer restart and request resync!
-    assert_eq!(
-        subscriber.apply_event(ev_restart),
-        SubscriptionApplyOutcome::GapDetectedResyncRequired {
-            expected_seq: 2,
-            received_seq: 1,
-        }
-    );
-    assert!(subscriber.needs_resync);
 }
 
 #[test]

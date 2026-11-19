@@ -141,10 +141,7 @@ struct SwitcherPage: View {
                     if result.candidates.count > 1 {
                         InlineNotice(title: "检测到多个运行中的代理候选", detail: result.candidates.joined(separator: "、") + "。请核对实际监听入口与路由后重新检测；当前保持未确认。", symbol: "exclamationmark.triangle", tint: p.amber, p: p)
                     }
-                    EnvironmentSummaryStrip(result: result, p: p,
-                        stale: result.expires_at < Date().timeIntervalSince1970 || store.currentEnvironmentIsHistorical,
-                        previousObserved: store.previousEnvironment?.observed_at)
-                    TimelineView(.periodic(from: .now, by: 1)) { context in
+                    TimelineView(.explicit(evidenceDisplayDates(until: result.expires_at))) { context in
                         let expired = result.expires_at < context.date.timeIntervalSince1970
                         let historical = expired || store.currentEnvironmentIsHistorical
                         VStack(alignment: .leading, spacing: 10) {
@@ -428,14 +425,17 @@ struct SwitcherPage: View {
                     Spacer()
                     Button { Task { await store.checkLaunchConditions() } } label: { Label("检查启动条件", systemImage: "checklist") }.disabled(store.busy || store.hasUnsavedSettings)
                 }
+                let session = store.sessionDisplay
                 if let result = store.currentPolicyEvaluation {
-                    TimelineView(.periodic(from: .now, by: 1)) { context in
+                    TimelineView(.explicit(evidenceDisplayDates(until: result.expires_at))) { context in
                         let expired = result.expires_at < context.date.timeIntervalSince1970
                         VStack(alignment: .leading, spacing: 9) {
-                            Label(expired ? "同轮启动要求预览已过期" : result.ready ? "同轮启动要求已满足" : "同轮启动要求尚未满足",
-                                  systemImage: expired ? "clock" : result.ready ? "checkmark.circle.fill" : "exclamationmark.triangle")
-                                .foregroundStyle(expired ? p.secondary : result.ready ? p.mint : p.amber)
-                            Text("与环境页同轮 · 采样于 " + timeLabel(result.observed_at) + " · 仅展示，不授予启动许可")
+                            launchSummary(session) {
+                                Label(expired ? "启动要求预览已过期" : result.ready ? "同轮启动要求已满足" : "同轮启动要求尚未满足",
+                                      systemImage: expired ? "clock" : result.ready ? "checkmark.circle.fill" : "exclamationmark.triangle")
+                                    .foregroundStyle(expired ? p.secondary : result.ready ? p.mint : p.amber)
+                            }
+                            Text("环境采样于 " + timeLabel(result.observed_at) + " · 启动时重新核验")
                                 .font(WatchTypography.small).foregroundStyle(p.secondary)
                             ForEach(result.rows.filter { result.blocked.contains($0.id) }) { row in
                                 VStack(alignment: .leading, spacing: 4) {
@@ -478,7 +478,7 @@ struct SwitcherPage: View {
                 DisclosureGroup("上次实际启动预检（历史）", isExpanded: $showAuditHistory) {
                     VStack(alignment: .leading, spacing: 8) {
                         if let result = store.audit {
-                            TimelineView(.periodic(from: .now, by: 1)) { context in
+                            TimelineView(.explicit(evidenceDisplayDates(until: result.expires_at))) { context in
                                 let expired = result.expires_at < context.date.timeIntervalSince1970
                                 VStack(alignment: .leading, spacing: 6) {
                                     Label(expired ? "历史预检已过期，不代表当前环境" : "历史预检记录", systemImage: expired ? "clock.badge.exclamationmark" : "clock")
@@ -587,16 +587,25 @@ struct SwitcherPage: View {
             }
         }
     }
-    private func serviceCard(_ service: BackgroundServiceRow, stale: Bool) -> some View {
+    private func isMaintenanceService(_ service: BackgroundServiceRow) -> Bool {
+        service.id == "watchdog" || service.id == "updater"
+    }
+
+    private func serviceRows(_ services: [BackgroundServiceRow], observedAt: Double) -> some View {
+        TimelineView(.explicit(evidenceDisplayDates(until: observedAt + 35))) { context in
+            let stale = !store.backgroundError.isEmpty || context.date.timeIntervalSince1970 - observedAt > 35
+            ForEach(services) { service in
+                Divider()
+                serviceRow(service, stale: stale)
+            }
+        }
+    }
+
+    private func serviceRow(_ service: BackgroundServiceRow, stale: Bool) -> some View {
         let descriptor = BackgroundServiceCatalog.descriptor(service.id)
-        return Surface(p) {
-            VStack(alignment: .leading, spacing: 11) {
-                HStack {
-                    Label(service.title, systemImage: descriptor.symbol).font(WatchTypography.section)
-                    Spacer()
-                    Label(stale ? "上次状态 · 请刷新" : service.statusLabel, systemImage: stale ? "clock" : service.healthy ? "checkmark.circle.fill" : service.state == "inactive" ? "pause.circle" : "exclamationmark.circle")
-                        .font(WatchTypography.caption).foregroundStyle(stale ? p.secondary : service.healthy ? p.mint : service.state == "inactive" ? p.secondary : p.amber)
-                }
+        let tint = stale ? p.secondary : service.healthy ? p.mint : service.state == "inactive" ? p.secondary : p.amber
+        return DisclosureGroup {
+            VStack(alignment: .leading, spacing: 8) {
                 Text(service.detail).font(WatchTypography.body).fixedSize(horizontal: false, vertical: true)
                 if let summary = service.evidenceSummary { Text(summary).font(WatchTypography.small).foregroundStyle(p.secondary) }
                 if let desired = service.desired { Text("保存设置：" + (desired ? "开启" : "关闭") + " · 实际状态见回读结果").font(WatchTypography.small).foregroundStyle(p.secondary) }
@@ -606,8 +615,16 @@ struct SwitcherPage: View {
                     serviceControls(service, descriptor)
                 }.disabled(store.busy || store.hasUnsavedSettings)
                 Text("来源：" + service.source).font(WatchTypography.small).foregroundStyle(p.secondary)
-            }
-        }
+            }.padding(.bottom, 10)
+        } label: {
+            HStack(spacing: 9) {
+                Image(systemName: descriptor.symbol).foregroundStyle(p.blue)
+                    .frame(width: 26, height: 26).background(p.elevated, in: RoundedRectangle(cornerRadius: 6))
+                Text(service.title).font(WatchTypography.bodyStrong)
+                Spacer(minLength: 4)
+                Badge(text: stale ? "上次状态" : service.statusLabel, color: tint)
+            }.padding(.vertical, 7)
+        }.disclosureGroupStyle(FullWidthDisclosureStyle(p: p))
     }
     /// What a service offers is read from its descriptor — which setting its
     /// switch owns, how the action reads and what it requires first — instead
@@ -1497,4 +1514,10 @@ struct EnvironmentCheckDetails: View {
 private struct EnvironmentDetailHeight: PreferenceKey {
     static var defaultValue: CGFloat = 0
     static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = nextValue() }
+}
+
+private func evidenceDisplayDates(until timestamp: Double) -> [Date] {
+    let now = Date()
+    let expiry = Date(timeIntervalSince1970: timestamp.nextUp)
+    return timestamp.isFinite && expiry > now ? [now, expiry] : [now]
 }

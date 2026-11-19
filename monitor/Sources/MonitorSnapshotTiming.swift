@@ -1,10 +1,10 @@
 import Foundation
 
-/// Keeps freshness checks explicit when a new snapshot arrives between timer
-/// ticks. A clock older than the capture time is never a valid context.
+/// Evaluate the original capture time on publication and at its deadline.
 enum MonitorSnapshotTiming {
+    static let snapshotMaximumAge: TimeInterval = 8
     static let proxyMaximumAge: TimeInterval = 30
-    static func isCurrent(capturedAt: Double, now: Double, maximumAge: Double = 8) -> Bool {
+    static func isCurrent(capturedAt: Double, now: Double, maximumAge: Double = snapshotMaximumAge) -> Bool {
         let elapsed = now - capturedAt
         return elapsed >= 0 && elapsed < maximumAge
     }

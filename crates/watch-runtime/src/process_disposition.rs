@@ -27,7 +27,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-pub(crate) const INTENT_TTL: f64 = 8.0;
+pub const INTENT_TTL: f64 = 8.0;
 pub(crate) const RECEIPT_TTL: f64 = 15.0;
 pub(crate) const RESULT_COMPLETION_GRACE: f64 = 2.25;
 pub(crate) const MAX_TARGETS: usize = 128;
@@ -165,8 +165,9 @@ impl ProcessDispositionDispatcher {
             .name("channel-process-disposition".into())
             .spawn(move || {
                 while !stop.load(Ordering::Acquire) {
-                    match rx.recv_timeout(Duration::from_millis(100)) {
+                    match rx.recv() {
                         Ok(job) => {
+                            if stop.load(Ordering::Acquire) { break; }
                             if let Some(receipt) = execute_job(&storage, &job, &stop) {
                                 // Diagnostic evidence only. The supervisor never
                                 // imports process authority or results from disk.
@@ -183,8 +184,7 @@ impl ProcessDispositionDispatcher {
                                 }
                             }
                         }
-                        Err(mpsc::RecvTimeoutError::Timeout) => {}
-                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                        Err(_) => break,
                     }
                 }
             })
@@ -340,7 +340,8 @@ fn execute_batch(
     }
     // One batch deadline, irrespective of the number of targets. Cancellation
     // stops future signals, but never erases outcomes for signals already sent.
-    while !sent.is_empty() {
+    let requested = sent.iter().map(|(_, target)| target.pid).collect();
+    crate::process_exit::wait_for_exits(requested, batch_deadline, || {
         sent.retain(|(index, target)| {
             if !observed_exit(target) {
                 return true;
@@ -350,13 +351,8 @@ fn execute_batch(
             results[*index].timestamp = native::now();
             false
         });
-        if sent.is_empty() || Instant::now() >= batch_deadline {
-            break;
-        }
-        thread::sleep(
-            Duration::from_millis(10).min(batch_deadline.saturating_duration_since(Instant::now())),
-        );
-    }
+        sent.is_empty()
+    });
     let observed_at = native::now();
     for (index, target) in sent {
         results[index].timestamp = observed_at;

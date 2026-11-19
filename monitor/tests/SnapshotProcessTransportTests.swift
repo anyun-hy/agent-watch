@@ -100,6 +100,15 @@ struct SnapshotProcessTransportTests {
         else { fatalError("infinite stdout misclassified") }
         expect(endlessElapsed < 10, "infinite stdout stops at the byte limit, not at EOF")
 
+        let (earlyEOF, beforeDeadline) = timed {
+            SnapshotProcessTransport.run(executable: sh, arguments: ["-c", "printf ok; exec 1>&-; sleep 0.2"],
+                                         timeoutSeconds: 4)
+        }
+        if case .success(let bytes) = earlyEOF {
+            expect(String(data: bytes, encoding: .utf8) == "ok" && beforeDeadline < 2,
+                   "a child exit after stdout EOF wakes the reader before the deadline")
+        } else { fatalError("exit after EOF failed") }
+
         // stdout is complete and the child exits 0, but only after the
         // deadline (TERM is trapped into a late clean exit). Still a timeout.
         let (late, lateElapsed) = timed {

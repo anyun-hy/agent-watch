@@ -1,3 +1,6 @@
+#[path = "support/published_events.rs"]
+mod published_events;
+
 use claude_watch_core::{channel::{BackendCoverageScope, NetworkBackendKind}, processes::Identity};
 use claude_watch_runtime::{channel_supervisor::{ChannelSupervisor, SupervisionEvent}, monitor_snapshot, sampler::Sampler, storage::{Paths, StateStore}};
 use serde_json::json;
@@ -32,7 +35,7 @@ fn rust_monitor_coverage_snapshot_and_events_match_wire_contract() {
     let controlled = claude_watch_core::channel::BoundProcessToken::with_system_identity(4101, 501, 100, 1, claude_watch_core::processes::ProcessRole::Cli)
         .with_audit_token([501,501,20,501,20,4101,0,9]);
     let snapshot = supervisor.handle_event(SupervisionEvent::ProcessInventoryUpdated { family: "claude".into(), desktops:vec![], processes:vec![controlled], observed_at:at }).unwrap();
-    let events = supervisor.drain_emitted_events();
+    let events = published_events::after(&store, 0);
     assert_eq!(snapshot.families["claude"].coverage_scope, scope);
     assert_eq!(events.last().unwrap().family_state.coverage_scope, scope);
     let producer = Identity { pid: 4000, parent: 1, uid: 501, executable: "/fixture/watch-engine".into(), start_seconds: 100, start_microseconds: 1, start_stamp: "fixture".into() };

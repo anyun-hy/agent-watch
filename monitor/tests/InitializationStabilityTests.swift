@@ -23,15 +23,15 @@ struct InitializationStabilityTests {
                                  aiChecks: AIProbeStore(isFixture: true), switcher: backend)
         store.beginInitialization(startSnapshotPolling: false)
         let start = Date()
-        store.monitorTick(at: start)
+        store.publicationsDidChange(.service, at: start)
         try? await Task.sleep(nanoseconds: 100_000_000)
         guard let first = backend.background?.observed_at else {
-            expect(false, "initialization must read service status on the normal timer"); return
+            expect(false, "initialization must read service status on service publication"); return
         }
-        store.monitorTick(at: start.addingTimeInterval(4))
+        store.publicationsDidChange(.service, at: start.addingTimeInterval(4))
         try? await Task.sleep(nanoseconds: 100_000_000)
         expect(backend.background?.observed_at == first, "status reads remain rate-limited")
-        store.monitorTick(at: start.addingTimeInterval(5))
+        store.publicationsDidChange(.service, at: start.addingTimeInterval(5))
         try? await Task.sleep(nanoseconds: 100_000_000)
         guard let second = backend.background?.observed_at else {
             expect(false, "the next service status must be available"); return

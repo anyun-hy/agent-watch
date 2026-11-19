@@ -200,11 +200,14 @@ struct EventTimelinePage: View {
             guard hasHistoryBackend else { return }
             requestID = UUID(); history = []; hasLoaded = false; hasMore = false
             historyError = false; invalidRecords = 0; showingOlder = false; loading = true
+            let (updates, continuation) = AsyncStream<Void>.makeStream(bufferingPolicy: .bufferingNewest(1))
+            let subscription = store.historyUpdated.sink { continuation.yield(()) }
+            defer { subscription.cancel(); continuation.finish() }
             do { try await Task.sleep(nanoseconds: 250_000_000) } catch { return }
             await loadHistory(reset: true)
-            while !Task.isCancelled {
-                do { try await Task.sleep(nanoseconds: 15_000_000_000) } catch { return }
-                if store.automatic && !showingOlder { await loadHistory(reset: true) }
+            for await _ in updates {
+                guard !Task.isCancelled else { return }
+                if store.automatic && !showingOlder && !loading { await loadHistory(reset: true) }
             }
         }
     }

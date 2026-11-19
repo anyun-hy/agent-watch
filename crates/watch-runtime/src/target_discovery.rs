@@ -358,8 +358,12 @@ struct PublishedObservation {
     hint_stamp: Option<(Vec<i128>, Option<PathBuf>)>,
     input_revision: u64,
 }
+pub const APPLICATION_REGISTRY_MAX_AGE: Duration = Duration::from_secs(30);
+
 #[derive(Default)]
 struct ObservationState {
+    publications: claude_watch_system::network_events::LocalNotifications,
+    refresh_requests: claude_watch_system::network_events::LocalNotifications,
     enabled: AtomicBool,
     inputs: Mutex<ObservedInputs>,
     published: Mutex<Option<Arc<PublishedObservation>>>,
@@ -544,7 +548,7 @@ impl DiscoveryCache {
         if self.inputs.query_registry
             && self
                 .last_registry_at
-                .is_none_or(|at| !now.is_finite() || now < at || now - at >= 30.0)
+                .is_none_or(|at| !now.is_finite() || now < at || now - at >= APPLICATION_REGISTRY_MAX_AGE.as_secs_f64())
         {
             let prior_issues = self.registry_issues.clone();
             self.registry_issues.clear();
@@ -1647,7 +1651,10 @@ impl DiscoveryHandle {
             hint_path: Paths { home: cache.inputs.home.clone() }.watch().join("state/target-discovery-hints.json"),
             hint_stamp: cache.hint_stamp.clone(),
         });
-        *self.2.published.lock().unwrap() = Some(publication);
+        let old = self.2.published.lock().unwrap().replace(publication);
+        if old.is_none_or(|old| old.snapshot.revision != snapshot.revision) {
+            self.2.publications.publish();
+        }
         snapshot
     }
     /// The daemon owns the refresh worker. Other callers retain the existing
@@ -1655,6 +1662,41 @@ impl DiscoveryHandle {
     pub fn enable_background_observation(&self) {
         self.2.enabled.store(true, Ordering::Release);
     }
+    pub fn subscribe_publications(&self) -> std::io::Result<std::os::unix::net::UnixStream> {
+        self.2.publications.subscribe()
+    }
+    pub fn installed_target_paths(&self) -> Vec<PathBuf> {
+        let view = self.2.published.lock().unwrap().clone();
+        let mut paths = BTreeSet::new();
+        if let Some(view) = view {
+            paths.insert(view.hint_path.clone());
+            for record in &view.snapshot.targets {
+                paths.insert(record.entry_path.clone());
+                paths.extend(record.executable.iter().chain(&record.script_entry).chain(&record.interpreter).chain(&record.child_executables).cloned());
+                if let Some(bundle) = &record.bundle { paths.insert(bundle.join("Contents/Info.plist")); }
+            }
+        }
+        paths.into_iter().collect()
+    }
+    /// Install and replacement notifications wake the owner of the discovery cache.
+    /// LaunchServices also covers applications outside these directories, so its
+    /// independent evidence deadline still applies.
+    pub fn background_watch_paths(&self) -> Vec<PathBuf> {
+        let mut paths: BTreeSet<_> = self.installed_target_paths().into_iter().collect();
+        let cache = self.0.lock().unwrap();
+        paths.extend(cache.inputs.application_roots.iter().cloned());
+        paths.extend(cache.signature.iter().map(|(path, _, _)| path)
+            .filter(|path| cache.directories.contains_key(*path)).cloned());
+        paths.extend(cache.inputs.prefixes.iter().map(|prefix| prefix.join("bin")));
+        paths.extend(cache.inputs.daemon_path.iter().chain(&cache.inputs.caller_path)
+            .chain(cache.inputs.caller_paths.values().flatten()).cloned());
+        paths.into_iter().collect()
+    }
+    pub fn subscribe_background_requests(&self) -> std::io::Result<std::os::unix::net::UnixStream> {
+        self.2.refresh_requests.subscribe()
+    }
+    pub fn request_background_refresh(&self) { self.2.refresh_requests.publish(); }
+
     /// No slow scan/content-approval lock, external command, or new authority.
     /// Metadata checks happen after releasing both short publication locks.
     pub fn observation_snapshot<R: ReadRunner + ?Sized>(&self, reader: &R, now: f64) -> Arc<DiscoverySnapshot> {
@@ -1686,6 +1728,7 @@ impl DiscoveryHandle {
             }
         }
         if pending {
+            self.request_background_refresh();
             snapshot.complete = false;
             snapshot.issues.push("target_discovery_refresh_pending".into());
             snapshot.issues.sort(); snapshot.issues.dedup();
@@ -1976,6 +2019,7 @@ impl DiscoveryHandle {
             if inputs.bundles.as_ref() != Some(&observed) {
                 inputs.bundles = Some(observed);
                 inputs.revision = inputs.revision.saturating_add(1);
+                self.request_background_refresh();
             }
             return;
         }
@@ -2001,7 +2045,10 @@ impl DiscoveryHandle {
                     else { inputs.cli_entries.push(entry); changed = true; }
                 }
             }
-            if changed || old_partial != inputs.cli_partial { inputs.revision = inputs.revision.saturating_add(1); }
+            if changed || old_partial != inputs.cli_partial {
+                inputs.revision = inputs.revision.saturating_add(1);
+                self.request_background_refresh();
+            }
             return;
         }
         let mut cache = self.0.lock().unwrap();
@@ -2042,7 +2089,10 @@ impl DiscoveryHandle {
                     } else { inputs.interpreters.insert(script, interpreter); changed = true; }
                 }
             }
-            if changed || old_partial != inputs.interpreters_partial { inputs.revision = inputs.revision.saturating_add(1); }
+            if changed || old_partial != inputs.interpreters_partial {
+                inputs.revision = inputs.revision.saturating_add(1);
+                self.request_background_refresh();
+            }
             return;
         }
         let mut cache = self.0.lock().unwrap();

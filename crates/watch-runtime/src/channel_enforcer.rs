@@ -312,6 +312,22 @@ struct FamilyEnforcerState {
     last_updated_at: f64,
 }
 impl FamilyEnforcerState {
+    fn lease_to_check(&self) -> Option<&ChannelEnforcementCommand> {
+        if self.local_revoke_reason.is_none() || self.enforcement_state == ChannelEnforcementState::Forwarding
+            || self.active_flows.values().any(|flow| flow.close_requested_at.is_none())
+        {
+            self.command.as_ref()
+        } else {
+            None
+        }
+    }
+
+    fn disconnect_deadline(&self, timeout: f64) -> Option<f64> {
+        if self.enforcement_state != ChannelEnforcementState::Disconnecting { return None; }
+        self.active_flows.values().filter_map(|flow| flow.close_requested_at)
+            .min_by(f64::total_cmp).map(|at| at + timeout)
+    }
+
     fn new(now: f64) -> Self {
         Self {
             command: None,
@@ -345,6 +361,7 @@ type ContextSocketAttributor = Arc<
 >;
 
 struct EnforcerInner {
+    lease_watchdog: Option<thread::Thread>,
     boot_id: String,
     backend: NetworkBackendKind,
     sandbox_ready: bool,
@@ -377,6 +394,17 @@ struct EnforcerInner {
 }
 
 impl EnforcerInner {
+    fn wake_lease_watchdog(&self) {
+        if let Some(worker) = &self.lease_watchdog { worker.unpark(); }
+    }
+
+    fn next_deadline(&self) -> Option<f64> {
+        self.families.values().flat_map(|state| [
+            state.lease_to_check().map(|command| command.permit.valid_until),
+            state.disconnect_deadline(self.disconnect_timeout_seconds),
+        ].into_iter().flatten()).min_by(f64::total_cmp)
+    }
+
     // Call under the authority lock. A caller timestamp is only a fallback
     // for explicit, clockless fixture timelines, never the live executor time.
     fn execution_now(&self, fallback: impl FnOnce() -> f64) -> f64 {
@@ -414,6 +442,7 @@ impl LocalTunnelEnforcer {
         local_control_endpoints.insert("localhost:ipc".into());
         Self {
             inner: Arc::new(Mutex::new(EnforcerInner {
+                lease_watchdog: None,
                 boot_id: boot_id.into(),
                 backend: NetworkBackendKind::Seatbelt,
                 sandbox_ready: false,
@@ -637,6 +666,7 @@ impl LocalTunnelEnforcer {
     {
         let mut guard = self.lock()?;
         guard.clock = Some(Arc::new(clock));
+        guard.wake_lease_watchdog();
         Ok(())
     }
 
@@ -873,6 +903,7 @@ impl LocalTunnelEnforcer {
                     now,
                 );
             }
+            guard.wake_lease_watchdog();
             Self::build_receipt_locked(&guard, family, now)?
         };
         let receipt = self.publish_current_receipt(&receipt)?;
@@ -919,6 +950,7 @@ impl LocalTunnelEnforcer {
                     now,
                 );
             }
+            guard.wake_lease_watchdog();
             Self::build_receipt_locked(&guard, family, now)?
         };
         let receipt = self.publish_current_receipt(&receipt)?;
@@ -929,37 +961,25 @@ impl LocalTunnelEnforcer {
     /// disconnect timeout without confirmation, transitioning the family to
     /// `Failed` (`flow_termination_timeout`).
     pub fn check_disconnect_timeouts(&self, now: f64) -> Result<Vec<ChannelEnforcementReceipt>> {
-        self.check_disconnect_timeouts_with_clock(|| now)
+        let mut guard = self.lock()?;
+        let now = guard.execution_now(|| now);
+        Self::check_disconnect_timeouts_locked(&mut guard, now)
     }
 
-    fn check_disconnect_timeouts_with_clock(
-        &self, fallback: impl FnOnce() -> f64,
-    ) -> Result<Vec<ChannelEnforcementReceipt>> {
-        let timed_out_receipts = {
-            let mut guard = self.lock()?;
-            let now = guard.execution_now(fallback);
-            let timeout = guard.disconnect_timeout_seconds;
-            let families: Vec<String> = guard.families.keys().cloned().collect();
-            let mut timed_out_receipts = Vec::new();
-            for family in families {
-                let expired = guard.families.get(&family).is_some_and(|state| {
-                    state.enforcement_state == ChannelEnforcementState::Disconnecting
-                        && state.active_flows.values().any(|flow| {
-                            flow.close_requested_at
-                                .is_some_and(|at| now - at >= timeout)
-                        })
-                });
-                if expired {
-                    if let Some(state) = guard.families.get_mut(&family) {
-                        state.enforcement_state = ChannelEnforcementState::Failed;
-                        state.last_error_code = Some("flow_termination_timeout".into());
-                        state.last_updated_at = now;
-                    }
-                    timed_out_receipts.push(Self::build_receipt_locked(&guard, &family, now)?);
-                }
+    fn check_disconnect_timeouts_locked(guard: &mut EnforcerInner, now: f64) -> Result<Vec<ChannelEnforcementReceipt>> {
+        let mut timed_out_receipts = Vec::new();
+        let mut expired = Vec::new();
+        for (family, state) in &mut guard.families {
+            if state.disconnect_deadline(guard.disconnect_timeout_seconds).is_some_and(|at| now >= at) {
+                state.enforcement_state = ChannelEnforcementState::Failed;
+                state.last_error_code = Some("flow_termination_timeout".into());
+                state.last_updated_at = now;
+                if state.command.is_some() { expired.push(family.clone()); }
             }
-            timed_out_receipts
-        };
+        }
+        for family in expired {
+            timed_out_receipts.push(Self::build_receipt_locked(guard, &family, now)?);
+        }
         Ok(timed_out_receipts)
     }
 
@@ -1198,7 +1218,7 @@ impl LocalTunnelEnforcer {
         bind_addr: &str,
         stop: Arc<AtomicBool>,
         now: f64,
-    ) -> Result<(SocketAddr, thread::JoinHandle<()>)> {
+    ) -> Result<(SocketAddr, claude_watch_system::ListenerWorker)> {
         let listener = match TcpListener::bind(bind_addr) {
             Ok(l) => l,
             Err(_) => {
@@ -1218,7 +1238,7 @@ impl LocalTunnelEnforcer {
         self: &Arc<Self>,
         verified: claude_watch_system::launchd_gateway::VerifiedGatewayListener,
         stop: Arc<AtomicBool>, now: f64,
-    ) -> Result<(SocketAddr, thread::JoinHandle<()>)> {
+    ) -> Result<(SocketAddr, claude_watch_system::ListenerWorker)> {
         let (listener, protection) = verified.into_parts();
         self.start_proxy_on_listener(listener, Some(protection), stop, now)
     }
@@ -1232,7 +1252,7 @@ impl LocalTunnelEnforcer {
         self: &Arc<Self>, listener: TcpListener,
         protection: Option<claude_watch_system::launchd_gateway::GatewayEndpointProtection>,
         stop: Arc<AtomicBool>, now: f64,
-    ) -> Result<(SocketAddr, thread::JoinHandle<()>)> {
+    ) -> Result<(SocketAddr, claude_watch_system::ListenerWorker)> {
         listener.set_nonblocking(true).map_err(|error| CoreError::new("enforcer_listener_mode_failed", &error.to_string()))?;
         let bound_addr = match listener.local_addr() {
             Ok(a) => a,
@@ -1267,10 +1287,8 @@ impl LocalTunnelEnforcer {
             guard.seed_wall_clock(now);
         }
         let enforcer = Arc::clone(self);
-        let handle = thread::Builder::new()
-            .name("channel-local-proxy-listener".into())
-            .spawn(move || {
-                while !stop.load(Ordering::Acquire) {
+        let handle = claude_watch_system::ListenerWorker::spawn("channel-local-proxy-listener", move |cancel| {
+                while claude_watch_system::listener_readable(&listener, &cancel, &stop) {
                     match listener.accept() {
                         Ok((incoming, peer_addr)) => {
                             if !peer_addr.ip().is_loopback() {
@@ -1295,10 +1313,7 @@ impl LocalTunnelEnforcer {
                                 enforcer.ingress_diagnostic("gateway_client_worker_failed");
                             }
                         }
-                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                            thread::sleep(Duration::from_millis(25));
-                        }
-                        Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                        Err(e) if matches!(e.kind(), std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock) => continue,
                         Err(_) => break,
                     }
                 }
@@ -2625,14 +2640,12 @@ impl LocalTunnelEnforcer {
         Ok(self.lock()?.traces.clone())
     }
 
-    /// Spawns an autonomous background watchdog thread that proactively checks
-    /// lease deadlines (`now >= valid_until`) at a fixed interval, cutting off
-    /// existing connections even when Rust stops renewing leases and no new
-    /// connections arrive.
+    /// Enforce the earliest lease or socket-close deadline independently of the
+    /// supervisor. State writers unpark the worker under the authority lock, so
+    /// a change during receipt delivery or immediately before parking is retained.
     pub fn spawn_lease_watchdog<F>(
         self: &Arc<Self>,
         stop: Arc<AtomicBool>,
-        interval: Duration,
         mut clock: F,
     ) -> Result<thread::JoinHandle<()>>
     where
@@ -2642,17 +2655,28 @@ impl LocalTunnelEnforcer {
         thread::Builder::new()
             .name("channel-lease-watchdog".into())
             .spawn(move || {
+                let Ok(mut guard) = enforcer.lock() else { return; };
+                guard.lease_watchdog = Some(thread::current());
+                drop(guard);
                 while !stop.load(Ordering::Acquire) {
-                    let mut emitted = enforcer
-                        .enforce_active_deadlines_with_clock(&mut clock, false)
-                        .unwrap_or_default();
-                    if let Ok(mut timeouts) = enforcer.check_disconnect_timeouts_with_clock(&mut clock) {
-                        emitted.append(&mut timeouts);
+                    let Ok(mut guard) = enforcer.lock() else { return; };
+                    let mut emitted = Vec::new();
+                    let mut wait = None;
+                    let started = Instant::now();
+                    if guard.next_deadline().is_some() {
+                        let now = guard.execution_now(&mut clock);
+                        emitted = Self::enforce_active_deadlines_locked(&mut guard, now, false).unwrap_or_default();
+                        if let Ok(mut timeouts) = Self::check_disconnect_timeouts_locked(&mut guard, now) {
+                            emitted.append(&mut timeouts);
+                        }
+                        wait = guard.next_deadline().and_then(|at| Duration::try_from_secs_f64((at - now).max(0.)).ok());
                     }
+                    drop(guard);
                     for receipt in emitted {
                         let _ = enforcer.publish_current_receipt(&receipt);
                     }
-                    thread::sleep(interval);
+                    if let Some(wait) = wait { thread::park_timeout(wait.saturating_sub(started.elapsed())); }
+                    else { thread::park(); }
                 }
             })
             .map_err(|_| CoreError::new("lease_watchdog_start_failed", "通道租约到期巡检线程无法启动"))
@@ -2714,6 +2738,7 @@ impl LocalTunnelEnforcer {
                 "底层套接字已关闭并确认断开".into(), now,
             );
         }
+        if removed.close_requested_at.is_some() { guard.wake_lease_watchdog(); }
         Self::build_receipt_locked(guard, family, now).ok()
     }
 
@@ -2784,6 +2809,7 @@ impl LocalTunnelEnforcer {
                 );
             }
         }
+        guard.wake_lease_watchdog();
         closing_ids
     }
 
@@ -3238,6 +3264,7 @@ impl ChannelEnforcer for LocalTunnelEnforcer {
                     }
                 }
             }
+            guard.wake_lease_watchdog();
             Self::build_receipt_locked(&guard, &command.family, now)?
         };
         // The caller ingests this result inline. Only autonomous executor
@@ -3264,7 +3291,9 @@ impl ChannelEnforcer for LocalTunnelEnforcer {
         now: f64,
         woke_from_sleep: bool,
     ) -> Result<Vec<ChannelEnforcementReceipt>> {
-        self.enforce_active_deadlines_with_clock(|| now, woke_from_sleep)
+        let mut guard = self.lock()?;
+        let now = guard.execution_now(|| now);
+        Self::enforce_active_deadlines_locked(&mut guard, now, woke_from_sleep)
     }
 
     fn local_proxy_port(&self) -> Option<u16> {
@@ -3276,45 +3305,22 @@ impl ChannelEnforcer for LocalTunnelEnforcer {
 }
 
 impl LocalTunnelEnforcer {
-    fn enforce_active_deadlines_with_clock(
-        &self,
-        fallback: impl FnOnce() -> f64,
+    fn enforce_active_deadlines_locked(
+        guard: &mut EnforcerInner,
+        now: f64,
         woke_from_sleep: bool,
     ) -> Result<Vec<ChannelEnforcementReceipt>> {
-        let updated = {
-            let mut guard = self.lock()?;
-            let now = guard.execution_now(fallback);
-            let last_wall = guard.last_wall_now;
-            guard.last_wall_now = Some(now);
-            let families: Vec<String> = guard.families.keys().cloned().collect();
-            let mut updated = Vec::new();
-            for family in families {
-                let should_revoke = guard.families.get(&family).and_then(|state| {
-                    let cmd = state.command.as_ref()?;
-                    let policy = &cmd.policy_version;
-                    let (eff_state, reason) = cmd.permit.effective_state_with_clock(
-                        now,
-                        last_wall,
-                        woke_from_sleep,
-                        policy,
-                    );
-                    if eff_state == ChannelPermitState::Revoked
-                        && (state.local_revoke_reason.is_none()
-                            || state.enforcement_state == ChannelEnforcementState::Forwarding
-                            || !state.active_flows.is_empty())
-                    {
-                        Some(reason)
-                    } else {
-                        None
-                    }
-                });
-                if let Some(reason) = should_revoke {
-                    Self::begin_autonomous_revoke_locked(&mut guard, &family, reason, now);
-                    updated.push(Self::build_receipt_locked(&guard, &family, now)?);
-                }
-            }
-            updated
-        };
+        let last_wall = guard.last_wall_now.replace(now);
+        let expired: Vec<_> = guard.families.iter().filter_map(|(family, state)| {
+            let cmd = state.lease_to_check()?;
+            let (effective, reason) = cmd.permit.effective_state_with_clock(now, last_wall, woke_from_sleep, &cmd.policy_version);
+            (effective == ChannelPermitState::Revoked).then(|| (family.clone(), reason))
+        }).collect();
+        let mut updated = Vec::new();
+        for (family, reason) in expired {
+            Self::begin_autonomous_revoke_locked(guard, &family, reason, now);
+            updated.push(Self::build_receipt_locked(guard, &family, now)?);
+        }
         Ok(updated)
     }
 }
@@ -3439,6 +3445,72 @@ mod control_rpc_contracts {
         peer.write_all(&byte).unwrap();
         client.read_exact(&mut byte).unwrap();
         assert_eq!(byte, [data]);
+    }
+
+    #[test]
+    fn watchdog_parks_without_a_lease_and_rearms_on_renewal() {
+        use std::sync::mpsc::{channel, RecvTimeoutError};
+        let enforcer = Arc::new(LocalTunnelEnforcer::new("publication-boot"));
+        enforcer.activate_interception(100.).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let start = Instant::now();
+        let (sampled, samples) = channel();
+        let handle = enforcer.spawn_lease_watchdog(stop.clone(), move || {
+            sampled.send(()).unwrap();
+            100. + start.elapsed().as_secs_f64()
+        }).unwrap();
+        assert_eq!(samples.recv_timeout(Duration::from_millis(320)), Err(RecvTimeoutError::Timeout));
+
+        let (sent, receipts) = channel();
+        enforcer.set_receipt_event_sink(move |r| { let _ = sent.send(r); }).unwrap();
+        let mut cmd = publication_command();
+        let now = 100. + start.elapsed().as_secs_f64();
+        cmd.permit.valid_until = now + 0.5;
+        enforcer.apply_command(&cmd, now).unwrap();
+        samples.recv_timeout(Duration::from_secs(1)).expect("a new command wakes the idle executor");
+        cmd.command_seq += 1;
+        cmd.permit.command_seq = cmd.command_seq;
+        cmd.permit.valid_until += 0.5;
+        enforcer.apply_command(&cmd, now).unwrap();
+        samples.recv_timeout(Duration::from_secs(1)).expect("renewal wakes the old deadline");
+        assert!(matches!(receipts.recv_timeout(Duration::from_millis(550)), Err(RecvTimeoutError::Timeout)));
+        let receipt = receipts.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(receipt.command_seq, cmd.command_seq);
+        assert_eq!(receipt.enforcement_state, ChannelEnforcementState::Blocked);
+        assert!(receipt.observed_at >= cmd.permit.valid_until);
+        stop.store(true, Ordering::Release);
+        handle.thread().unpark();
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn watchdog_waits_for_the_original_disconnect_confirmation_deadline() {
+        use std::sync::mpsc::channel;
+        let enforcer = Arc::new(LocalTunnelEnforcer::new("publication-boot"));
+        enforcer.activate_interception(100.).unwrap();
+        enforcer.set_defer_auto_flow_confirm(true).unwrap();
+        enforcer.lock().unwrap().disconnect_timeout_seconds = 0.15;
+        let cmd = publication_command();
+        enforcer.apply_command(&cmd, 100.).unwrap();
+        let (_client, _peer) = open_clock_fixture_flow(&enforcer, &cmd);
+        let stop = Arc::new(AtomicBool::new(false));
+        let start = Instant::now();
+        let handle = enforcer.spawn_lease_watchdog(stop.clone(), move || 100. + start.elapsed().as_secs_f64()).unwrap();
+        let (sent, receipts) = channel();
+        enforcer.set_receipt_event_sink(move |r| { let _ = sent.send(r); }).unwrap();
+        let closing = enforcer.revoke_family("claude", "test_revoke", 100.).unwrap().unwrap();
+        assert_eq!(closing.enforcement_state, ChannelEnforcementState::Disconnecting);
+        let failed = loop {
+            let receipt = receipts.recv_timeout(Duration::from_secs(2)).unwrap();
+            if receipt.enforcement_state == ChannelEnforcementState::Failed { break receipt; }
+        };
+        assert_eq!(failed.error_code.as_deref(), Some("flow_termination_timeout"));
+        assert!(failed.observed_at >= 100.15);
+        assert!(!failed.active_flows_closed);
+        assert_eq!(failed.active_flows_count, 1);
+        stop.store(true, Ordering::Release);
+        handle.thread().unpark();
+        handle.join().unwrap();
     }
 
     #[test]
@@ -3664,7 +3736,7 @@ mod control_rpc_contracts {
             fixture_peer.load(Ordering::Acquire).then(|| ("claude".into(), token.clone()))).unwrap();
         let stop = Arc::new(AtomicBool::new(false));
         let (addr, listener) = enforcer.start_local_proxy_listener("127.0.0.1:0", stop.clone(), 100.).unwrap();
-        struct Listener(Arc<AtomicBool>, Option<thread::JoinHandle<()>>);
+        struct Listener(Arc<AtomicBool>, Option<claude_watch_system::ListenerWorker>);
         impl Drop for Listener {
             fn drop(&mut self) {
                 self.0.store(true, Ordering::Release);

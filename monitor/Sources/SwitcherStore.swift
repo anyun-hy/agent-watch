@@ -774,6 +774,7 @@ final class SwitcherStore: ObservableObject {
     /// detections, 30 (DNS_LAUNCH_TTL) for launch-grade rounds.
     var onDNSReceiptRecorded: (() -> Void)?
     var onWebRTCRiskRecorded: (() -> Void)?
+    var onBackgroundUpdated: (() -> Void)?
     var onConfigUpdated: (() -> Void)?
     /// Test-only transport; production configuration always uses the Rust command runner.
     var configurationCommandFixture: (([String], Data) async throws -> Data)?
@@ -1331,12 +1332,14 @@ final class SwitcherStore: ObservableObject {
         guard readingEnvironment else { return true }
         waitingForEnvironmentRead = true
         cancelCurrentDetection()
-        let deadline = Date().addingTimeInterval(environmentReadWaitTimeout)
-        while readingEnvironment && Date() < deadline {
-            try? await Task.sleep(nanoseconds: 50_000_000)
-        }
-        waitingForEnvironmentRead = false
-        return !readingEnvironment
+        let (finished, continuation) = AsyncStream<Void>.makeStream()
+        let subscription = $readingEnvironment.first { !$0 }.sink { _ in continuation.finish() }
+        let timeout = DispatchWorkItem { continuation.finish() }
+        DispatchQueue.main.asyncAfter(deadline: .now() + environmentReadWaitTimeout, execute: timeout)
+        defer { subscription.cancel(); timeout.cancel(); waitingForEnvironmentRead = false }
+        var iterator = finished.makeAsyncIterator()
+        _ = await iterator.next()
+        return !Task.isCancelled && !readingEnvironment
     }
     private func beginActivity(_ text: String) -> Int {
         activityGeneration += 1
@@ -1450,6 +1453,7 @@ final class SwitcherStore: ObservableObject {
                 backgroundReadFailureCode = "missing_" + BackendInitializationDiagnostics.code(key.stringValue)
             } else if error is DecodingError { backgroundReadFailureCode = "decode_failed" }
             else { backgroundReadFailureCode = "read_error_\((error as NSError).code)" }
+            onBackgroundUpdated?()
         }
     }
     private func publishBackground(_ value: BackgroundServiceReceipt) {
@@ -1460,6 +1464,7 @@ final class SwitcherStore: ObservableObject {
            value.observed_at.isFinite, value.observed_at < previous.observed_at { return }
         advanceLoginClock(Date())
         background = value; backgroundError = ""; backgroundReadFailureCode = nil
+        onBackgroundUpdated?()
     }
     #if UI_REVIEW
     func publishBackgroundForFixture(_ value: BackgroundServiceReceipt) {

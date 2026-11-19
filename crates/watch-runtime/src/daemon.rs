@@ -13,10 +13,13 @@ use std::collections::BTreeMap;
 pub const PROCESS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 pub const NETWORK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
 
-pub struct ShutdownSignals(Vec<signal_hook::SigId>);
+pub struct ShutdownSignals {
+    handlers: Vec<signal_hook::SigId>,
+    pub wake: std::os::unix::net::UnixStream,
+}
 impl Drop for ShutdownSignals {
     fn drop(&mut self) {
-        for id in self.0.drain(..) {
+        for id in self.handlers.drain(..) {
             signal_hook::low_level::unregister(id);
         }
     }
@@ -24,12 +27,12 @@ impl Drop for ShutdownSignals {
 pub fn shutdown_signals(
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<ShutdownSignals> {
-    let mut signals = ShutdownSignals(Vec::new());
+    let unavailable = |_| CoreError::new("daemon_signal_failed", "后台停止信号无法注册");
+    let (wake, sender) = std::os::unix::net::UnixStream::pair().map_err(unavailable)?;
+    let mut signals = ShutdownSignals { handlers: Vec::new(), wake };
     for signal in [signal_hook::consts::SIGTERM, signal_hook::consts::SIGINT] {
-        signals.0.push(
-            signal_hook::flag::register(signal, stop.clone())
-                .map_err(|_| CoreError::new("daemon_signal_failed", "后台停止信号无法注册"))?,
-        );
+        signals.handlers.push(signal_hook::flag::register(signal, stop.clone()).map_err(unavailable)?);
+        signals.handlers.push(signal_hook::low_level::pipe::register(signal, sender.try_clone().map_err(unavailable)?).map_err(unavailable)?);
     }
     Ok(signals)
 }

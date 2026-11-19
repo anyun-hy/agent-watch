@@ -177,6 +177,107 @@ fn captured_listener(server: &MockControllerServer, captured_at: f64, sequence: 
 }
 
 #[test]
+fn listener_event_only_refreshes_vpn_facts_on_change_recovery_or_deadline() {
+    use claude_watch_core::error::CoreError;
+    let (server, expectation) = live_owner_fixture();
+    let frame = Arc::new(Mutex::new(captured_listener(&server, 1000.0, 1, "A")));
+    let input = Arc::clone(&frame);
+    let reader = HttpControllerVpnReader::new_live("tag", server.credentials())
+        .with_listener_snapshot_result(Box::new(move |_| Ok(input.lock().unwrap().clone())));
+    let (_dir, store) = setup_store();
+    let mut observer = VpnObserver::new("events", Some(store.clone()));
+    let mut sent = Vec::new();
+    observer.observe_listener_event(&reader, &expectation, true, 1000.0, || None, |obs| { sent.push(obs.clone()); Ok(()) }).unwrap();
+    assert_eq!(sent.len(), 1);
+    assert!(sent[0].source_error.is_none());
+    let requests = server.request_paths.lock().unwrap().len();
+    assert!(requests > 0);
+    let original = std::fs::read(store.paths.base().join("vpn-observation.json")).unwrap();
+    for i in 2..=9 {
+        let at = 1000.0 + (i as f64 / 10.0);
+        *frame.lock().unwrap() = captured_listener(&server, at, i, "A");
+        observer.observe_listener_event(&reader, &expectation, false, at, || None, |obs| { sent.push(obs.clone()); Ok(()) }).unwrap();
+    }
+    assert_eq!(sent.len(), 1);
+    assert_eq!(server.request_paths.lock().unwrap().len(), requests);
+    assert_eq!(std::fs::read(store.paths.base().join("vpn-observation.json")).unwrap(), original);
+    assert_eq!(observer.state.current_observation().unwrap().valid_until, 1003.5);
+    *frame.lock().unwrap() = captured_listener(&server, 1002.4, 10, "A");
+    observer.observe_listener_event(&reader, &expectation, true, 1002.5, || None, |obs| { sent.push(obs.clone()); Ok(()) }).unwrap();
+    assert_eq!(sent.len(), 2);
+    assert!(server.request_paths.lock().unwrap().len() > requests);
+    assert_eq!(sent[1].epoch, sent[0].epoch);
+    assert_eq!(sent[1].valid_until, 1005.9);
+    // A replacement during a healthy epoch withdraws evidence before HTTP resumes.
+    *frame.lock().unwrap() = captured_listener(&server, 1002.6, 1, "A2");
+    observer.observe_listener_event(&reader, &expectation, false, 1002.7, || None, |obs| { sent.push(obs.clone()); Ok(()) }).unwrap();
+    assert_eq!(sent[2].source_error.as_deref(), Some("vpn_listener_identity_changed"));
+    assert!(sent[3].source_error.is_none());
+    // The sticky loss during HTTP suppresses the result even after the source reconnected.
+    let loss = observer.observe_listener_event(&reader, &expectation, true, 1003.0,
+        || Some(CoreError::new("native_listener_closed", "EOF")), |obs| { sent.push(obs.clone()); Ok(()) }).unwrap_err();
+    assert_eq!(sent.len(), 4);
+    assert!(observer.invalidate_if_changed(&loss.code, &expectation, 1003.0).is_some());
+    assert!(observer.invalidate_if_changed(&loss.code, &expectation, 1003.1).is_none());
+    *frame.lock().unwrap() = captured_listener(&server, 1003.1, 1, "B");
+    observer.observe_listener_event(&reader, &expectation, false, 1003.2, || None, |obs| { sent.push(obs.clone()); Ok(()) }).unwrap();
+    assert_eq!(sent.len(), 5, "recovery publishes once after the outstanding loss");
+    assert!(sent[4].source_error.is_none());
+    assert_ne!(sent[4].epoch, sent[3].epoch);
+    let count = server.request_paths.lock().unwrap().len();
+    for (at, sequence, expected) in [(1003.2, 1, "vpn_listener_snapshot_out_of_order"), (995.0, 2, "vpn_listener_snapshot_stale")] {
+        *frame.lock().unwrap() = captured_listener(&server, at, sequence, "B");
+        let error = observer.observe_listener_event(&reader, &expectation, false, 1003.3, || None, |_| panic!("invalid frame published")).unwrap_err();
+        assert_eq!(error.code, expected);
+    }
+    assert_eq!(server.request_paths.lock().unwrap().len(), count);
+    observer.invalidate_network_event("system_wake", &expectation, 1005.0).unwrap();
+    *frame.lock().unwrap() = captured_listener(&server, 1004.5, 2, "B");
+    observer.observe_listener_event(&reader, &expectation, true, 1005.1, || None,
+        |_| panic!("pre-wake frame republished")).unwrap();
+    assert_eq!(server.request_paths.lock().unwrap().len(), count);
+    observer.invalidate_network_event("clock_discontinuity", &expectation, 900.0).unwrap();
+    *frame.lock().unwrap() = captured_listener(&server, 900.1, 3, "B");
+    observer.observe_listener_event(&reader, &expectation, true, 900.2, || None,
+        |obs| { assert!(obs.source_error.is_none()); Ok(()) }).unwrap();
+    assert_eq!(observer.state.current_observation().unwrap().observed_at, 900.2);
+}
+
+#[test]
+fn vpn_deadline_rechecks_selected_node_even_when_listener_identity_is_unchanged() {
+    let route = |node: &str| json!({"proxies": {
+        "AI": {"name":"AI","type":"Selector","now":node},
+        "US": {"name":"US","type":"Trojan"}, "JP":{"name":"JP","type":"Trojan"}
+    }});
+    let server = MockControllerServer::start(Some(7890),
+        vec![json!({"mode":"rule","mixed-port":7890,"revision":"r1"}),
+             json!({"mode":"rule","mixed-port":7890,"revision":"r1"}),
+             json!({"mode":"rule","mixed-port":7890,"revision":"r2"})],
+        vec![route("US"), route("US"), route("JP")], json!({"rules":[]}));
+    let mut expectation = VpnExpectation::unconfigured();
+    expectation.configured = true;
+    expectation.proxy_mode = "tag".into();
+    expectation.proxy_group = "AI".into();
+    expectation.proxy_url = "http://127.0.0.1:7890".into();
+    expectation.expected_node = Some("US".into());
+    let frame = Arc::new(Mutex::new(captured_listener(&server, 1000.0, 1, "A")));
+    let input = frame.clone();
+    let reader = HttpControllerVpnReader::new_live("tag", server.credentials())
+        .with_listener_snapshot_result(Box::new(move |_| Ok(input.lock().unwrap().clone())));
+    let mut observer = VpnObserver::new("node-change", None);
+    observer.observe_listener_event(&reader, &expectation, true, 1000.0, || None, |_| Ok(())).unwrap();
+    let original = observer.state.current_observation().unwrap().clone();
+    assert!(claude_watch_core::vpn::compare_vpn(&expectation, &original, 1000.0).is_matched());
+    *frame.lock().unwrap() = captured_listener(&server, 1002.0, 2, "A");
+    observer.observe_listener_event(&reader, &expectation, true, 1002.4, || None, |_| Ok(())).unwrap();
+    let next = observer.state.current_observation().unwrap();
+    assert_eq!(next.source_instance, original.source_instance);
+    assert_eq!(next.selected_node, ObservedField::Known("JP".into()));
+    assert_ne!(next.epoch, original.epoch);
+    assert!(!claude_watch_core::vpn::compare_vpn(&expectation, next, 1002.4).is_matched());
+}
+
+#[test]
 fn batch_listener_reads_are_two_per_sample_and_same_frame_cannot_renew_evidence() {
     let (server, expectation) = live_owner_fixture();
     let snapshot = captured_listener(&server, 999.0, 7, "collector-A");

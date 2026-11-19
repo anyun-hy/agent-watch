@@ -16,7 +16,7 @@ final class FirstRunChecks: InitializationChecking {
     private let accessibilityTrusted: () -> Bool
     private let requestAccessibility: () -> Void
     private let connectionNow: () -> Double
-    private let waitForConnectionPoll: () async -> Void
+    private let waitForConnectionChange: (Double, @escaping () -> Bool) async -> Void
     private let startSnapshotPolling: Bool
     private let connectionLog: InitializationConnectionLog
 
@@ -25,17 +25,13 @@ final class FirstRunChecks: InitializationChecking {
          accessibilityTrusted: (() -> Bool)? = nil,
          requestAccessibility: (() -> Void)? = nil,
          connectionNow: @escaping () -> Double = { Date().timeIntervalSince1970 },
-         waitForConnectionPoll: (() async -> Void)? = nil,
+         waitForConnectionChange: ((Double, @escaping () -> Bool) async -> Void)? = nil,
          startSnapshotPolling: Bool = true,
          connectionLog: InitializationConnectionLog? = nil) {
         self.store = store
         self.connectionNow = connectionNow
-        self.waitForConnectionPoll = waitForConnectionPoll ?? { [weak store] in
-            if let store {
-                await store.waitForNextSnapshot()
-            } else {
-                try? await Task.sleep(nanoseconds: 1_000_000_000)
-            }
+        self.waitForConnectionChange = waitForConnectionChange ?? { deadline, changed in
+            await store.waitForConnectionChange(until: Date(timeIntervalSince1970: deadline), changed: changed)
         }
         self.startSnapshotPolling = startSnapshotPolling
         self.connectionLog = connectionLog ?? (store.switcher.isFixture
@@ -89,14 +85,14 @@ final class FirstRunChecks: InitializationChecking {
             // Once the first valid sample arrives, wait for a second source
             // observation only while that first sample is still current.
             // Rereads, gaps and context changes cannot renew this deadline.
+            // Seed service status once. MonitorStore already owns ongoing snapshot
+            // and status reads; their consumers must not schedule the next read.
+            await store.switcher.refreshBackground(maximumAge: 5)
             while !Task.isCancelled {
                 phase = confirmationDeadline == nil ? "waiting_first_sample" : "waiting_next_sample"
                 let deadline = confirmationDeadline ?? startupDeadline
-                guard connectionNow() < deadline else { return finish(lastFailure) }
-                traceConnection(event: "poll_begin", phase: phase, code: "reading_backend", deadline: deadline,
+                traceConnection(event: "poll_begin", phase: phase, code: "evaluating_evidence", deadline: deadline,
                                 candidate: candidate, sampled: candidateSample)
-                await store.switcher.refreshBackground(maximumAge: 5)
-                store.refresh(full: true)
                 let now = connectionNow()
                 let failure = connectionEvidenceFailure(at: now)
                 let observedCode: String
@@ -129,7 +125,10 @@ final class FirstRunChecks: InitializationChecking {
                     }
                     lastFailure = .failed(code: "proxy_next_sample_timeout", detail: "已取得首轮有效代理采样，但未在其有效期内收到同一代理的后续采样。")
                 }
-                await waitForConnectionPoll()
+                let source = connectionObservation(failure: failure)
+                await waitForConnectionChange(confirmationDeadline ?? startupDeadline) {
+                    self.connectionObservation(failure: self.connectionEvidenceFailure(at: self.connectionNow())) != source
+                }
             }
             return finish(.failed(code: "cancelled", detail: "本轮检查已取消，请重新检查。"))
         case .environment:
@@ -159,13 +158,7 @@ final class FirstRunChecks: InitializationChecking {
             guard acceptedSettings == settingsData else { return changedFailure }
             // Watch's newly enabled guard needs time to publish its first real
             // heartbeat. Bound this wait; never manufacture readiness from intent.
-            let deadline = Date().addingTimeInterval(20)
-            repeat {
-                await store.switcher.refreshBackground(maximumAge: 5)
-                if backgroundIsCurrent { break }
-                try? await Task.sleep(nanoseconds: 1_000_000_000)
-            } while Date() < deadline && !Task.isCancelled
-            guard backgroundIsCurrent else { return backgroundFailure }
+            guard await waitForGuardHeartbeat(seconds: 20) else { return backgroundFailure }
             if !hasCurrentProtectionReadback, !(await store.switcher.detectCurrentEnvironment()) {
                 return .failed(code: "environment_unstable", detail: "最终环境检测未完成或上下文不稳定，请重新检查。")
             }
@@ -177,6 +170,12 @@ final class FirstRunChecks: InitializationChecking {
             }
             return validateCurrentEvidence()
         }
+    }
+    private func waitForGuardHeartbeat(seconds: TimeInterval) async -> Bool {
+        let deadline = Date().addingTimeInterval(seconds)
+        await store.switcher.refreshBackground()
+        await store.waitForConnectionChange(until: deadline) { self.backgroundIsCurrent }
+        return !Task.isCancelled && backgroundIsCurrent
     }
     private func checkNetwork(_ step: InitializationStep, forceNew: Bool) async -> InitializationResult {
         guard contextMatches else {
@@ -280,13 +279,7 @@ final class FirstRunChecks: InitializationChecking {
             approvedContext = boundContext
             acceptedSettings = settingsData
             if request.action == .protection {
-                let deadline = Date().addingTimeInterval(15)
-                repeat {
-                    await store.switcher.refreshBackground(maximumAge: 5)
-                    if backgroundIsCurrent { break }
-                    try? await Task.sleep(nanoseconds: 500_000_000)
-                } while Date() < deadline && !Task.isCancelled
-                guard backgroundIsCurrent else { return backgroundFailure }
+                guard await waitForGuardHeartbeat(seconds: 15) else { return backgroundFailure }
                 return .passed("Watch 守护已开启并确认运行心跳，继续联合复核。")
             }
             return .passed("实测环境已保存并回读，继续核对权限及网络。")
@@ -529,6 +522,20 @@ final class FirstRunChecks: InitializationChecking {
             same_candidate_context: candidate.map { $0 == store.initializationContext },
             source_sample_advanced: sampled.flatMap { previous in proxy.map { $0.observedAt > previous } },
             deadline_remaining_seconds: finite(deadline.map { $0 - now })))
+    }
+    // A newer UI read time, wrapper capture time, or service receipt timestamp
+    // alone does not change the decision. Fresh/stale and failure transitions
+    // come from the gate itself; do not maintain a second eligibility rule.
+    private struct ConnectionObservation: Equatable {
+        let failureCode: String?
+        let context: String?
+        let sourceTime: Double?
+    }
+    private func connectionObservation(failure: InitializationResult?) -> ConnectionObservation {
+        let code: String?
+        if case .failed(let reason, _)? = failure { code = reason } else { code = nil }
+        return ConnectionObservation(failureCode: code, context: store.initializationContext,
+                                     sourceTime: code == nil ? store.snapshot?.proxy?.observedAt : nil)
     }
     /// The gate and its diagnostic code use the same facts. Never infer a
     /// proxy outage merely because a cold daemon has not published two rounds.

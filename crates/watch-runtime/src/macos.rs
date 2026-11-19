@@ -176,13 +176,15 @@ pub fn guard_heartbeat_confirmed(
         && crate::config_store::guard_heartbeat_policy_matches(heartbeat, config) == Some(true)
 }
 
+pub const GUARD_SERVICE_PULSE_MAX_AGE: Duration = Duration::from_secs(15);
+
 /// The service pulse is independent of collector completion. A present but
 /// invalid pulse cannot fall back to an older sampling heartbeat.
 fn guard_service_pulse(pulse: &Value, pid: u32, stamp: &str, sample_fresh: bool, now: f64) -> bool {
     if pulse.is_null() { return sample_fresh; }
     pulse["schema"] == 1 && pulse["pid"] == pid
         && pulse["start_stamp"].as_str().is_some_and(|s| s.split_whitespace().eq(stamp.split_whitespace()))
-        && pulse["time"].as_f64().is_some_and(|at| at.is_finite() && (0.0..=15.0).contains(&(now - at)))
+        && pulse["time"].as_f64().is_some_and(|at| at.is_finite() && (0.0..=GUARD_SERVICE_PULSE_MAX_AGE.as_secs_f64()).contains(&(now - at)))
 }
 
 #[cfg(test)]

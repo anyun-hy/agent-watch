@@ -117,7 +117,7 @@ for CW_TARGET_ARCH in $CW_TARGETS; do
   # Build the ControlledEntry desktop wrapper binary
   "$SWIFTC" -swift-version 5 -O -parse-as-library \
     -target "$CW_TARGET_ARCH-apple-macosx$CW_MACOS_MINIMUM" -sdk "$SDK" -module-cache-path "$ROOT/build/module-cache" \
-    -framework AppKit -framework Foundation "$ROOT/Sources/BoundedDiagnosticLog.swift" "$ROOT/ControlledEntry/ControlledEntryApp.swift" \
+    -framework AppKit -framework Foundation "$ROOT/Sources/BoundedDiagnosticLog.swift" "$ROOT/Sources/MonitorPublicationObserver.swift" "$ROOT/ControlledEntry/ControlledEntryApp.swift" \
     -o "$ROOT/build/ControlledEntry.$CW_TARGET_ARCH"
 done
 cp "$ROOT/build/ClaudeWatchMonitor.$CW_BUILD_ARCH" "$APP/Contents/MacOS/ClaudeWatchMonitor"

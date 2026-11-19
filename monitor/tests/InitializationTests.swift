@@ -191,7 +191,7 @@ struct InitializationTests {
                "new protection requires a separate confirmation after DNS and WebRTC have passed")
         expect(!staged.allPassed && !staged.entered && !stagedChecks.calls.contains(.verification), "pending guard approval cannot reach the final gate")
         let beforeGuardPoll = stagedChecks.calls.count
-        await staged.pollAccessibility(at: Date().addingTimeInterval(600))
+        await staged.returnedFromAccessibilitySettings()
         expect(stagedChecks.calls.count == beforeGuardPoll, "other authorization stages never poll accessibility")
         staged.refreshReadiness(at: Date().addingTimeInterval(600))
         expect(staged.approval == protectionApproval && stagedChecks.automaticRefreshes == 0,
@@ -206,18 +206,17 @@ struct InitializationTests {
         let axCoordinator = FirstRunInitialization(checks: axChecks, completed: false, saveCompletion: {})
         await axCoordinator.start()
         let initialAXChecks = axChecks.calls.filter { $0 == .accessibility }.count
-        await axCoordinator.pollAccessibility(at: Date().addingTimeInterval(100))
+        await axCoordinator.returnedFromAccessibilitySettings()
         expect(axChecks.calls.filter { $0 == .accessibility }.count == initialAXChecks, "no polling before user opens settings")
         await axCoordinator.authorize(axApproval)
-        let tick = Date().addingTimeInterval(10)
-        await axCoordinator.pollAccessibility(at: tick)
-        expect(axChecks.calls.filter { $0 == .accessibility }.count == initialAXChecks + 1 && axChecks.approvals == 1, "waiting poll reads trust without reopening settings")
-        await axCoordinator.pollAccessibility(at: tick.addingTimeInterval(1))
-        expect(axChecks.calls.filter { $0 == .accessibility }.count == initialAXChecks + 1, "poll is rate limited")
+        await axCoordinator.returnedFromAccessibilitySettings()
+        expect(axChecks.calls.filter { $0 == .accessibility }.count == initialAXChecks + 1 && axChecks.approvals == 1, "return from settings reads trust without reopening settings")
+        expect(axCoordinator.nextReadinessDeadline == nil, "waiting for permission schedules no time-based trust read")
+        expect(axChecks.calls.filter { $0 == .accessibility }.count == initialAXChecks + 1, "no scheduled repeat while settings remains open")
         axChecks.overrides[.accessibility] = .passed("trusted")
-        await axCoordinator.pollAccessibility(at: tick.addingTimeInterval(3))
+        await axCoordinator.returnedFromAccessibilitySettings()
         expect(axCoordinator.allPassed && axChecks.calls.filter { $0 == .dns }.count == 1, "real trust confirmation continues once")
-        await axCoordinator.pollAccessibility(at: tick.addingTimeInterval(30))
+        await axCoordinator.returnedFromAccessibilitySettings()
         expect(axChecks.calls.filter { $0 == .dns }.count == 1 && axChecks.approvals == 1, "completed authorization never polls or continues twice")
         let axRetryChecks = ScriptedInitializationChecks()
         axRetryChecks.overrides[.accessibility] = .approval(axApproval)
@@ -225,19 +224,19 @@ struct InitializationTests {
         let axRetry = FirstRunInitialization(checks: axRetryChecks, completed: false, saveCompletion: {})
         await axRetry.start(); await axRetry.authorize(axApproval); await axRetry.retry()
         let retryCount = axRetryChecks.calls.count
-        await axRetry.pollAccessibility(at: Date().addingTimeInterval(100))
+        await axRetry.returnedFromAccessibilitySettings()
         expect(axRetryChecks.calls.count == retryCount, "retry requires a new explicit settings opening before polling")
         await axRetry.authorize(axApproval)
-        axRetry.stopAccessibilityPolling()
+        axRetry.cancelAccessibilityWait()
         let stoppedCount = axRetryChecks.calls.count
-        await axRetry.pollAccessibility(at: Date().addingTimeInterval(100))
+        await axRetry.returnedFromAccessibilitySettings()
         expect(axRetryChecks.calls.count == stoppedCount, "declining again stops background trust polling")
         await axRetry.authorize(axApproval)
         axRetryChecks.overrides[.accessibility] = .passed("trusted")
         axRetryChecks.delayStep = .accessibility
-        let latePoll = Task { await axRetry.pollAccessibility(at: Date().addingTimeInterval(100)) }
+        let latePoll = Task { await axRetry.returnedFromAccessibilitySettings() }
         try? await Task.sleep(nanoseconds: 20_000_000)
-        axRetry.stopAccessibilityPolling()
+        axRetry.cancelAccessibilityWait()
         await latePoll.value
         expect(axRetry.approval == axApproval && !axRetryChecks.calls.contains(.dns), "declining cancels a late trust result before continuation")
 
@@ -245,12 +244,15 @@ struct InitializationTests {
         concurrentChecks.automaticRefreshDelay = 100_000_000
         let concurrentInit = FirstRunInitialization(checks: concurrentChecks, completed: false, saveCompletion: {})
         await concurrentInit.start()
-        concurrentInit.refreshReadiness(at: Date().addingTimeInterval(61))
-        concurrentInit.refreshReadiness(at: Date().addingTimeInterval(61))
+        let concurrentExpiry = concurrentInit.nextReadinessDeadline!
+        concurrentInit.refreshReadiness(at: concurrentExpiry.addingTimeInterval(-1))
+        expect(concurrentChecks.automaticRefreshes == 0 && !concurrentInit.running, "a current receipt does not trigger an early refresh")
+        concurrentInit.refreshReadiness(at: concurrentExpiry)
+        concurrentInit.refreshReadiness(at: concurrentExpiry)
         await concurrentInit.enter()
         try await Task.sleep(nanoseconds: 20_000_000)
         expect(concurrentChecks.automaticRefreshes == 1 && concurrentInit.running && !concurrentInit.entered,
-               "overlapping timer ticks and entry cannot start duplicate refreshes or bypass an in-flight round")
+               "overlapping clock events and entry cannot start duplicate refreshes or bypass an in-flight round")
         for _ in 0..<100 where concurrentInit.running { try await Task.sleep(nanoseconds: 10_000_000) }
         expect(concurrentInit.allPassed && !concurrentInit.running, "one completed automatic refresh restores readiness")
 
@@ -394,9 +396,40 @@ struct InitializationTests {
             isolated.acceptSnapshot(snapshot(node: "isolated", at: isolatedSnapshotTime),
                                     receivedAt: Date(timeIntervalSince1970: isolatedSnapshotTime))
             isolated.handleChannelUpdate()
-            isolated.refresh(full: true, manual: true)
+            isolated.refresh(manual: true)
             expect(!isolated.refreshing && isolated.error == nil && isolated.snapshot?.capturedAt == isolatedSnapshotTime,
                    "fixture channel callbacks and manual refreshes cannot schedule live snapshot reads or replace supplied evidence")
+        }
+        // Exercise the real store subscription: fresh wrappers can carry the
+        // same producer observation; none may release this waiter. No sleeps
+        // or live runner: the queued fixture producer runs after registration.
+        do {
+            let store = MonitorStore(leakChecks: LeakCheckStore(isFixture: true), aiChecks: AIProbeStore(isFixture: true),
+                                     switcher: SwitcherStore(isFixture: true))
+            store.beginInitialization(startSnapshotPolling: false)
+            store.switcher.loadReviewScenario(.normal)
+            let base = Date().timeIntervalSince1970
+            var now = base, waits = 0, comparisons = 0
+            func publish(_ source: Double) {
+                store.acceptSnapshot(snapshot(node: "A", at: now, proxyObservedAt: source),
+                                     receivedAt: Date(timeIntervalSince1970: now))
+            }
+            publish(base)
+            let checks = FirstRunChecks(store: store, connectionNow: { now }, waitForConnectionChange: { deadline, changed in
+                waits += 1
+                let producer = Task { @MainActor in
+                    let before = comparisons
+                    for _ in 0..<16 { now += 0.01; publish(base) }
+                    expect(comparisons == before + 16, "same-source wrapper publications leave the real store subscription active")
+                    now += 1; publish(now)
+                }
+                await store.waitForConnectionChange(until: Date(timeIntervalSince1970: deadline)) {
+                    comparisons += 1; return changed()
+                }
+                await producer.value
+            }, startSnapshotPolling: false)
+            let result = await checks.check(.connection)
+            expect(passed(result) && waits == 1, "only an advancing source sample releases the connection waiter")
         }
         // A clean installation has no UI snapshot to seed the first check.
         // Replay publication latency (4s) and the observed 14s proxy cadence:
@@ -424,8 +457,12 @@ struct InitializationTests {
         }
         publishColdRound()
         expect(cold.snapshot == nil, "clean startup has no cached snapshot or proxy evidence")
+        var semanticWaits = 0
         let coldChecks = FirstRunChecks(store: cold, componentCheck: {}, connectionNow: { coldTime },
-            waitForConnectionPoll: { coldTime += 1; publishColdRound() })
+            waitForConnectionChange: { deadline, changed in
+                semanticWaits += 1
+                repeat { coldTime += 1; publishColdRound() } while coldTime < deadline && !changed()
+            })
         let coldResult = await coldChecks.check(.connection)
         if !passed(coldResult) {
             let retryResult = await coldChecks.check(.connection)
@@ -434,6 +471,7 @@ struct InitializationTests {
         expect(passed(coldResult), "clean startup must wait for the second actual proxy publication without requiring Retry")
         expect(coldTime >= epoch + 19 && coldTime < epoch + 30,
                "repeated reads of the first snapshot never count as two samples")
+        expect(semanticWaits == 2, "read/capture/service timestamps advance on every fixture tick; only the two actual proxy rounds wake first-run")
         func replay(_ values: [(Double, Double, String)], native: Bool = true, freezeCapture: Bool = false) async -> InitializationResult {
             coldTime = epoch; publications = values; nativeAvailable = native
             freezeSnapshotCapture = freezeCapture
@@ -494,7 +532,7 @@ struct InitializationTests {
         let acceptedBeforeGap = await recovery.leakChecks.ensureInitializationReceipt(.dns)
         expect(acceptedBeforeGap, "fresh receipt starts in the verified proxy context")
         let afterGap = base.addingTimeInterval(2)
-        recovery.monitorTick(at: afterGap)
+        recovery.advanceClock(at: afterGap)
         expect(recovery.initializationContext != nil && recovery.leakChecks.dns.verdict.state == .matched &&
                recovery.leakChecks.initializationReceiptIsCurrent(.dns),
                "a directly verified current proxy remains usable after the separate ten-second gap grace")
@@ -520,7 +558,7 @@ struct InitializationTests {
         let fullNode = NodeBox()
         fullStore.acceptSnapshot(snapshot(node: fullNode.value, at: Date().timeIntervalSince1970), receivedAt: Date())
         let fullChecks = FirstRunChecks(store: fullStore, componentCheck: {}, accessibilityTrusted: { true },
-            requestAccessibility: {}, waitForConnectionPoll: {
+            requestAccessibility: {}, waitForConnectionChange: { _, _ in
                 try? await Task.sleep(nanoseconds: 5_000_000)
                 fullStore.acceptSnapshot(snapshot(node: fullNode.value, at: Date().timeIntervalSince1970), receivedAt: Date())
             }, startSnapshotPolling: false)
@@ -638,7 +676,7 @@ struct InitializationTests {
         // refresh into a full multi-minute restart of the network checks.
         for _ in 0..<2 {
             let oldDNS = fullLeaks.dns.result!.finishedAt, oldRTC = fullLeaks.rtc.result!.finishedAt
-            full.refreshReadiness(at: Date().addingTimeInterval(61))
+            full.refreshReadiness(at: full.nextReadinessDeadline!)
             expect(full.running && !full.canEnter(at: Date().timeIntervalSince1970), "automatic refresh cannot grant entry while evidence is in flight")
             for _ in 0..<300 where full.running { try await Task.sleep(nanoseconds: 10_000_000) }
             expect(!full.running && full.allPassed && fullLeaks.dns.result!.finishedAt == oldDNS && fullLeaks.rtc.result!.finishedAt == oldRTC,

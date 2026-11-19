@@ -168,6 +168,7 @@ fn openai_only_session_refreshes_without_a_claude_record() {
     let f = Fixture::new(); let before = f.active("openai"); let mut system = f.mock("claude");
     let out = background_evidence::refresh_supervised_sessions(&f.store, &mut system).unwrap();
     assert_eq!(out["status"], "ok"); assert_eq!(out["count"], 2);
+    assert_eq!(out["next_review_at"], system.now + ProbeKind::Dns.refresh_age());
     assert!(system.calls.iter().all(|(family, _)| family == "openai"));
     assert!(!f.store.paths.session_for("claude").exists());
     assert_eq!(f.sessions("openai").load(system.now).unwrap().unwrap(), before);

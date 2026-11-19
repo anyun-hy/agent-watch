@@ -83,7 +83,7 @@ struct MonitorView: View {
         .toolbar {
             MonitorRefreshToolbar(automatic: $store.automatic, refreshing: store.refreshing, p: p) {
                 if let refreshAction { refreshAction() }
-                else { store.refresh(full: true, manual: true) }
+                else { store.refresh(manual: true) }
             }
         }
         .foregroundStyle(p.text)

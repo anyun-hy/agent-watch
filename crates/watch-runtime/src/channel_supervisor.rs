@@ -59,7 +59,6 @@ pub fn async_audit_retry_delay(failures: u32) -> f64 {
         (15.0 * 2_f64.powi(failures.saturating_sub(MAX_ASYNC_AUDIT_RETRIES).min(5) as i32)).min(300.0)
     }
 }
-pub const MAX_EMITTED_EVENTS: usize = 128;
 pub const MAX_PERSISTED_EVENTS: usize = 64;
 
 #[cfg(test)]
@@ -137,7 +136,7 @@ mod logging_tests {
         }).unwrap();
         assert_eq!(supervisor.snapshot(now).families["openai"].active_members, vec![external.clone()]);
         let (tx, rx) = mpsc::channel();
-        supervisor.audit_tx = Some(tx);
+        supervisor.audit_tx = Some(tx.into());
         supervisor.request_async_audit_if_needed("openai", None, None, now);
         assert_eq!(rx.try_recv().expect("external Codex enters the existing audit path").target, LaunchTarget::CodexCli);
         supervisor.issue_family_command("openai", None, ChannelPermitState::Revoked, "fixture_risk", now).unwrap();
@@ -194,13 +193,13 @@ mod logging_tests {
             session_id: None, context_id: None,
             policy_version: PolicyVersion { policy_digest: "fixture".into(), guard_policy_digest: "fixture".into() },
             vpn_epoch: None, upstream_endpoint: String::new(), requested_at: crate::native::now(),
-            timeout_seconds: 5.0, cancellation: Some(Arc::new(AtomicBool::new(false))),
+            timeout_seconds: 5.0, cancellation: Some(Arc::default()),
         };
         requests.send(request(1)).unwrap();
         started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
         let retired = request(2);
         requests.send(retired.clone()).unwrap();
-        retired.cancellation.unwrap().store(true, Ordering::Release);
+        retired.cancellation.unwrap().cancel();
         release_tx.send(()).unwrap();
         let first = event_rx.recv_timeout(Duration::from_secs(2));
         // No completion for the cancelled queued request. Also let the first
@@ -218,6 +217,22 @@ mod logging_tests {
             request_id: 3, outcome: AsyncAuditOutcome::Succeeded { .. }, ..
         })));
         assert_eq!(*calls.lock().unwrap(), vec![1, 3]);
+    }
+
+    #[test]
+    fn idle_audit_worker_exits_when_the_last_request_sender_closes() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let (events, _) = mpsc::channel();
+        let (requests, worker) = ChannelSupervisor::spawn_async_audit_worker(stop.clone(), events,
+            |_| panic!("idle worker received an audit")).unwrap();
+        let last = requests.clone();
+        drop(requests);
+        let (closed, observed) = mpsc::channel();
+        thread::spawn(move || closed.send(worker.handle.join().is_ok()).unwrap());
+        assert!(matches!(observed.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        drop(last);
+        assert!(observed.recv_timeout(Duration::from_secs(2)).unwrap());
+        assert!(!stop.load(Ordering::Acquire));
     }
 
     #[test]
@@ -274,12 +289,12 @@ mod logging_tests {
             session_id: None, context_id: None,
             policy_version: PolicyVersion { policy_digest: "fixture".into(), guard_policy_digest: "fixture".into() },
             vpn_epoch: None, upstream_endpoint: String::new(), requested_at: crate::native::now(),
-            timeout_seconds: 5.0, cancellation: Some(Arc::new(AtomicBool::new(false))),
+            timeout_seconds: 5.0, cancellation: Some(Arc::default()),
         };
         let first = request(1);
         requests.send(first.clone()).unwrap();
         started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
-        first.cancellation.unwrap().store(true, Ordering::Release);
+        first.cancellation.unwrap().cancel();
         requests.send(request(2)).unwrap();
         assert!(matches!(results.recv_timeout(Duration::from_secs(1)).unwrap(),
             SupervisionEvent::AsyncAuditCompleted { request_id: 2, outcome: AsyncAuditOutcome::Failed { code, .. }, .. }
@@ -305,7 +320,7 @@ mod logging_tests {
                 .with_audit_token([501, 501, 20, 501, 20, 7200, 0, 9])], observed_at: now,
         }).unwrap();
         let (tx, rx) = mpsc::channel();
-        supervisor.audit_tx = Some(tx);
+        supervisor.audit_tx = Some(tx.into());
         let mut clock = now;
         for delay in [2.0, 2.0, 15.0, 30.0, 60.0, 120.0, 240.0, 300.0, 300.0] {
             supervisor.record_async_audit_failure("claude", None, "probe_failed", clock).unwrap();
@@ -401,6 +416,7 @@ mod logging_tests {
         supervisor.issue_family_command("claude", None, ChannelPermitState::Revoked,
             "vpn_observation_stale", now).unwrap();
         let command_seq = supervisor.tracks["claude"].command_seq;
+        assert_eq!(supervisor.next_evidence_deadline(now), Some(now + MAX_ENFORCEMENT_RECEIPT_AGE / 3.0));
         supervisor.enforcer = None;
         let snapshot = supervisor.handle_event(SupervisionEvent::LeaseExpired {
             observed_at: now + 20.0, woke_from_sleep: false,
@@ -434,6 +450,7 @@ mod logging_tests {
 
     #[test]
     fn published_graph_block_deadline_tracks_receipt_without_new_event() {
+        use std::os::unix::fs::MetadataExt;
         let now = 1_800_000_000.0;
         let (mut supervisor, enforcer) = blocked_supervisor(now);
         let session: session::Session = serde_json::from_value(json!({
@@ -450,6 +467,15 @@ mod logging_tests {
         });
         supervisor.issue_family_command("claude", Some(&session), ChannelPermitState::Revoked,
             "vpn_observation_stale", now).unwrap();
+        supervisor.publish(&supervisor.snapshot(now));
+        let authority = supervisor.storage.paths.watch().join(crate::channel_policy_status::FRAME_PATH);
+        let history = fs::read_dir(supervisor.storage.paths.watch().join("state/channel-events"))
+            .unwrap().next().unwrap().unwrap().path();
+        let authority_file = fs::File::open(&authority).unwrap();
+        let history_file = fs::File::open(&history).unwrap();
+        supervisor.publish(&supervisor.snapshot(now + 0.1));
+        assert_eq!(authority_file.metadata().unwrap().ino(), fs::metadata(&authority).unwrap().ino());
+        assert!(crate::channel_policy_status::read_frame(&supervisor.storage).get("events").is_none());
         let seq = supervisor.event_seq;
         let observed_at = now + DEFAULT_PERMIT_TTL + 1.0;
         let receipt = enforcer.receipt_for("claude", observed_at).unwrap().unwrap();
@@ -457,7 +483,9 @@ mod logging_tests {
         assert_eq!(supervisor.event_seq, seq, "refresh is not a state event");
         let deadline = observed_at + MAX_ENFORCEMENT_RECEIPT_AGE;
         supervisor.publish(&supervisor.snapshot(deadline - 1.0));
-        let frame = crate::channel_policy_status::read_frame(&supervisor.storage);
+        assert_ne!(authority_file.metadata().unwrap().ino(), fs::metadata(&authority).unwrap().ino());
+        assert_eq!(history_file.metadata().unwrap().ino(), fs::metadata(&history).unwrap().ino());
+        let frame = crate::channel_policy_status::read_frame_with_events(&supervisor.storage);
         assert_eq!(frame["families"]["claude"]["blocked_evidence_valid_until"], json!(deadline));
         assert!(frame["events"].as_array().unwrap().iter()
             .all(|event| event["family_state"]["blocked_evidence_valid_until"].is_null()));
@@ -469,6 +497,37 @@ mod logging_tests {
         supervisor.publish(&supervisor.snapshot(deadline));
         let expired = crate::channel_policy_status::read_frame(&supervisor.storage);
         assert!(expired["families"]["claude"]["blocked_evidence_valid_until"].is_null());
+    }
+
+    #[test]
+    fn history_failure_still_publishes_revoke_and_retries_same_sequence() {
+        let now = 1_800_000_000.0;
+        let (mut supervisor, enforcer) = blocked_supervisor(now);
+        let history_dir = supervisor.storage.paths.watch().join("state/channel-events");
+        supervisor.storage.atomic_bytes(&history_dir, b"fixture", 0o600).unwrap();
+        let snapshot = supervisor.handle_event(SupervisionEvent::ProcessInventoryUnavailable {
+            family: "claude".into(), observed_at: now,
+        }).unwrap();
+        assert_eq!(enforcer.receipt_for("claude", now).unwrap().unwrap().permit_state, ChannelPermitState::Revoked);
+        let frame = crate::channel_policy_status::read_frame(&supervisor.storage);
+        assert_eq!(frame["snapshot_seq"], snapshot.snapshot_seq);
+        assert_eq!(frame["event_history"], "unavailable");
+        assert_eq!(frame["authoritative_permits"]["claude"]["state"], "revoked");
+        fs::remove_file(history_dir).unwrap();
+        supervisor.handle_event(SupervisionEvent::ProcessInventoryUnavailable {
+            family: "claude".into(), observed_at: now + 0.1,
+        }).unwrap();
+        let repaired = crate::channel_policy_status::read_frame_with_events(&supervisor.storage);
+        assert_eq!(repaired["snapshot_seq"], snapshot.snapshot_seq);
+        assert_eq!(repaired["event_history"], "separate");
+        assert_eq!(repaired["events"].as_array().unwrap().last().unwrap()["event_seq"], snapshot.snapshot_seq);
+        let path = supervisor.storage.paths.watch().join(crate::channel_policy_status::FRAME_PATH);
+        let before = fs::File::open(&path).unwrap();
+        supervisor.handle_queued_event(SupervisionEvent::ProcessInventoryUnavailable {
+            family: "claude".into(), observed_at: now + 0.1,
+        }, now + 0.2).unwrap();
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(before.metadata().unwrap().ino(), fs::metadata(path).unwrap().ino());
     }
 
     #[test]
@@ -486,7 +545,7 @@ mod logging_tests {
         supervisor.issue_family_command("claude", None, ChannelPermitState::Permitted, "fixture_ready", now).unwrap();
         assert_eq!(supervisor.snapshot(now).families["claude"].display_state, ChannelMonitorDisplayState::Forwarding);
         let (audit_tx, _audit_rx) = std::sync::mpsc::channel();
-        supervisor.audit_tx = Some(audit_tx);
+        supervisor.audit_tx = Some(audit_tx.into());
         supervisor.request_async_audit_if_needed("claude", None, None, now);
         assert!(supervisor.tracks["claude"].audit_in_flight.is_some());
 
@@ -728,6 +787,38 @@ pub enum SupervisionEvent {
     },
 }
 
+#[derive(Clone)]
+pub struct AuditRequestSender {
+    sender: Option<Sender<AsyncAuditRequest>>,
+    worker: Option<thread::Thread>,
+}
+impl From<Sender<AsyncAuditRequest>> for AuditRequestSender {
+    fn from(sender: Sender<AsyncAuditRequest>) -> Self { Self { sender: Some(sender), worker: None } }
+}
+impl AuditRequestSender {
+    pub fn send(&self, request: AsyncAuditRequest) -> std::result::Result<(), mpsc::SendError<AsyncAuditRequest>> {
+        self.sender.as_ref().expect("live audit sender").send(request)?;
+        if let Some(worker) = &self.worker { worker.unpark(); }
+        Ok(())
+    }
+}
+impl Drop for AuditRequestSender {
+    fn drop(&mut self) {
+        drop(self.sender.take());
+        if let Some(worker) = &self.worker { worker.unpark(); }
+    }
+}
+
+pub struct AuditWorker {
+    handle: thread::JoinHandle<()>,
+}
+impl AuditWorker {
+    pub fn join(self) -> thread::Result<()> {
+        self.handle.thread().unpark();
+        self.handle.join()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct AsyncAuditRequest {
     pub request_id: u64,
@@ -740,7 +831,7 @@ pub struct AsyncAuditRequest {
     pub upstream_endpoint: String,
     pub requested_at: f64,
     pub timeout_seconds: f64,
-    pub cancellation: Option<Arc<AtomicBool>>,
+    pub cancellation: Option<Arc<crate::audit_process::AuditCancellation>>,
 }
 
 impl PartialEq for AsyncAuditRequest {
@@ -762,7 +853,7 @@ impl AsyncAuditRequest {
     pub fn is_cancelled(&self) -> bool {
         self.cancellation
             .as_ref()
-            .map(|c| c.load(Ordering::Acquire))
+            .map(|c| c.is_cancelled())
             .unwrap_or(false)
     }
 }
@@ -843,7 +934,7 @@ impl FamilyRuntimeTrack {
     fn cancel_audit(&mut self) {
         if let Some(request) = self.audit_in_flight.take() {
             if let Some(cancel) = request.cancellation {
-                cancel.store(true, Ordering::Release);
+                cancel.cancel();
             }
         }
     }
@@ -865,7 +956,7 @@ pub struct ChannelSupervisor {
     #[cfg(test)]
     recovery_persist_failure: Option<CoreError>,
     expected_executor_boot_id: Option<String>,
-    audit_tx: Option<Sender<AsyncAuditRequest>>,
+    audit_tx: Option<AuditRequestSender>,
     next_audit_request_id: u64,
     config: Config,
     config_blocking_reason: Option<String>,
@@ -883,15 +974,16 @@ pub struct ChannelSupervisor {
     upstream_endpoint: String,
     tracks: BTreeMap<String, FamilyRuntimeTrack>,
     event_seq: u64,
-    emitted_events: Vec<ChannelMonitorEvent>,
     persisted_events: Vec<ChannelMonitorEvent>,
+    written_history_seq: Option<u64>,
+    published_frame: Option<Value>,
 }
 
 impl ChannelSupervisor {
     pub fn new(
         storage: StateStore,
         enforcer: Option<Arc<dyn ChannelEnforcer>>,
-        audit_tx: Option<Sender<AsyncAuditRequest>>,
+        audit_tx: Option<AuditRequestSender>,
     ) -> Result<Self> {
         let store = ConfigStore {
             storage: storage.clone(),
@@ -915,7 +1007,7 @@ impl ChannelSupervisor {
         config: Config,
         config_blocking_reason: Option<String>,
         enforcer: Option<Arc<dyn ChannelEnforcer>>,
-        audit_tx: Option<Sender<AsyncAuditRequest>>,
+        audit_tx: Option<AuditRequestSender>,
     ) -> Result<Self> {
         let saved_policy_version = Self::compute_policy_version(&config)?;
         let upstream_endpoint = if let Some(ep) = config
@@ -938,7 +1030,7 @@ impl ChannelSupervisor {
         }
         let producer_boot_id = format!(
             "sup-boot-{}",
-            &uuid::Uuid::new_v4().simple().to_string()[..8]
+            uuid::Uuid::new_v4().simple()
         );
         Ok(Self {
             storage,
@@ -967,8 +1059,9 @@ impl ChannelSupervisor {
             upstream_endpoint,
             tracks,
             event_seq: 0,
-            emitted_events: Vec::new(),
             persisted_events: Vec::new(),
+            written_history_seq: None,
+            published_frame: None,
         })
     }
 
@@ -1010,7 +1103,7 @@ impl ChannelSupervisor {
         }
     }
 
-    fn publish(&self, snapshot: &ChannelMonitorSnapshot) {
+    fn publish(&mut self, snapshot: &ChannelMonitorSnapshot) {
         let now = snapshot.captured_at;
         let mut value = json!(snapshot);
         value["executor_boot_id"] = json!(self.expected_executor_boot_id);
@@ -1036,7 +1129,6 @@ impl ChannelSupervisor {
         value["process_receipts"] = json!(self.tracks.iter()
             .filter_map(|(family, t)| t.latest_process_receipt.as_ref().map(|r| (family, r)))
             .collect::<BTreeMap<_, _>>());
-        value["events"] = json!(self.persisted_events);
         value["egress"] = json!(self.latest_egress.iter().filter_map(|(family, raw)|
             Egress::fresh(raw, now, session::GUARD_EGRESS_TTL).map(|egress| (family, egress)))
             .collect::<BTreeMap<_, _>>());
@@ -1049,6 +1141,25 @@ impl ChannelSupervisor {
             "unavailable_reason": self.latest_vpn_unavailable_reason,
             "vpn_match": self.compute_vpn_match(now),
         });
+        let needs_history = self.written_history_seq != Some(self.event_seq);
+        if needs_history {
+            match crate::channel_history::write(&self.storage, &value, &self.persisted_events) {
+                Ok(()) => self.written_history_seq = Some(self.event_seq),
+                Err(error) => if let Some(logger) = &self.diagnostics {
+                    logger.persistence_failed(self.diagnostic(None, "persist_channel_history"), &error, now);
+                },
+            }
+        }
+        value["event_history"] = json!(if self.written_history_seq == Some(self.event_seq) { "separate" } else { "unavailable" });
+        // Compare only after deriving all expiry and identity-sensitive fields
+        // at delivery time. These three timestamps merely label the projection.
+        let mut content = value.clone();
+        content["captured_at"] = Value::Null;
+        content["vpn_supervision"]["captured_at"] = Value::Null;
+        if let Some(families) = content["families"].as_object_mut() {
+            for state in families.values_mut() { state["updated_at"] = Value::Null; }
+        }
+        if self.published_frame.as_ref() == Some(&content) { return; }
         // The only published authority frame. A failed write never rolls back
         // a command that already took effect in the executor.
         if let Err(error) = self.storage.atomic_json(&self.storage.paths.watch().join(crate::channel_policy_status::FRAME_PATH), &value) {
@@ -1056,6 +1167,7 @@ impl ChannelSupervisor {
                 logger.persistence_failed(self.diagnostic(None, "persist_supervision"), &error, now);
             }
         } else {
+            self.published_frame = Some(content);
             crate::native::notify_channel_update();
         }
     }
@@ -1271,7 +1383,7 @@ impl ChannelSupervisor {
         stop: Arc<AtomicBool>,
         event_tx: Sender<SupervisionEvent>,
         run_audit: F,
-    ) -> Result<(Sender<AsyncAuditRequest>, thread::JoinHandle<()>)>
+    ) -> Result<(AuditRequestSender, AuditWorker)>
     where
         F: Fn(&AsyncAuditRequest) -> Result<(Value, Value, f64)> + Send + Sync + 'static,
     {
@@ -1281,15 +1393,19 @@ impl ChannelSupervisor {
         let handle = thread::Builder::new()
             .name("channel-async-audit-worker".into())
             .spawn(move || {
-                let mut retiring: Option<(Arc<AtomicBool>, thread::JoinHandle<()>)> = None;
+                let mut retiring: Option<(thread::JoinHandle<()>, mpsc::Receiver<_>)> = None;
                 while !stop.load(Ordering::Acquire) {
-                    let Ok(req) = req_rx.recv_timeout(std::time::Duration::from_millis(50)) else { continue; };
+                    let req = match req_rx.try_recv() {
+                        Ok(req) => req,
+                        Err(mpsc::TryRecvError::Empty) => { thread::park(); continue; }
+                        Err(mpsc::TryRecvError::Disconnected) => break,
+                    };
                     if stop.load(Ordering::Acquire) { break; }
                     if req.is_cancelled() { continue; }
                     // The previous runner may have finished while waiting for
                     // this request. Recheck now before rejecting new work.
-                    if retiring.as_ref().is_some_and(|(_, h)| h.is_finished()) {
-                        let (_, handle) = retiring.take().unwrap();
+                    if retiring.as_ref().is_some_and(|(_, result)| !matches!(result.try_recv(), Err(mpsc::TryRecvError::Empty))) {
+                        let (handle, _) = retiring.take().unwrap();
                         let _ = handle.join();
                     }
                     let send = |outcome, completed_at| {
@@ -1307,14 +1423,19 @@ impl ChannelSupervisor {
                     }
                     let runner = Arc::clone(&run_audit);
                     let (result_tx, result_rx) = mpsc::channel();
-                    let cancellation = req.cancellation.clone().unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
+                    let cancellation = req.cancellation.clone().unwrap_or_default();
+                    cancellation.watch_worker();
                     let mut req_clone = req.clone();
                     req_clone.cancellation = Some(cancellation.clone());
                     let started = std::time::Instant::now();
                     let timeout = std::time::Duration::from_secs_f64(
                         if req.timeout_seconds.is_finite() && req.timeout_seconds > 0.0 { req.timeout_seconds } else { 30.0 });
+                    let owner = thread::current();
                     let runner_thread = match thread::Builder::new().name("channel-audit-runner".into()).spawn(move || {
-                        let _ = result_tx.send(runner(&req_clone));
+                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| runner(&req_clone)));
+                        if let Ok(outcome) = result { let _ = result_tx.send(outcome); }
+                        drop(result_tx);
+                        owner.unpark();
                     }) {
                         Ok(handle) => handle,
                         Err(_) => { send(AsyncAuditOutcome::Failed { code: "audit_runner_start_failed".into(),
@@ -1322,15 +1443,15 @@ impl ChannelSupervisor {
                     };
                     let mut completed = false;
                     loop {
-                        if stop.load(Ordering::Acquire) || cancellation.load(Ordering::Acquire) || started.elapsed() >= timeout {
-                            let was_cancelled = cancellation.load(Ordering::Acquire);
-                            cancellation.store(true, Ordering::Release);
+                        if stop.load(Ordering::Acquire) || cancellation.is_cancelled() || started.elapsed() >= timeout {
+                            let was_cancelled = cancellation.is_cancelled();
+                            cancellation.cancel();
                             if !stop.load(Ordering::Acquire) && !was_cancelled {
                                 send(AsyncAuditOutcome::TimedOut { elapsed_seconds: started.elapsed().as_secs_f64() }, crate::native::now());
                             }
                             break;
                         }
-                        match result_rx.recv_timeout(std::time::Duration::from_millis(20).min(timeout.saturating_sub(started.elapsed()))) {
+                        match result_rx.try_recv() {
                             Ok(Ok((audit, egress, completed_at))) => {
                                 completed = true;
                                 if completed_at - req.requested_at >= req.timeout_seconds {
@@ -1346,31 +1467,24 @@ impl ChannelSupervisor {
                                 send(outcome, crate::native::now());
                                 break;
                             }
-                            Err(mpsc::RecvTimeoutError::Timeout) => continue,
-                            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                            Err(mpsc::TryRecvError::Empty) => thread::park_timeout(timeout.saturating_sub(started.elapsed())),
+                            Err(mpsc::TryRecvError::Disconnected) => {
                                 send(AsyncAuditOutcome::Failed { code: "audit_runner_disconnected".into(), detail: "审计工作线程异常结束".into() }, crate::native::now());
                                 break;
                             }
                         }
                     }
                     if completed || runner_thread.is_finished() { let _ = runner_thread.join(); }
-                    else { retiring = Some((cancellation, runner_thread)); }
+                    else { retiring = Some((runner_thread, result_rx)); }
                 }
-                if let Some((cancel, handle)) = retiring {
-                    cancel.store(true, Ordering::Release);
-                    let cleanup_until = std::time::Instant::now() + std::time::Duration::from_secs(1);
-                    while !handle.is_finished() && std::time::Instant::now() < cleanup_until {
-                        thread::sleep(std::time::Duration::from_millis(5));
+                if let Some((handle, result)) = retiring {
+                    if !matches!(result.recv_timeout(Duration::from_secs(1)), Err(mpsc::RecvTimeoutError::Timeout)) {
+                        let _ = handle.join();
                     }
-                    if handle.is_finished() { let _ = handle.join(); }
                 }
             })
             .map_err(|_| CoreError::new("async_audit_worker_failed", "异步审计工作线程无法启动"))?;
-        Ok((req_tx, handle))
-    }
-
-    pub fn drain_emitted_events(&mut self) -> Vec<ChannelMonitorEvent> {
-        std::mem::take(&mut self.emitted_events)
+        Ok((AuditRequestSender { sender: Some(req_tx), worker: Some(handle.thread().clone()) }, AuditWorker { handle }))
     }
 
     pub fn snapshot(&self, now: f64) -> ChannelMonitorSnapshot {
@@ -1431,7 +1545,6 @@ impl ChannelSupervisor {
             SupervisionEvent::AsyncAuditCompleted { completed_at, .. } => *completed_at,
         };
         let now = delivered_at.unwrap_or(source_at);
-        let initial_seq = self.event_seq;
         let mut publish = !matches!(&event, SupervisionEvent::LeaseExpired { .. }
             | SupervisionEvent::EnforcementReceiptArrived { .. } | SupervisionEvent::ProcessReceiptArrived { .. });
 
@@ -1711,7 +1824,11 @@ impl ChannelSupervisor {
         }
 
         let snap = self.snapshot(now);
-        if publish || self.event_seq != initial_seq { self.publish(&snap); }
+        // Coverage may emit before delivery of this event. A failed authority
+        // write also leaves its sequence pending for the next delivery.
+        if publish || self.published_frame.as_ref().and_then(|frame| frame["snapshot_seq"].as_u64()) != Some(self.event_seq) {
+            self.publish(&snap);
+        }
         Ok(snap)
     }
 
@@ -2190,7 +2307,7 @@ impl ChannelSupervisor {
             upstream_endpoint: self.upstream_endpoint.clone(),
             requested_at: now,
             timeout_seconds: DEFAULT_ASYNC_AUDIT_TIMEOUT_SECONDS,
-            cancellation: Some(Arc::new(AtomicBool::new(false))),
+            cancellation: Some(Arc::default()),
         };
         if let Some(tx) = &self.audit_tx {
             if tx.send(req.clone()).is_ok() {
@@ -2780,13 +2897,45 @@ impl ChannelSupervisor {
         Ok(())
     }
 
+    /// Earliest remaining boundary for the authority's existing deadline path.
+    /// A receipt arriving while the loop sleeps replaces the old schedule.
+    pub fn next_evidence_deadline(&self, after: f64) -> Option<f64> {
+        let mut next: Option<f64> = None;
+        let mut consider = |at: f64| {
+            if at.is_finite() && at > after { next = Some(next.map_or(at, |old| old.min(at))); }
+        };
+        if let Some(vpn) = &self.latest_vpn_observation { consider(vpn.valid_until); }
+        for track in self.tracks.values() {
+            if let Some(permit) = &track.current_permit {
+                consider(permit.valid_until);
+                if self.enforcer.is_some() {
+                    let interval = MAX_ENFORCEMENT_RECEIPT_AGE / 3.0;
+                    let due = track.latest_receipt.as_ref().map_or(permit.issued_at, |r| r.observed_at + interval);
+                    consider(track.last_receipt_refresh_attempt.map_or(due, |at| due.max(at + interval)));
+                }
+            }
+            if let Some(r) = &track.latest_receipt { consider(r.observed_at + MAX_ENFORCEMENT_RECEIPT_AGE); }
+            if track.audit_in_flight.is_none() {
+                if let Some(at) = track.audit_retry_not_before { consider(at); }
+            }
+            if let Some(intent) = track.process_fence.as_ref().and_then(|f| f.current()) {
+                consider(intent.valid_until);
+            }
+            for r in track.latest_process_receipt.iter().chain(&track.previous_process_receipts) {
+                // Process receipt validation includes the last instant of its window.
+                consider((r.observed_at + crate::process_disposition::RECEIPT_TTL).next_up());
+            }
+        }
+        next
+    }
+
     fn refresh_execution_receipt(&mut self, family: &str, now: f64) -> Result<(f64, bool)> {
         let Some(enforcer) = self.enforcer.clone() else { return Ok((now, false)); };
         let Some(track) = self.tracks.get_mut(family) else { return Ok((now, false)); };
         // Deadline ticks can be frequent. Refresh well before evidence expires,
         // and bound retry/write load when an executor is unavailable.
         let refresh_interval = MAX_ENFORCEMENT_RECEIPT_AGE / 3.0;
-        let due = |at: f64| !at.is_finite() || at > now || now - at >= refresh_interval;
+        let due = |at: f64| !at.is_finite() || at > now || now >= at + refresh_interval;
         if track.current_permit.is_none()
             || !track.latest_receipt.as_ref().is_none_or(|receipt| due(receipt.observed_at))
             || !track.last_receipt_refresh_attempt.is_none_or(due)
@@ -3008,11 +3157,6 @@ impl ChannelSupervisor {
             event_seq: self.event_seq,
             family_state,
         };
-        self.emitted_events.push(event.clone());
-        if self.emitted_events.len() > MAX_EMITTED_EVENTS {
-            let overflow = self.emitted_events.len() - MAX_EMITTED_EVENTS;
-            self.emitted_events.drain(0..overflow);
-        }
         self.persisted_events.push(event);
         if self.persisted_events.len() > MAX_PERSISTED_EVENTS {
             let drain_count = self.persisted_events.len() - MAX_PERSISTED_EVENTS;

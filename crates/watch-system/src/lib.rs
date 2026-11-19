@@ -1,5 +1,6 @@
 //! Narrow, safe OS boundary. Runtime policy and state machines remain unsafe-free.
 pub mod network_events;
+pub mod process_events;
 pub mod launchd_gateway;
 pub mod application_locations;
 pub mod anchored_files;
@@ -10,6 +11,72 @@ use std::{
     os::unix::{io::AsRawFd, net::UnixStream},
     path::Path,
 };
+
+/// Wait for a listening socket or the owner's shutdown descriptor. Closing the
+/// handle interrupts an idle accept loop without opening a client connection.
+pub struct ListenerWorker {
+    cancel: UnixStream,
+    worker: std::thread::JoinHandle<()>,
+    completion: std::sync::Arc<std::sync::Mutex<ListenerCompletion>>,
+}
+
+#[derive(Default)]
+struct ListenerCompletion {
+    finished: bool,
+    notify: Option<Box<dyn FnOnce() + Send>>,
+}
+
+impl ListenerWorker {
+    pub fn spawn(name: &str, run: impl FnOnce(UnixStream) + Send + 'static) -> std::io::Result<Self> {
+        use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
+        let (cancel, receiver) = UnixStream::pair()?;
+        let completion = std::sync::Arc::new(std::sync::Mutex::new(ListenerCompletion::default()));
+        let finished = completion.clone();
+        let worker = std::thread::Builder::new().name(name.into()).spawn(move || {
+            let result = catch_unwind(AssertUnwindSafe(|| run(receiver)));
+            let notify = {
+                let mut state = finished.lock().unwrap();
+                state.finished = true;
+                state.notify.take()
+            };
+            if let Some(notify) = notify { notify(); }
+            if let Err(panic) = result { resume_unwind(panic); }
+        })?;
+        Ok(Self { cancel, worker, completion })
+    }
+
+    pub fn is_finished(&self) -> bool { self.completion.lock().unwrap().finished }
+
+    /// The owning supervisor can subscribe even if startup failed immediately.
+    pub fn on_exit(&self, notify: impl FnOnce() + Send + 'static) {
+        let mut state = self.completion.lock().unwrap();
+        if state.finished {
+            drop(state);
+            notify();
+        } else {
+            state.notify = Some(Box::new(notify));
+        }
+    }
+
+    pub fn cancel(&self) { let _ = self.cancel.shutdown(std::net::Shutdown::Both); }
+
+    pub fn join(self) -> std::thread::Result<()> {
+        drop(self.cancel);
+        self.worker.join()
+    }
+}
+
+pub fn listener_readable(listener: &impl AsRawFd, cancellation: &UnixStream, stop: &std::sync::atomic::AtomicBool) -> bool {
+    use std::sync::atomic::Ordering;
+    let descriptor = |fd| libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
+    let mut fds = [descriptor(cancellation.as_raw_fd()), descriptor(listener.as_raw_fd())];
+    while !stop.load(Ordering::Acquire) {
+        let ready = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as _, -1) };
+        if ready < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted { continue; }
+        return ready > 0 && fds[0].revents == 0 && fds[1].revents & libc::POLLIN != 0 && !stop.load(Ordering::Acquire);
+    }
+    false
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -294,6 +361,14 @@ pub fn process_start_stamp(seconds: u64) -> Option<String> {
     Some(format!("{day} {month} {} {:02}:{:02}:{:02} {}", tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec, tm.tm_year + 1900))
 }
 
+/// Kernel-bound lifetime of the process that opened this exact connection.
+pub fn unix_stream_peer_process(stream: &UnixStream) -> Option<ProcessKernelIdentity> {
+    #[cfg(target_os = "macos")]
+    { macos::unix_peer_process(stream.as_raw_fd()) }
+    #[cfg(not(target_os = "macos"))]
+    { let _ = stream; None }
+}
+
 pub fn verify_sandbox_helper_peer(
     stream: &UnixStream,
     verifier: &SandboxPeerVerifier,
@@ -447,6 +522,34 @@ unsafe extern "C" {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn listener_waits_for_input_or_cancellation_and_reports_exit() {
+        use super::{listener_readable, ListenerWorker, UnixStream};
+        use std::{io::{Read, Write}, sync::{atomic::AtomicBool, mpsc}, time::Duration};
+        let (mut input, mut peer) = UnixStream::pair().unwrap();
+        let (seen, result) = mpsc::channel();
+        let worker = ListenerWorker::spawn("test-listener", move |cancel| {
+            let stop = AtomicBool::new(false);
+            assert!(listener_readable(&input, &cancel, &stop));
+            let mut byte = [0];
+            input.read_exact(&mut byte).unwrap();
+            seen.send(byte).unwrap();
+            assert!(!listener_readable(&input, &cancel, &stop));
+        }).unwrap();
+        let (exited, exit) = mpsc::channel();
+        worker.on_exit(move || exited.send(()).unwrap());
+        peer.write_all(b"S").unwrap();
+        assert_eq!(result.recv_timeout(Duration::from_secs(2)).unwrap(), *b"S");
+        assert!(!worker.is_finished());
+        worker.cancel();
+        exit.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(worker.is_finished());
+        let (late, received) = mpsc::channel();
+        worker.on_exit(move || late.send(()).unwrap());
+        received.try_recv().unwrap();
+        worker.join().unwrap();
+    }
+
     #[test]
     fn sha256_standard_vectors() {
         for (input, expected) in [
@@ -746,6 +849,18 @@ mod macos {
         }
     }
 
+    pub fn unix_peer_process(fd: i32) -> Option<super::ProcessKernelIdentity> {
+        let mut token = [0u32; 8];
+        let mut len = std::mem::size_of_val(&token) as libc::socklen_t;
+        if unsafe { libc::getsockopt(fd, 0, 0x006, token.as_mut_ptr().cast(), &mut len) } != 0
+            || len as usize != std::mem::size_of_val(&token) || token[5] <= 1
+        {
+            return None;
+        }
+        let process = inspect_process(token[5])?;
+        (process.audit_token == token && process.uid == token[1]).then_some(process)
+    }
+
     pub fn verify_sandbox_peer(
         fd: i32,
         verifier: &super::SandboxPeerVerifier,
@@ -757,22 +872,10 @@ mod macos {
         {
             return None;
         }
-        let mut token = [0u32; 8];
-        let mut len = std::mem::size_of_val(&token) as libc::socklen_t;
-        if unsafe { libc::getsockopt(fd, 0, 0x006, token.as_mut_ptr().cast(), &mut len) } != 0
-            || len as usize != std::mem::size_of_val(&token)
-        {
-            return None;
-        }
-        let pid = token[5];
-        let euid = token[1];
-        if pid <= 1 || euid != verifier.expected_uid {
-            return None;
-        }
-        let proc_id = inspect_process(pid)?;
-        if proc_id.audit_token != token || proc_id.uid != verifier.expected_uid {
-            return None;
-        }
+        let proc_id = unix_peer_process(fd)?;
+        let pid = proc_id.pid;
+        let token = proc_id.audit_token;
+        if proc_id.uid != verifier.expected_uid { return None; }
         let expected_canonical = std::fs::canonicalize(&verifier.expected_helper_executable)
             .ok()
             .and_then(|p| p.to_str().map(str::to_owned))

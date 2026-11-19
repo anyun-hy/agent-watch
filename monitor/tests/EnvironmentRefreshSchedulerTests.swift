@@ -11,6 +11,16 @@ struct EnvironmentRefreshSchedulerTests {
         var scheduler = EnvironmentRefreshScheduler()
         let base = Date(timeIntervalSince1970: 1_792_713_600)
 
+        var replay = EnvironmentRefreshScheduler()
+        _ = replay.claim(context: "A", now: base, switcherBusy: false, observedAt: base)
+        expect(replay.claim(context: "A", now: base.addingTimeInterval(1), switcherBusy: false, observedAt: base) == nil,
+               "duplicate notifications cannot manufacture a second observation")
+        _ = replay.claim(context: "A", now: base.addingTimeInterval(2), switcherBusy: false)
+        replay.complete(context: "A", accepted: true, now: base.addingTimeInterval(3), validUntil: base.timeIntervalSince1970 + 97)
+        expect(replay.claim(context: "A", now: base.addingTimeInterval(70), switcherBusy: false) == nil,
+               "a current receipt with a longer lifetime is not refreshed after sixty seconds")
+        expect(replay.claim(context: "A", now: base.addingTimeInterval(97), switcherBusy: false) == .interval,
+               "refresh becomes due at the receipt deadline")
         expect(scheduler.claim(context: "A", now: base, switcherBusy: false) == nil,
                "first valid snapshot only establishes a candidate")
         expect(scheduler.claim(context: "A", now: base.addingTimeInterval(2), switcherBusy: false) == .initial,

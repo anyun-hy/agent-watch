@@ -21,6 +21,14 @@ pub fn read_frame(store: &StateStore) -> Value {
     store.read_json(&store.paths.watch().join(FRAME_PATH), Value::Null).unwrap_or(Value::Null)
 }
 
+pub fn read_frame_with_events(store: &StateStore) -> Value {
+    let mut frame = read_frame(store);
+    if frame.get("event_history").is_some() {
+        frame["events"] = crate::channel_history::events(store, &frame, false).unwrap_or(Value::Null);
+    }
+    frame
+}
+
 /// Fixed inputs for the read projections of one frame. Live identity and
 /// backend observations are taken by each consumer at its existing boundary.
 pub struct StatusFrame<'a> {

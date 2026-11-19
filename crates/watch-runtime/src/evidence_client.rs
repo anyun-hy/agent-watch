@@ -124,6 +124,9 @@ pub struct EvidenceServer {
     path: PathBuf,
     inode: u64,
 }
+impl std::os::fd::AsFd for EvidenceServer {
+    fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> { self.listener.as_fd() }
+}
 impl EvidenceServer {
     pub fn bind(store: &StateStore) -> Result<Self> {
         let path = evidence_socket_path(&store.paths);
@@ -156,9 +159,15 @@ impl EvidenceServer {
         })
     }
     pub fn poll<S: EvidenceSystem>(&self, store: &StateStore, system: &mut S) -> Result<bool> {
+        Ok(self.poll_with_update(store, system)?.is_some())
+    }
+
+    /// A handled request may just read existing evidence. Wake supervision
+    /// only when the resident executor actually produced receipts.
+    pub fn poll_with_update<S: EvidenceSystem>(&self, store: &StateStore, system: &mut S) -> Result<Option<bool>> {
         let (mut stream, _) = match self.listener.accept() {
             Ok(value) => value,
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(false),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(None),
             Err(_) => return Err(failure("evidence_response_failed")),
         };
         // macOS inherits the listener's nonblocking flag. A connected request
@@ -176,8 +185,9 @@ impl EvidenceServer {
                 json!({"schema":1,"id":request.id,"status":"error","code":e.code,"message":e.message})
             }
         };
+        let updated = response["result"]["count"].as_u64().is_some_and(|n| n > 0);
         write_frame(&mut stream, &response)?;
-        Ok(true)
+        Ok(Some(updated))
     }
 }
 impl Drop for EvidenceServer {

@@ -42,10 +42,9 @@ use std::{
     },
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::AtomicBool,
         Arc, Mutex,
     },
-    thread,
     time::Duration,
 };
 use uuid::Uuid;
@@ -210,6 +209,7 @@ fn combo_aliases_match(combo: &ApprovedScriptCombo) -> bool {
 }
 
 struct RegistryInner {
+    changes: claude_watch_system::network_events::LocalNotifications,
     executor_boot_id: String,
     policy_version: PolicyVersion,
     verifier: SandboxPeerVerifier,
@@ -269,6 +269,7 @@ impl SandboxLaunchRegistry {
     ) -> Self {
         Self {
             inner: Arc::new(Mutex::new(RegistryInner {
+                changes: Default::default(),
                 executor_boot_id: executor_boot_id.into(),
                 policy_version,
                 verifier,
@@ -572,7 +573,10 @@ impl SandboxLaunchRegistry {
         let Some(key) = VerificationKey::new(path, sha, *revision) else { return ImageStatus::Invalid; };
         // At most one current key per approved/live image; mutations cannot accumulate history.
         guard.image_verifications.retain(|old, _| old.path != path || old == &key);
-        *guard.image_verifications.entry(key).or_insert(ImageStatus::Pending)
+        *guard.image_verifications.entry(key).or_insert_with(|| {
+            guard.changes.publish();
+            ImageStatus::Pending
+        })
     }
 
     /// Called by the existing target-refresh worker. All file content IO is outside
@@ -659,6 +663,15 @@ impl SandboxLaunchRegistry {
             blocker_code,
             blocker_detail,
         }
+    }
+
+    pub fn subscribe_changes(&self) -> std::io::Result<std::os::unix::net::UnixStream> {
+        self.inner.lock().unwrap().changes.subscribe()
+    }
+
+    pub fn has_live_instances(&self) -> bool {
+        self.inner.lock().unwrap().instances.values().any(|i|
+            !matches!(i.state, ManagedInstanceState::Exited | ManagedInstanceState::Failed))
     }
 
     pub fn instances(&self) -> Vec<ManagedLaunchInstance> {
@@ -1036,6 +1049,7 @@ impl SandboxLaunchRegistry {
                 guard.image_verifications.insert(interpreter, ImageStatus::Verified);
             }
         }
+        guard.changes.publish();
         drop(guard);
         self.persist_instances();
 
@@ -1601,7 +1615,7 @@ impl SandboxLaunchRegistry {
         self: &Arc<Self>,
         socket_path: &Path,
         stop: Arc<AtomicBool>,
-    ) -> Result<thread::JoinHandle<()>> {
+    ) -> Result<claude_watch_system::ListenerWorker> {
         if let Some(parent) = socket_path.parent() {
             let _ = std::fs::DirBuilder::new()
                 .recursive(true)
@@ -1613,13 +1627,11 @@ impl SandboxLaunchRegistry {
             CoreError::new("sandbox_registration_bind_failed", "沙箱注册 Unix 套接字绑定失败")
         })?;
         let _ = std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o600));
-        let _ = listener.set_nonblocking(true);
+        listener.set_nonblocking(true).map_err(|_| CoreError::new("sandbox_registration_thread_failed", "无法配置沙箱注册监听套接字"))?;
         let reg = Arc::clone(self);
         let path_owned = socket_path.to_path_buf();
-        thread::Builder::new()
-            .name("sandbox-helper-registration".into())
-            .spawn(move || {
-                while !stop.load(Ordering::Acquire) {
+        claude_watch_system::ListenerWorker::spawn("sandbox-helper-registration", move |cancel| {
+                while claude_watch_system::listener_readable(&listener, &cancel, &stop) {
                     match listener.accept() {
                         Ok((stream, _)) => {
                             let _ = stream.set_nonblocking(false);
@@ -1628,12 +1640,8 @@ impl SandboxLaunchRegistry {
                                 crate::native::now(),
                             );
                         }
-                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                            thread::sleep(Duration::from_millis(20));
-                        }
-                        Err(_) => {
-                            thread::sleep(Duration::from_millis(20));
-                        }
+                        Err(e) if matches!(e.kind(), std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock) => continue,
+                        Err(_) => break,
                     }
                 }
                 drop(listener);
@@ -1908,7 +1916,7 @@ mod approval_refresh_tests {
         reg.replace_approved_targets(BTreeMap::from([(path.clone(), sha.clone())]), BTreeMap::new());
         let (entered_tx, entered_rx) = mpsc::channel(); let (release_tx, release_rx) = mpsc::channel();
         let worker_registry = reg.clone();
-        let worker = thread::spawn(move || worker_registry.refresh_executable_verifications_with(|key| {
+        let worker = std::thread::spawn(move || worker_registry.refresh_executable_verifications_with(|key| {
             entered_tx.send(()).unwrap(); release_rx.recv_timeout(Duration::from_secs(3)).unwrap(); key.verify()
         }));
         entered_rx.recv_timeout(Duration::from_secs(3)).unwrap();

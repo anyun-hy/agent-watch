@@ -182,7 +182,9 @@ fn execute_targets(targets: &[ExitTarget], timeout: Duration,
         }
         row
     }).collect();
-    loop {
+    let requested = targets.iter().zip(&results).filter_map(|(target, row)|
+        row.request_sent_at.map(|_| target.process.pid)).collect();
+    wait_for_exits(requested, deadline, || {
         let mut waiting = false;
         for (target, row) in targets.iter().zip(&mut results) {
             if row.request_sent_at.is_some() && row.process_state == "timeout" {
@@ -190,10 +192,26 @@ fn execute_targets(targets: &[ExitTarget], timeout: Duration,
                 else { waiting = true; }
             }
         }
-        if !waiting || Instant::now() >= deadline { break; }
-        std::thread::sleep(Duration::from_millis(20).min(deadline.saturating_duration_since(Instant::now())));
-    }
+        !waiting
+    });
     results
+}
+
+/// Register before inspecting completion so an exit in between cannot be lost.
+/// A kernel notification only prompts the caller to verify the original lifetime.
+pub(crate) fn wait_for_exits(pids: Vec<u32>, deadline: Instant, mut complete: impl FnMut() -> bool) {
+    if pids.is_empty() { return; }
+    let queue = claude_watch_system::process_events::ProcessEvents::new().ok();
+    if let Some(events) = &queue {
+        for pid in pids { let _ = events.watch_exit(pid); }
+    }
+    while !complete() && Instant::now() < deadline {
+        if queue.as_ref().is_none_or(|events| events.wait(Some(deadline)).is_err()) {
+            // If event registration is unavailable, do one final identity check
+            // at the original deadline. It must never manufacture a receipt.
+            std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
+        }
+    }
 }
 
 fn receipt(plan: &ExitPlan, results: Vec<ExitResult>, remaining: Vec<u32>, unavailable: bool) -> ExitReceipt {
