@@ -60,6 +60,10 @@ pub struct DiscoveredTarget {
     pub entry_path: PathBuf,
     pub bundle: Option<PathBuf>,
     pub bundle_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_version: Option<String>,
     pub executable: Option<PathBuf>,
     pub script_entry: Option<PathBuf>,
     pub interpreter: Option<PathBuf>,
@@ -392,6 +396,15 @@ struct DirectoryBatch {
     more: bool,
     error: bool,
 }
+fn clean_plist_version(value: &serde_json::Value) -> Option<String> {
+    let text = value.as_str()?.trim();
+    if text.is_empty() || text.len() > 128 || text.chars().any(char::is_control) {
+        None
+    } else {
+        Some(text.to_owned())
+    }
+}
+
 fn stamp(path: &Path) -> (Vec<i128>, Option<PathBuf>) {
     let mut facts = Vec::new();
     for value in [fs::symlink_metadata(path), fs::metadata(path)] {
@@ -1016,6 +1029,8 @@ impl<R: ReadRunner + ?Sized> Scan<'_, R> {
             entry_path: path,
             bundle: None,
             bundle_id: None,
+            app_version: None,
+            build_version: None,
             executable: None,
             script_entry: None,
             interpreter: None,
@@ -1100,6 +1115,8 @@ impl<R: ReadRunner + ?Sized> Scan<'_, R> {
         }
         record.bundle = resolved;
         record.bundle_id = Some(id.into());
+        record.app_version = clean_plist_version(&info["CFBundleShortVersionString"]);
+        record.build_version = clean_plist_version(&info["CFBundleVersion"]);
         if record.valid() {
             let bundle = record.bundle.as_ref().unwrap();
             self.watch(&bundle.join("Contents/Info.plist"));
@@ -1109,8 +1126,23 @@ impl<R: ReadRunner + ?Sized> Scan<'_, R> {
                     break;
                 }
                 self.remaining -= 1;
-                if helper.extension().is_some_and(|v| v == "app") {
-                    for file in self.entries(&helper.join("Contents/MacOS")) {
+                let helper_apps: Vec<PathBuf> = if helper.extension().is_some_and(|v| v == "app") {
+                    vec![helper]
+                } else if helper.extension().is_some_and(|v| v == "framework") {
+                    let helpers_dir = helper.join("Versions/Current/Helpers");
+                    if helpers_dir.is_dir() {
+                        self.entries(&helpers_dir)
+                            .into_iter()
+                            .filter(|p| p.extension().is_some_and(|v| v == "app"))
+                            .collect()
+                    } else {
+                        vec![]
+                    }
+                } else {
+                    vec![]
+                };
+                for helper_app in helper_apps {
+                    for file in self.entries(&helper_app.join("Contents/MacOS")) {
                         if self.remaining == 0 {
                             self.issues.push("discovery_source_budget_exhausted".into());
                             break;
@@ -1119,7 +1151,10 @@ impl<R: ReadRunner + ?Sized> Scan<'_, R> {
                         self.watch(&file);
                         if let Ok(file) = fs::canonicalize(file) {
                             self.watch(&file);
-                            if file.starts_with(bundle) && executable_file(&file) {
+                            if file.starts_with(bundle)
+                                && executable_file(&file)
+                                && !record.child_executables.contains(&file)
+                            {
                                 record.child_executables.push(file);
                             }
                         }
@@ -1131,7 +1166,10 @@ impl<R: ReadRunner + ?Sized> Scan<'_, R> {
                 self.watch(&file);
                 if let Ok(child) = fs::canonicalize(&file) {
                     self.watch(&child);
-                    if child.starts_with(bundle) && executable_file(&child) {
+                    if child.starts_with(bundle)
+                        && executable_file(&child)
+                        && !record.child_executables.contains(&child)
+                    {
                         record.child_executables.push(child);
                     }
                 }
@@ -1144,6 +1182,8 @@ impl<R: ReadRunner + ?Sized> Scan<'_, R> {
                         let cli = self.targets.last_mut().unwrap();
                         cli.bundle = Some(bundle.clone());
                         cli.bundle_id = Some(id.into());
+                        cli.app_version = record.app_version.clone();
+                        cli.build_version = record.build_version.clone();
                     }
                 }
             }

@@ -34,6 +34,12 @@ fn io(_: std::io::Error) -> CoreError {
     err("account_io_failed", "账号资料文件操作失败")
 }
 
+/// Safe runtime wrapper around macOS APFS copy-on-write file cloning.
+/// Returns `Ok(false)` when COW is unavailable so `copy_dir` falls back to byte copy.
+pub fn clone_regular_file(source: &Path, target: &Path) -> Result<bool> {
+    claude_watch_system::anchored_files::clone_regular_file(source, target).map_err(io)
+}
+
 /// Application and COW authority is injected by the eventual dispatcher.
 pub trait AccountOs {
     fn current_desktop(&mut self) -> Result<claude_watch_core::processes::Identity> {
@@ -500,6 +506,12 @@ impl<O: AccountOs> AccountStore<O> {
             if self.storage.paths.active().exists() {
                 copies
                     .push(self.copy_tree(&self.storage.paths.active(), &work.join("old-profile"))?);
+            }
+            // Keep only the latest embedded Claude Code CLI inside staged
+            // profiles so older versions do not accumulate across A/B switches.
+            crate::ai_versions::prune_claude_code_dir(&next);
+            if work.join("old-profile").exists() {
+                crate::ai_versions::prune_claude_code_dir(&work.join("old-profile"));
             }
             j["phase"] = json!("publishing");
             self.storage

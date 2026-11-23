@@ -35,12 +35,20 @@ impl<R: ReadRunner, T: Transport, S: AuditSystem + ServiceSystem> AccountOs
     for AccountRuntimeHost<R, T, S>
 {
     fn claude_version(&mut self) -> Result<Option<String>> {
+        let snapshot = crate::target_discovery::DiscoveryHandle::for_home(&self.storage.paths.home)
+            .refresh(&self.desktop.runner, crate::native::now());
+        if let Ok(record) = snapshot.select(claude_watch_core::processes::LaunchTarget::ClaudeDesktop, None) {
+            if let Some(version) = record.app_version.as_ref().filter(|v| !v.is_empty()) {
+                return Ok(Some(version.clone()));
+            }
+        }
         let v = crate::native::Observer {
             runner: &self.desktop.runner,
         }
         .environment()?;
         Ok(v.pointer("/claude_app/version")
             .and_then(serde_json::Value::as_str)
+            .filter(|s| !s.is_empty())
             .map(str::to_owned))
     }
     fn quit_claude(&mut self) -> Result<()> {
@@ -73,5 +81,8 @@ impl<R: ReadRunner, T: Transport, S: AuditSystem + ServiceSystem> AccountOs
             ));
         }
         Ok(())
+    }
+    fn clone_file(&mut self, source: &std::path::Path, target: &std::path::Path) -> Result<bool> {
+        crate::accounts::clone_regular_file(source, target)
     }
 }

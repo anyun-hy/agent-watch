@@ -53,6 +53,9 @@ impl claude_watch_runtime::accounts::AccountOs for ReadOnlyAccounts {
     fn preflight(&mut self) -> Result<()> {
         Err(CoreError::new("read_only", "只读入口不授予启动许可"))
     }
+    fn clone_file(&mut self, source: &Path, target: &Path) -> Result<bool> {
+        claude_watch_runtime::accounts::clone_regular_file(source, target)
+    }
 }
 fn bounded_input(limit: usize) -> Result<Value> {
     let mut data = Vec::new();
@@ -181,6 +184,29 @@ fn local_command(request: &claude_watch_core::cli::Request, paths: Paths) -> Res
                 .status()?
                 .value(),
         )),
+        ("account", Some("prune-cli")) => {
+            if !request.flag("apply") {
+                return claude_watch_runtime::ai_versions::prune_embedded_claude_cli(
+                    &storage, false, false,
+                )
+                .map(Some);
+            }
+            let mut sampler = Sampler::new(runtime::runner()?, storage.paths.clone());
+            let round = sampler.processes()?;
+            let claude_running = round.targets.iter().any(|t| {
+                matches!(
+                    t.kind,
+                    claude_watch_core::processes::Kind::ClaudeMain
+                        | claude_watch_core::processes::Kind::ClaudeHelper
+                )
+            });
+            claude_watch_runtime::ai_versions::prune_embedded_claude_cli(
+                &storage,
+                claude_running,
+                true,
+            )
+            .map(Some)
+        }
         ("diagnostic-export", _) => {
             let path = request.value("export").ok_or_else(|| CoreError::new("export_path_required", "请选择新的诊断导出文件"))?;
             let data = claude_watch_runtime::diagnostic_bundle::collect(&storage);

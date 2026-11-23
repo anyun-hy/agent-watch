@@ -4,15 +4,20 @@ import Foundation
 /// Native presence only; process membership and protection are backend facts.
 struct WorkspaceDesktopPresence: Equatable {
     static let supervisedBundleIDs: Set<String> = ["com.anthropic.claudefordesktop", "com.openai.codex", "com.openai.chat"]
-    private var processes: [pid_t: String] = [:]
+    private struct Entry: Equatable {
+        let bundle: String
+        let bundleName: String?
+    }
+    private var processes: [pid_t: Entry] = [:]
 
-    mutating func record(pid: pid_t, bundle: String, launched: Bool) -> Bool {
+    mutating func record(pid: pid_t, bundle: String, bundleName: String? = nil, launched: Bool) -> Bool {
         guard Self.supervisedBundleIDs.contains(bundle) else { return false }
         if launched {
-            guard processes[pid] != bundle else { return false }
-            processes[pid] = bundle
+            let entry = Entry(bundle: bundle, bundleName: bundleName)
+            guard processes[pid] != entry else { return false }
+            processes[pid] = entry
         } else {
-            guard processes[pid] == bundle else { return false }
+            guard processes[pid]?.bundle == bundle else { return false }
             processes.removeValue(forKey: pid)
         }
         return true
@@ -20,10 +25,17 @@ struct WorkspaceDesktopPresence: Equatable {
 
     func processIDs(for product: MonitoredProduct) -> Set<pid_t> {
         let bundles = product == .claude ? ["com.anthropic.claudefordesktop"] : ["com.openai.codex", "com.openai.chat"]
-        return Set(processes.compactMap { bundles.contains($0.value) ? $0.key : nil })
+        return Set(processes.compactMap { bundles.contains($0.value.bundle) ? $0.key : nil })
     }
 
-    func contains(bundle: String) -> Bool { processes.values.contains(bundle) }
+    func contains(bundle: String) -> Bool { processes.values.contains { $0.bundle == bundle } }
+
+    func containsChatGPT() -> Bool {
+        processes.values.contains { entry in
+            entry.bundle == "com.openai.chat" ||
+                (entry.bundle == "com.openai.codex" && entry.bundleName?.lowercased() == "chatgpt.app")
+        }
+    }
 
 }
 
@@ -43,13 +55,13 @@ final class WorkspaceAppObserver {
             tokens.append(workspace.notificationCenter.addObserver(forName: name, object: nil, queue: .main) { [weak self] note in
                 guard let self, let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
                       let bundle = app.bundleIdentifier,
-                      self.presence.record(pid: app.processIdentifier, bundle: bundle, launched: launched) else { return }
+                      self.presence.record(pid: app.processIdentifier, bundle: bundle, bundleName: app.bundleURL?.lastPathComponent, launched: launched) else { return }
                 self.onChange(self.presence)
             })
         }
         for app in workspace.runningApplications {
             guard let bundle = app.bundleIdentifier else { continue }
-            _ = presence.record(pid: app.processIdentifier, bundle: bundle, launched: true)
+            _ = presence.record(pid: app.processIdentifier, bundle: bundle, bundleName: app.bundleURL?.lastPathComponent, launched: true)
         }
         return presence
     }

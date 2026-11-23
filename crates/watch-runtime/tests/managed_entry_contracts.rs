@@ -92,7 +92,7 @@ fn chatgpt_28661_installed_components_block_both_desktop_aliases() {
         assert!(!preview.destination_path.exists());
         let mut changed = spec;
         changed.target_fingerprint = "f".repeat(64);
-        assert!(changed.check_seatbelt_compatibility().is_ok());
+        assert_eq!(changed.check_seatbelt_compatibility().unwrap_err().code, "desktop_sandbox_incompatible");
     }
 }
 
@@ -105,17 +105,25 @@ fn chatgpt_known_main_with_changed_aperitif_components_is_unverified() {
     let mut spec = DesktopManagedEntrySpec {
         entry_bundle_id: DesktopManagedEntrySpec::entry_bundle_id_for(LaunchTarget::ChatgptDesktop).into(),
         target: LaunchTarget::ChatgptDesktop, target_bundle_id: "com.openai.codex".into(),
-        target_bundle_path: fs::canonicalize(&tmp.0).unwrap(), target_executable: tmp.0.join("unused"),
+        target_bundle_path: fs::canonicalize(&tmp.0).unwrap(), target_executable: tmp.0.join("Contents/MacOS/ChatGPT"),
         target_fingerprint: "00305cecf34970bd6fffcd108812bb88888fbb89447ffb7d3bf966a43319a13f".into(),
         proxy_adaptation: ProxyAdaptationKind::EnvAndElectronSwitches,
     };
     assert_eq!(spec.check_seatbelt_compatibility().unwrap_err().code, "desktop_compatibility_unverified");
-    for (path, size) in [(helper, 51_568), (library, 85_456)] {
+    for (path, size) in [(&helper, 51_568), (&library, 85_456)] {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, vec![0; size]).unwrap();
     }
     assert_eq!(spec.check_seatbelt_compatibility().unwrap_err().code, "desktop_compatibility_unverified");
+    // Updated builds (e.g. 29513 with a new main executable SHA/size) that still
+    // bundle Aperitif components must also be blocked before Seatbelt launch.
     spec.target_fingerprint = "f".repeat(64);
+    assert!(DesktopManagedEntrySpec::bundle_has_aperitif_components(&spec.target_bundle_path));
+    assert_eq!(spec.check_seatbelt_compatibility().unwrap_err().code, "desktop_sandbox_incompatible");
+    // Once Aperitif components are absent, a different build is allowed.
+    fs::remove_file(&helper).unwrap();
+    fs::remove_file(&library).unwrap();
+    assert!(!DesktopManagedEntrySpec::bundle_has_aperitif_components(&spec.target_bundle_path));
     assert!(spec.check_seatbelt_compatibility().is_ok());
 }
 

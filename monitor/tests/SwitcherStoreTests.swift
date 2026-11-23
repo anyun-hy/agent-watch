@@ -74,6 +74,22 @@ struct SwitcherStoreTests {
             current.source_token = nil
             await manager.loadManualAccount(.openAI)
             expect(manager.manualAccounts[.openAI]?.canSave == false, "visible identity without verified process binding cannot enable save")
+
+            let splitBrain = try JSONDecoder().decode(SwitcherAccountState.self, from: Data(#"{"current":"A","recovery_required":false,"detail":"test","accounts":[{"id":"A","stored":true,"current":true},{"id":"B","stored":true,"current":false}],"legacy_conflict":{"code":"external_switcher_conflict","watch_current":"A","legacy_current":"C","message":"原版切换器当前账号与 Claude Watch 不一致"}}"#.utf8))
+            expect(splitBrain.legacy_conflict?.code == "external_switcher_conflict" &&
+                   splitBrain.legacy_conflict?.watch_current == "A" &&
+                   splitBrain.legacy_conflict?.legacy_current == "C" &&
+                   splitBrain.legacy_conflict?.title == "检测到跨工具账号资料冲突" &&
+                   splitBrain.legacy_conflict?.summaryDetail.contains("原版切换器记录：C") == true,
+                   "Claude account state decodes split-brain legacy conflict details")
+            let locked = try JSONDecoder().decode(SwitcherAccountState.self, from: Data(#"{"current":"A","recovery_required":false,"detail":"test","accounts":[{"id":"A","stored":true,"current":true},{"id":"B","stored":false,"current":false}],"legacy_conflict":{"code":"external_switcher_locked","message":"检测到原版切换器正在执行操作"}}"#.utf8))
+            expect(locked.legacy_conflict?.code == "external_switcher_locked" &&
+                   locked.legacy_conflict?.title == "原版切换器正在操作" &&
+                   locked.legacy_conflict?.watch_current == nil &&
+                   locked.legacy_conflict?.legacy_current == nil,
+                   "Claude account state decodes external lock legacy conflict without slot fields")
+            let clean = try JSONDecoder().decode(SwitcherAccountState.self, from: Data(#"{"current":"A","recovery_required":false,"detail":"test","accounts":[{"id":"A","stored":true,"current":true},{"id":"B","stored":false,"current":false}],"legacy_conflict":null}"#.utf8))
+            expect(clean.legacy_conflict == nil, "null legacy_conflict decodes as nil")
         }
         var replaceable = try JSONDecoder().decode(CurrentEnvironmentReceipt.self, from: SwitcherStore.fixtureCurrentEnvironment())
         let grouped = AtlasSubject.allCases.flatMap(\.ids)
@@ -257,11 +273,27 @@ struct SwitcherStoreTests {
         expect(chatgptLaunch.hasRunningDesktop(in: presence) && !claudeLaunch.hasRunningDesktop(in: presence), "one remaining ChatGPT instance is still running")
         _ = presence.record(pid: 13, bundle: "com.openai.chat", launched: false)
         expect(!chatgptLaunch.hasRunningDesktop(in: presence), "last termination clears ChatGPT independently of Codex")
+        expect(presence.record(pid: 14, bundle: "com.openai.codex", bundleName: "ChatGPT.app", launched: true) &&
+               chatgptLaunch.hasRunningDesktop(in: presence),
+               "unified ChatGPT.app (com.openai.codex) is recognized as running ChatGPT without conflating Codex.app")
+        _ = presence.record(pid: 14, bundle: "com.openai.codex", bundleName: "ChatGPT.app", launched: false)
+        expect(!chatgptLaunch.hasRunningDesktop(in: presence), "closing unified ChatGPT.app clears running state while Codex stays separate")
         let cliOnly = [WatchedProcess(id: "cli", pid: 1, started: "fixture", kind: "codex-cli", authorized: nil)]
         let chatgptMain = [WatchedProcess(id: "desktop", pid: 2, started: "fixture", kind: "chatgpt-desktop-main", authorized: nil)]
+        let unifiedMain = [WatchedProcess(id: "unified", pid: 3, started: "fixture", kind: "openai-desktop-main", authorized: nil)]
         expect(!chatgptLaunch.hasRunningDesktop(in: cliOnly) && chatgptLaunch.hasRunningDesktop(in: chatgptMain) &&
-               !claudeLaunch.hasRunningDesktop(in: chatgptMain),
+               chatgptLaunch.hasRunningDesktop(in: unifiedMain) && !claudeLaunch.hasRunningDesktop(in: chatgptMain) &&
+               !claudeLaunch.hasRunningDesktop(in: unifiedMain),
                "a running desktop blocks only its own launch, not another product or a CLI")
+        let backendLaunchMsg = SwitcherStore.resolveOperationMessage(
+            raw: ["status": "ok", "message": "启动检查通过并已启动 ChatGPT。"],
+            args: ["launch", "--target", "chatgpt-desktop", "--apply"],
+            status: "ok", failure: false)
+        expect(backendLaunchMsg == "启动检查通过并已启动 ChatGPT。" && !backendLaunchMsg.hasPrefix("上次操作："),
+               "launch result preserves backend message without misleading historical prefix")
+        expect(SwitcherStore.formattedVersion("6.28899.2", build: "6.28899.2") == "6.28899.2" &&
+               SwitcherStore.formattedVersion("26.1117.31558", build: "29513") == "26.1117.31558 (29513)",
+               "version formatter omits duplicate build numbers while keeping distinct build numbers")
         review.publishBackgroundForFixture(backgroundReceipt(at: Date().timeIntervalSince1970, sampling: true, guardReady: true))
         expect(claudeLaunch.blockReason(store: review, at: Date()) == nil &&
                chatgptLaunch.blockReason(store: review, at: Date()) == nil,
@@ -322,6 +354,9 @@ struct SwitcherStoreTests {
         expect(review.webRTCReceiptError == "后台检测不可用" && review.initializationWebRTCReceipt == nil,
                "unavailable daemon invalidates the initialization receipt and preserves its reason")
         await store.load()
+        expect(store.chatgptVersion == "26.1117.31558" && store.chatgptBuild == "29513" &&
+               store.aiVersions?.claude_embedded_cli.latest == "2.1.328",
+               "status load populates ChatGPT version/build and AI version inspection receipt")
         let coordinated = SwitcherStore(isFixture: true)
         await coordinated.load()
         coordinated.fixtureEnvironmentReadDelayNanoseconds = 150_000_000
@@ -423,6 +458,9 @@ struct SwitcherStoreTests {
         await store.refreshBackground()
         expect(store.settings["locale"] as? String == "en_GB" && store.hasUnsavedSettings, "refreshing actual services preserves a draft")
         await store.load()
+        expect(store.chatgptVersion == "26.1117.31558" && store.chatgptBuild == "29513" &&
+               store.aiVersions?.claude_embedded_cli.latest == "2.1.328",
+               "status load populates ChatGPT version/build and AI version inspection receipt")
         expect(store.settings["locale"] as? String == "en_GB" && store.hasUnsavedSettings, "reloading authoritative status cannot replace a draft")
         store.discardChanges()
         expect(store.settings["locale"] as? String == "" && !store.hasUnsavedSettings, "discard restores the saved settings without saving")

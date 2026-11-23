@@ -23,8 +23,23 @@ struct AIProcessIdentity: Codable, Equatable, Sendable {
             && auditToken == other.auditToken
     }
 }
-enum AIProcessInventoryFailure: Error {
-    case malformed, engineUnavailable, timeout, outputTooLarge, readFailed, commandFailed
+enum AIProcessInventoryFailure: Error, LocalizedError {
+    case malformed, engineUnavailable, timeout, outputTooLarge, readFailed, commandFailed(String? = nil)
+
+    var errorDescription: String? {
+        switch self {
+        case .malformed: return "后台返回的进程控制回执格式无效。"
+        case .engineUnavailable: return "未找到可用的原生运行组件（watch-engine）。"
+        case .timeout: return "后台进程控制请求超时。"
+        case .outputTooLarge: return "后台返回数据超过安全上限。"
+        case .readFailed: return "读取后台进程输出失败。"
+        case .commandFailed(let detail):
+            if let detail, !detail.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                return detail
+            }
+            return "后台命令未能完成。"
+        }
+    }
 }
 struct AIProcessClosePlan: Sendable {
     let product: MonitoredProduct
@@ -121,7 +136,8 @@ enum AIProcessInventory {
                         maxBytes: Int = 4_000_000, input: Data? = nil) throws -> Data {
         let task = Process(), pipe = Pipe()
         task.executableURL = executable; task.arguments = arguments
-        task.environment = ["PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "LC_ALL": "C"]
+        let home = ProcessInfo.processInfo.environment["HOME"].flatMap { $0.isEmpty ? nil : $0 } ?? NSHomeDirectory()
+        task.environment = ["HOME": home, "PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "LC_ALL": "C"]
         let inputPipe = input.map { _ in Pipe() }
         if let inputPipe { task.standardInput = inputPipe }
         else { task.standardInput = FileHandle.nullDevice }
@@ -190,7 +206,10 @@ enum AIProcessInventory {
         }
         let remaining = max(0, deadline - ProcessInfo.processInfo.systemUptime)
         guard exited.wait(timeout: .now() + remaining) == .success else { throw AIProcessInventoryFailure.timeout }
-        guard task.terminationStatus == 0 else { throw AIProcessInventoryFailure.commandFailed }
+        guard task.terminationStatus == 0 else {
+            let detail = (try? JSONSerialization.jsonObject(with: data) as? [String: Any])?["message"] as? String
+            throw AIProcessInventoryFailure.commandFailed(detail)
+        }
         return data
     }
 

@@ -87,6 +87,11 @@ struct ChatGPTAccountPanel: View {
                     Text(store.chatGPTAccountsError ?? (store.loaded ? "当前后台未提供 ChatGPT 桌面账号切换。" : "正在读取桌面账号…"))
                         .font(WatchTypography.caption).foregroundStyle(p.secondary)
                 }
+                if store.aiVersions?.chatgpt_desktop.seatbelt_incompatible == true {
+                    InlineNotice(title: "当前 ChatGPT 构建暂不兼容受控 Seatbelt 启动",
+                                 detail: "已检测到包内包含 Aperitif 辅助进程组件，从「代理与连接」受控启动时会自动拦截以防止崩溃。",
+                                 symbol: "exclamationmark.shield", tint: p.amber, p: p)
+                }
             }
         }.task(id: StatusRequest(presence: presence, loaded: store.loaded, activation: activation)) {
             await store.refreshChatGPTAccounts()
@@ -96,10 +101,13 @@ struct ChatGPTAccountPanel: View {
     }
 
     private var selectionSummary: String {
-        if let id = store.switchingChatGPTSlot { return "正在打开账号 \(id) 并核对桌面状态…" }
-        if let id = store.chatGPTAccounts?.current { return "桌面正在使用槽位 \(id)" }
-        if let id = store.chatGPTAccounts?.selected { return "上次选用槽位 \(id)，当前桌面实例尚未核实" }
-        return "当前桌面使用的账号槽位尚未核实"
+        let base: String
+        if let id = store.switchingChatGPTSlot { base = "正在打开账号 \(id) 并核对桌面状态…" }
+        else if let id = store.chatGPTAccounts?.current { base = "桌面正在使用槽位 \(id)" }
+        else if let id = store.chatGPTAccounts?.selected { base = "上次选用槽位 \(id)，当前桌面实例尚未核实" }
+        else { base = "当前桌面使用的账号槽位尚未核实" }
+        let versionText = SwitcherStore.formattedVersion(store.chatgptVersion, build: store.chatgptBuild)
+        return versionText.isEmpty ? base : "\(base) · ChatGPT \(versionText)"
     }
 
     private func slotSummary(_ slot: SwitcherAccountSlot) -> String {
@@ -180,6 +188,8 @@ struct DesktopAccountControls: View {
                 Text("已读取「" + label + "」。请先保存或撤销工具设置，再加载账号。")
             } else if product == .claude && store.accounts?.recovery_required == true {
                 Text("已读取「" + label + "」。请先恢复未完成的账号切换，再加载账号。")
+            } else if product == .claude, let conflict = store.accounts?.legacy_conflict {
+                Text("已读取「" + label + "」。" + conflict.message + "，请先核对资料冲突后再保存。")
             } else if product == .openAI, let slot = reading.slot {
                 Text("「" + label + "」正在使用槽位 " + slot + "。选另一个空槽会把这份资料改存到那里。")
             } else {
@@ -194,7 +204,7 @@ struct DesktopAccountControls: View {
             Task { await store.saveManualAccount(product, to: slot, expectedToken: token) }
         }
         .disabled(store.busy || store.hasUnsavedSettings ||
-                  (product == .claude && store.accounts?.recovery_required == true))
+                  (product == .claude && (store.accounts?.recovery_required == true || store.accounts?.legacy_conflict != nil)))
     }
 
     private var accountText: String {

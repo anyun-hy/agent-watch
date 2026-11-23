@@ -7,7 +7,7 @@ enum GraphLaunchTarget: Equatable {
         self = product == .claude ? .claude : .chatgpt
     }
     func hasRunningDesktop(in presence: WorkspaceDesktopPresence) -> Bool {
-        presence.contains(bundle: self == .claude ? "com.anthropic.claudefordesktop" : "com.openai.chat")
+        self == .claude ? presence.contains(bundle: "com.anthropic.claudefordesktop") : presence.containsChatGPT()
     }
     var title: String { self == .claude ? "Claude" : "ChatGPT" }
     var arguments: [String] {
@@ -15,8 +15,9 @@ enum GraphLaunchTarget: Equatable {
     }
     func hasRunningDesktop(in processes: [WatchedProcess]) -> Bool {
         processes.contains { process in
-            self == .claude ? process.kind == "desktop-main"
-                : process.kind == "chatgpt-desktop-main"
+            self == .claude
+                ? process.kind == "desktop-main"
+                : ["chatgpt-desktop-main", "openai-desktop-main"].contains(process.kind)
         }
     }
     /// A launch is only impossible when the backend cannot represent the target

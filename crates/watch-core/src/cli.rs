@@ -79,7 +79,7 @@ impl Request {
                 &["confirm-force"],
             ),
             "account" => (
-                &["status", "current", "identity", "save", "switch", "recover", "import"],
+                &["status", "current", "identity", "save", "switch", "recover", "import", "prune-cli"],
                 &["apply", "ack-unverified-version"],
                 &["product"],
             ),
@@ -197,7 +197,7 @@ impl Request {
             let action = request.action.as_deref();
             let product = request.value("product").unwrap_or("claude");
             match (product, action) {
-                ("claude", Some("status" | "current" | "save" | "switch" | "recover" | "import")) |
+                ("claude", Some("status" | "current" | "save" | "switch" | "recover" | "import" | "prune-cli")) |
                 ("chatgpt", Some("status" | "identity" | "save" | "switch")) => {}
                 _ => return Err(invalid()),
             }
@@ -209,7 +209,7 @@ impl Request {
                 positionals.remove(0);
             }
             if (action == Some("save") && request.target.is_none())
-                || (matches!(action, Some("identity" | "current")) && request.target.is_some())
+                || (matches!(action, Some("identity" | "current" | "prune-cli")) && request.target.is_some())
                 || (request.value("product") == Some("chatgpt")
                     && matches!(action, Some("status" | "switch"))
                     && (action == Some("switch")) != request.target.is_some()) {
@@ -407,6 +407,11 @@ mod cli_target_contracts {
         assert!(parse(&["account", "status", "--product", "chatgpt"]).is_ok());
         assert!(parse(&["account", "identity", "--product", "chatgpt"]).is_ok());
         assert!(parse(&["account", "current", "--product", "claude"]).is_ok());
+        assert!(parse(&["account", "prune-cli"]).is_ok());
+        let prune_apply = parse(&["account", "prune-cli", "--apply"]).unwrap();
+        prune_apply.require_apply().unwrap();
+        assert!(parse(&["account", "prune-cli", "A"]).is_err());
+        assert!(parse(&["account", "prune-cli", "--product", "chatgpt"]).is_err());
         for product in ["chatgpt", "claude"] {
             let save = parse(&["account", "save", "B", "--product", product, "--apply"]).unwrap();
             assert_eq!(save.target.as_deref(), Some("B"));

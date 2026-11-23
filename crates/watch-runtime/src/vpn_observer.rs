@@ -26,7 +26,7 @@ use url::Url;
 use uuid::Uuid;
 
 pub const DEFAULT_VPN_OBSERVATION_TTL_SECONDS: f64 = 3.5;
-pub const VPN_OBSERVATION_RENEWAL_LEAD_SECONDS: f64 = 1.2;
+pub const VPN_OBSERVATION_RENEWAL_LEAD_SECONDS: f64 = 2.0;
 /// Leave time for publication and consumption inside the unchanged evidence TTL.
 pub const VPN_OBSERVATION_BUDGET: Duration = Duration::from_millis(2500);
 pub const RULES_CACHE_TTL_SECONDS: f64 = 5.0;

@@ -11,6 +11,7 @@ pub mod account_native;
 pub mod accounts;
 pub mod agent_install;
 pub mod ai_probe;
+pub mod ai_versions;
 pub mod alert_gate;
 pub mod app_lifecycle;
 pub mod audit_store;

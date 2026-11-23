@@ -385,12 +385,89 @@ struct SwitcherAccountSlot: Decodable, Identifiable {
     var account_label: String?
 }
 struct SwitcherAccountState: Decodable {
+    struct LegacyConflict: Decodable, Equatable {
+        let code: String
+        let message: String
+        var watch_current: String? = nil
+        var legacy_current: String? = nil
+
+        var title: String {
+            code == "external_switcher_locked" ? "原版切换器正在操作" : "检测到跨工具账号资料冲突"
+        }
+
+        var summaryDetail: String {
+            var details = [message]
+            if let watch = watch_current, !watch.isEmpty, let legacy = legacy_current, !legacy.isEmpty {
+                details.append("Claude Watch 当前记录：\(watch) · 原版切换器记录：\(legacy)")
+            } else if let legacy = legacy_current, !legacy.isEmpty {
+                details.append("原版切换器当前记录：\(legacy)")
+            } else if let watch = watch_current, !watch.isEmpty {
+                details.append("Claude Watch 当前记录：\(watch)")
+            }
+            details.append("为防止资料错槽覆盖，Claude 账号切换与保存已暂停；请先核对实际登录资料并重新核对状态。")
+            return details.joined(separator: "\n")
+        }
+    }
     let current: String?
     let recovery_required: Bool
     var accounts: [SwitcherAccountSlot]
     let detail: String
     var selected: String?
     var login_checked: Bool?
+    var app_version: String? = nil
+    var build_version: String? = nil
+    var legacy_conflict: LegacyConflict? = nil
+}
+struct AIDesktopInstallInfo: Decodable, Equatable, Identifiable {
+    let path: String
+    let bundle_id: String
+    let version: String
+    let build_version: String
+    let selected: Bool
+    let seatbelt_incompatible: Bool
+    var id: String { path }
+}
+struct AIDesktopVersionsInfo: Decodable, Equatable {
+    let selected_version: String
+    let selected_build: String
+    let selected_path: String
+    let selected_bundle_id: String
+    let seatbelt_incompatible: Bool
+    let installs: [AIDesktopInstallInfo]
+    let multiple_versions: Bool
+}
+struct AICliInstallInfo: Decodable, Equatable, Identifiable {
+    let path: String
+    let source_kind: String
+    let version: String
+    let selected: Bool
+    var id: String { path }
+}
+struct AICliVersionsInfo: Decodable, Equatable {
+    let selected_version: String
+    let selected_path: String
+    let installs: [AICliInstallInfo]
+    let multiple_versions: Bool
+}
+struct EmbeddedClaudeCLIInfo: Decodable, Equatable {
+    let latest: String
+    let versions: [String]
+    let redundant_versions: [String]
+    let redundant_bytes: UInt64
+    let legacy_redundant_versions: [String]
+
+    var redundantMBText: String {
+        let mb = Double(redundant_bytes) / (1024.0 * 1024.0)
+        return String(format: "%.1f MB", mb)
+    }
+}
+struct AIVersionsReceipt: Decodable, Equatable {
+    let claude_desktop: AIDesktopVersionsInfo
+    let chatgpt_desktop: AIDesktopVersionsInfo
+    let claude_embedded_cli: EmbeddedClaudeCLIInfo
+    let claude_cli: AICliVersionsInfo
+    let codex_cli: AICliVersionsInfo
+    let has_multi_version_warnings: Bool
 }
 struct AccountSlotPresentation {
     let summary, confirmationTitle, confirmationDetail, actionTitle: String
@@ -765,6 +842,11 @@ final class SwitcherStore: ObservableObject {
     @Published private(set) var message = ""
     @Published private(set) var failure = false
     @Published private(set) var claudeVersion = ""
+    @Published private(set) var claudeBuild = ""
+    @Published private(set) var chatgptVersion = ""
+    @Published private(set) var chatgptBuild = ""
+    @Published private(set) var aiVersions: AIVersionsReceipt?
+    @Published private(set) var pruneCLIMessage = ""
     @Published private(set) var loaded = false
     @Published private(set) var hasUnsavedSettings = false
     @Published private(set) var proxyGroups: [String] = []
@@ -1729,6 +1811,8 @@ final class SwitcherStore: ObservableObject {
             }
             chatGPTAccounts = state
             chatGPTAccountsError = nil
+            if let version = state.app_version, !version.isEmpty { chatgptVersion = version }
+            if let build = state.build_version, !build.isEmpty { chatgptBuild = build }
         } else {
             chatGPTAccounts = nil
             chatGPTAccountsError = object?["error"] as? String
@@ -1803,6 +1887,9 @@ final class SwitcherStore: ObservableObject {
                     savedSettings = settings
                 }
                 else if args.first == "logs" { operationLog = "隔离记录：没有访问真实操作日志。" }
+                else if args.starts(with: ["account", "prune-cli"]) {
+                    pruneCLIMessage = "隔离预览：未删除真实内置 Claude Code 目录。"
+                }
                 else if args.starts(with: ["account", "switch"]), args.count > 2 {
                     if args.contains("chatgpt"), let previous = chatGPTAccounts {
                         chatGPTAccounts = .init(current: args[2], recovery_required: false, accounts: previous.accounts.map {
@@ -1862,17 +1949,16 @@ final class SwitcherStore: ObservableObject {
                 } else if let value = try? JSONDecoder().decode(SwitcherRepairPlan.self, from: data), !args.contains("--apply") {
                     plan = value; message = value.actions.isEmpty ? "没有需要应用的修复项。" : "请核对变更列表后再应用。"
                 } else {
-                    message = raw["message"] as? String ?? (failure ? "操作部分完成，请查看变更记录。" :
-                        status == "available" ? "发现新版本；完整应用更新应在退出界面后执行。" : "操作已完成。")
-                    if args.first == "launch", status == "ok" {
-                        message = "上次操作：启动检查通过并打开 \(Self.launchDisplayName(args))。当前运行状态以实际进程为准。"
-                    }
+                    message = Self.resolveOperationMessage(raw: raw, args: args, status: status, failure: failure)
                     if args == ["account", "import"] {
                         let found = (raw["accounts"] as? [String] ?? []).joined(separator: "、")
                         let config = raw["settings"] as? [String: String] ?? [:]
                         message = "旧版存档：" + (found.isEmpty ? "无" : found) + "\n"
                             + ["proxy_mode", "country", "timezone", "locale"].compactMap { key in config[key].map { key + " = " + $0 } }.joined(separator: "\n")
                             + "\n仅预览，尚未导入或停用旧后台。"
+                    }
+                    if args.starts(with: ["account", "prune-cli"]) {
+                        pruneCLIMessage = message
                     }
                     // A preview that cannot be read as a plan must not report
                     // success with an empty action list: the review sheet would
@@ -1924,6 +2010,26 @@ final class SwitcherStore: ObservableObject {
             }
         }
     }
+    static func formattedVersion(_ version: String, build: String) -> String {
+        let v = version.trimmingCharacters(in: .whitespacesAndNewlines)
+        let b = build.trimmingCharacters(in: .whitespacesAndNewlines)
+        if v.isEmpty && b.isEmpty { return "" }
+        if b.isEmpty || b == v { return v }
+        if v.isEmpty { return b }
+        return "\(v) (\(b))"
+    }
+    static func resolveOperationMessage(raw: [String: Any], args: [String], status: String, failure: Bool) -> String {
+        if let rawMessage = raw["message"] as? String {
+            let trimmed = rawMessage.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty { return trimmed }
+        }
+        if failure { return "操作部分完成，请查看变更记录。" }
+        if status == "available" { return "发现新版本；完整应用更新应在退出界面后执行。" }
+        if args.first == "launch" && status == "ok" {
+            return "启动检查通过并已请求打开 \(launchDisplayName(args))。实际运行与联网状态以通道回执为准。"
+        }
+        return "操作已完成。"
+    }
     private static func launchDisplayName(_ args: [String]) -> String {
         guard let index = args.firstIndex(of: "--target"), args.indices.contains(index + 1) else { return "Claude" }
         switch args[index + 1] {
@@ -1950,6 +2056,20 @@ final class SwitcherStore: ObservableObject {
             syncVpnExpectationDraftFromSaved()
         }
         claudeVersion = raw["claude_version"] as? String ?? ""
+        claudeBuild = raw["claude_build"] as? String ?? ""
+        chatgptVersion = raw["chatgpt_version"] as? String ?? ""
+        chatgptBuild = raw["chatgpt_build"] as? String ?? ""
+        if let object = raw["ai_versions"], !(object is NSNull),
+           let encoded = try? JSONSerialization.data(withJSONObject: object),
+           let decoded = try? JSONDecoder().decode(AIVersionsReceipt.self, from: encoded) {
+            aiVersions = decoded
+            if claudeVersion.isEmpty { claudeVersion = decoded.claude_desktop.selected_version }
+            if claudeBuild.isEmpty { claudeBuild = decoded.claude_desktop.selected_build }
+            if chatgptVersion.isEmpty { chatgptVersion = decoded.chatgpt_desktop.selected_version }
+            if chatgptBuild.isEmpty { chatgptBuild = decoded.chatgpt_desktop.selected_build }
+        } else {
+            aiVersions = nil
+        }
         proxyGroups = raw["proxy_groups"] as? [String] ?? []
         updateRecoveryRequired = raw["update_recovery_required"] as? Bool ?? false
         setupRecoveryRequired = raw["setup_recovery_required"] as? Bool ?? false
@@ -2066,10 +2186,45 @@ final class SwitcherStore: ObservableObject {
                                       ["id": "B", "stored": false, "current": false]],
                          "detail": "隔离账号槽位；没有真实登录信息"],
             "chatgpt_accounts": ["product": "chatgpt", "current": "A", "selected": "A", "login_checked": true, "recovery_required": false,
+                                "app_version": "26.1117.31558", "build_version": "29513",
                                 "accounts": [["id": "A", "stored": true, "current": true, "profile_state": "present", "login_state": "logged_in"],
                                              ["id": "B", "stored": false, "current": false, "profile_state": "absent", "login_state": "uninitialized"]],
                                 "detail": "隔离的 ChatGPT 桌面账号"],
-            "claude_version": "fixture"
+            "claude_version": "fixture",
+            "claude_build": "fixture",
+            "chatgpt_version": "26.1117.31558",
+            "chatgpt_build": "29513",
+            "ai_versions": [
+                "claude_desktop": [
+                    "selected_version": "fixture", "selected_build": "fixture",
+                    "selected_path": "/Applications/Claude.app", "selected_bundle_id": "com.anthropic.claudefordesktop",
+                    "seatbelt_incompatible": false,
+                    "installs": [[
+                        "path": "/Applications/Claude.app", "bundle_id": "com.anthropic.claudefordesktop",
+                        "version": "fixture", "build_version": "fixture",
+                        "selected": true, "seatbelt_incompatible": false
+                    ]],
+                    "multiple_versions": false
+                ],
+                "chatgpt_desktop": [
+                    "selected_version": "26.1117.31558", "selected_build": "29513",
+                    "selected_path": "/Applications/ChatGPT.app", "selected_bundle_id": "com.openai.codex",
+                    "seatbelt_incompatible": false,
+                    "installs": [[
+                        "path": "/Applications/ChatGPT.app", "bundle_id": "com.openai.codex",
+                        "version": "26.1117.31558", "build_version": "29513",
+                        "selected": true, "seatbelt_incompatible": false
+                    ]],
+                    "multiple_versions": false
+                ],
+                "claude_embedded_cli": [
+                    "latest": "2.1.328", "versions": ["2.1.328"],
+                    "redundant_versions": [], "redundant_bytes": 0, "legacy_redundant_versions": []
+                ],
+                "claude_cli": ["selected_version": "", "selected_path": "", "installs": [], "multiple_versions": false],
+                "codex_cli": ["selected_version": "", "selected_path": "", "installs": [], "multiple_versions": false],
+                "has_multi_version_warnings": false
+            ]
         ]
         return try! JSONSerialization.data(withJSONObject: raw)
     }

@@ -825,3 +825,88 @@ fn consecutive_watch_switches_do_not_self_deadlock_when_legacy_is_idle() {
         "external_change"
     );
 }
+
+#[cfg(target_os = "macos")]
+#[test]
+fn switch_and_manual_save_use_native_clonefile_without_sharing_mutations() {
+    use std::os::unix::fs::MetadataExt;
+
+    struct NativeCloneOs {
+        running: bool,
+    }
+    impl AccountOs for NativeCloneOs {
+        fn current_desktop(&mut self) -> Result<claude_watch_core::processes::Identity> {
+            Ok(claude_watch_core::processes::Identity {
+                executable: "/Applications/Claude.app/Contents/MacOS/Claude".into(),
+                pid: 41,
+                start_seconds: 100,
+                start_microseconds: 12,
+                uid: 501,
+                parent: 1,
+                start_stamp: String::new(),
+            })
+        }
+        fn claude_version(&mut self) -> Result<Option<String>> {
+            Ok(Some("1.0".into()))
+        }
+        fn quit_claude(&mut self) -> Result<()> {
+            self.running = false;
+            Ok(())
+        }
+        fn claude_running(&mut self) -> Result<bool> {
+            Ok(self.running)
+        }
+        fn launch_claude(&mut self) -> Result<()> {
+            self.running = true;
+            Ok(())
+        }
+        fn preflight(&mut self) -> Result<()> {
+            Ok(())
+        }
+        fn clone_file(&mut self, source: &Path, target: &Path) -> Result<bool> {
+            claude_watch_runtime::accounts::clone_regular_file(source, target)
+        }
+    }
+
+    let f = Fixture::new();
+    let mut store = AccountStore::new(f.storage(), NativeCloneOs { running: false });
+    let active_cookie = store.storage.paths.active().join("Cookies");
+    file(&active_cookie, "account-a-initial");
+
+    // 1. Switch A -> B archives live A using native APFS clonefile.
+    let switched = store.switch("B", &config(), false).unwrap();
+    assert_eq!(switched.current, "B");
+    assert_eq!(switched.copied.len(), 1);
+    assert_eq!(switched.copied[0].strategy, "clone");
+    assert_eq!(switched.copied[0].cloned_files, 1);
+    assert_eq!(switched.copied[0].copied_files, 0);
+
+    // 2. Manual save of B uses native clonefile and keeps COW isolation.
+    file(&active_cookie, "account-b-live");
+    let source = store.current_source().unwrap();
+    let saved = store
+        .save_current(
+            "B",
+            &claude_watch_runtime::accounts::SaveCurrentAccount {
+                source_token: source["source_token"].as_str().unwrap().to_owned(),
+                account_label: "b@example.invalid".into(),
+            },
+        )
+        .unwrap();
+    assert_eq!(saved["saved"], true);
+
+    let slot_b_cookie = store.profile_path("B").unwrap().join("Cookies");
+    assert_ne!(
+        fs::symlink_metadata(&active_cookie).unwrap().ino(),
+        fs::symlink_metadata(&slot_b_cookie).unwrap().ino()
+    );
+    file(&active_cookie, "account-b-mutated-later");
+    assert_eq!(fs::read_to_string(&slot_b_cookie).unwrap(), "account-b-live");
+
+    // 3. Switch back B -> A clones both archived A into active and live B into archive.
+    let back = store.switch("A", &config(), false).unwrap();
+    assert_eq!(back.current, "A");
+    assert_eq!(back.copied.len(), 2);
+    assert!(back.copied.iter().all(|m| m.strategy == "clone" && m.cloned_files == 1 && m.copied_files == 0));
+    assert_eq!(fs::read_to_string(&active_cookie).unwrap(), "account-a-initial");
+}

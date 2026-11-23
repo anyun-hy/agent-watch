@@ -249,3 +249,176 @@ impl Dir {
         }
     }
 }
+
+/// Clone a single regular file via macOS APFS copy-on-write (`fclonefileat`)
+/// without following symlinks on the source file or target parent directory.
+///
+/// Returns `Ok(true)` when cloned via COW, `Ok(false)` when COW is unsupported
+/// for this file or filesystem (e.g. non-APFS, cross-device, or immutable/append
+/// BSD flags) so callers can fall back to a regular copy, and `Err` for real
+/// I/O, symlink, non-regular-file, or target-exists failures.
+#[cfg(target_os = "macos")]
+pub fn clone_regular_file(source: &Path, target: &Path) -> io::Result<bool> {
+    const CLONE_NOFOLLOW: u32 = 0x0001;
+    const CLONE_NOOWNERCOPY: u32 = 0x0002;
+    const RESTRICTED_FLAGS: u32 =
+        libc::UF_IMMUTABLE | libc::SF_IMMUTABLE | libc::UF_APPEND | libc::SF_APPEND;
+    extern "C" {
+        fn fclonefileat(
+            srcfd: libc::c_int,
+            dst_dirfd: libc::c_int,
+            dst: *const libc::c_char,
+            flags: u32,
+        ) -> libc::c_int;
+    }
+
+    let parent = target
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "target missing parent"))?;
+    let file_name = target
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "target missing file name"))?;
+    let file_name_bytes = file_name.as_bytes();
+    if file_name_bytes.is_empty()
+        || file_name_bytes == b"."
+        || file_name_bytes == b".."
+        || file_name_bytes.contains(&b'/')
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid target file name",
+        ));
+    }
+    let dst_name =
+        CString::new(file_name_bytes).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+    let src_path = CString::new(source.as_os_str().as_bytes())
+        .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+    let parent_path = CString::new(parent.as_os_str().as_bytes())
+        .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+
+    let src_fd = unsafe {
+        libc::open(
+            src_path.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
+        )
+    };
+    if src_fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let src_file = unsafe { File::from_raw_fd(src_fd) };
+
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(src_file.as_raw_fd(), &mut st) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if (st.st_mode & libc::S_IFMT) != libc::S_IFREG {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "clone source is not a regular file",
+        ));
+    }
+    if (st.st_flags & RESTRICTED_FLAGS) != 0 {
+        return Ok(false);
+    }
+
+    let dir_fd = unsafe {
+        libc::open(
+            parent_path.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if dir_fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let dst_dir = unsafe { File::from_raw_fd(dir_fd) };
+
+    let ret = unsafe {
+        fclonefileat(
+            src_file.as_raw_fd(),
+            dst_dir.as_raw_fd(),
+            dst_name.as_ptr(),
+            CLONE_NOFOLLOW | CLONE_NOOWNERCOPY,
+        )
+    };
+    if ret == 0 {
+        return Ok(true);
+    }
+    let error = io::Error::last_os_error();
+    match error.raw_os_error() {
+        Some(libc::EXDEV | libc::ENOTSUP | libc::EOPNOTSUPP | libc::ENOSYS) => Ok(false),
+        _ => Err(error),
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn clone_regular_file(_source: &Path, _target: &Path) -> io::Result<bool> {
+    Ok(false)
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod clone_tests {
+    use super::clone_regular_file;
+    use std::{
+        fs,
+        io::ErrorKind,
+        os::unix::fs::{symlink, MetadataExt},
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    fn temp_dir(label: &str) -> std::path::PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+        let dir = root.join(format!("cw-clone-{label}-{}-{nanos}", std::process::id()));
+        fs::create_dir(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn clones_regular_file_with_independent_inode_and_cow_isolation() {
+        let dir = temp_dir("ok");
+        let src = dir.join("source.bin");
+        let dst = dir.join("target.bin");
+        fs::write(&src, b"original-payload-bytes").unwrap();
+
+        let cloned = clone_regular_file(&src, &dst).unwrap();
+        assert!(cloned, "APFS temp dir should support fclonefileat");
+        assert_eq!(fs::read(&dst).unwrap(), b"original-payload-bytes");
+        assert_ne!(
+            fs::symlink_metadata(&src).unwrap().ino(),
+            fs::symlink_metadata(&dst).unwrap().ino()
+        );
+
+        // Mutating source after clone must not affect the cloned target.
+        fs::write(&src, b"mutated-source-content").unwrap();
+        assert_eq!(fs::read(&dst).unwrap(), b"original-payload-bytes");
+
+        // Re-cloning onto an existing target fails with AlreadyExists.
+        let err = clone_regular_file(&src, &dst).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::AlreadyExists);
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn rejects_symlink_source_directory_source_and_symlink_parent() {
+        let dir = temp_dir("reject");
+        let real = dir.join("real.txt");
+        let link = dir.join("link.txt");
+        let subdir = dir.join("subdir");
+        let link_dir = dir.join("linkdir");
+        fs::write(&real, b"hello").unwrap();
+        fs::create_dir(&subdir).unwrap();
+        symlink(&real, &link).unwrap();
+        symlink(&subdir, &link_dir).unwrap();
+
+        assert!(clone_regular_file(&link, &dir.join("out1")).is_err());
+        assert!(clone_regular_file(&subdir, &dir.join("out2")).is_err());
+        assert!(clone_regular_file(&real, &link_dir.join("out3")).is_err());
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+}

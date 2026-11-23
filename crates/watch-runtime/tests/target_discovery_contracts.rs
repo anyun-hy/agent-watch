@@ -1567,6 +1567,8 @@ fn select_prefers_system_applications_when_multiple_sources_exist() {
         entry_path: "/Applications/ChatGPT.app".into(),
         bundle: Some("/Applications/ChatGPT.app".into()),
         bundle_id: Some("com.openai.chat".into()),
+        app_version: Some("26.1117.31558".into()),
+        build_version: Some("29513".into()),
         executable: Some("/Applications/ChatGPT.app/Contents/MacOS/ChatGPT".into()),
         script_entry: None,
         interpreter: None,
@@ -1581,6 +1583,8 @@ fn select_prefers_system_applications_when_multiple_sources_exist() {
         entry_path: "/Users/someone/staged/ChatGPT.app".into(),
         bundle: Some("/Users/someone/staged/ChatGPT.app".into()),
         bundle_id: Some("com.openai.chat".into()),
+        app_version: Some("1.0.0".into()),
+        build_version: Some("100".into()),
         executable: Some("/Users/someone/staged/ChatGPT.app/Contents/MacOS/ChatGPT".into()),
         script_entry: None,
         interpreter: None,
@@ -1602,5 +1606,44 @@ fn select_prefers_system_applications_when_multiple_sources_exist() {
     assert_eq!(candidates.len(), 2);
     assert!(candidates.contains(&PathBuf::from("/Applications/ChatGPT.app")));
     assert!(candidates.contains(&PathBuf::from("/Users/someone/staged/ChatGPT.app")));
+}
+
+#[test]
+fn desktop_discovery_reads_versions_and_framework_helpers() {
+    let f = Fixture::new();
+    let app = f.home.join("Applications/ChatGPT.app");
+    let exe = app.join("Contents/MacOS/ChatGPT");
+    let helper = app.join(
+        "Contents/Frameworks/Codex Framework.framework/Versions/Current/Helpers/Codex Helper (Renderer).app/Contents/MacOS/Codex Helper (Renderer)",
+    );
+    fs::create_dir_all(exe.parent().unwrap()).unwrap();
+    fs::create_dir_all(helper.parent().unwrap()).unwrap();
+    fs::write(&exe, b"#!/bin/sh\n").unwrap();
+    fs::write(&helper, b"#!/bin/sh\n").unwrap();
+    fs::set_permissions(&exe, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::set_permissions(&helper, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::write(
+        app.join("Contents/Info.plist"),
+        serde_json::to_vec(&serde_json::json!({
+            "CFBundleIdentifier": "com.openai.codex",
+            "CFBundleExecutable": "ChatGPT",
+            "CFBundleShortVersionString": "26.1117.31558",
+            "CFBundleVersion": "29513"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let handle = f.handle();
+    let snap = handle.refresh(&f.reader, 100.0);
+    let selected = snap.select(LaunchTarget::ChatgptDesktop, None).unwrap();
+    assert_eq!(selected.app_version.as_deref(), Some("26.1117.31558"));
+    assert_eq!(selected.build_version.as_deref(), Some("29513"));
+    let canon_helper = fs::canonicalize(&helper).unwrap();
+    assert!(
+        selected.child_executables.contains(&canon_helper),
+        "expected framework helper {:?} in {:?}",
+        canon_helper,
+        selected.child_executables
+    );
 }
 

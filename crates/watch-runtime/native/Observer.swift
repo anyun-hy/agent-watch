@@ -272,9 +272,11 @@ private func environment() throws -> [String: Any] {
         }
     }
     let claude = Bundle(path: "/Applications/Claude.app")
+    let chatgpt = Bundle(path: "/Applications/ChatGPT.app")
     return ["timezone": TimeZone.current.identifier, "locale": preferences["AppleLocale"] as? String ?? "", "language": "(" + languages.map { "\"" + $0 + "\"" }.joined(separator: ",") + ")",
         "app_language": (app["AppleLanguages"] as? [String]) as Any? ?? NSNull(), "date_format": regional, "network": network, "ipv6": ipv6, "ipv6_method": ipv6Method as Any? ?? NSNull(), "system_proxy": proxy,
-        "claude_app": ["path": "/Applications/Claude.app", "bundle_id": claude?.bundleIdentifier ?? "", "version": claude?.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? ""]]
+        "claude_app": ["path": "/Applications/Claude.app", "bundle_id": claude?.bundleIdentifier ?? "", "version": claude?.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "", "build": claude?.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? ""],
+        "chatgpt_app": ["path": "/Applications/ChatGPT.app", "bundle_id": chatgpt?.bundleIdentifier ?? "", "version": chatgpt?.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "", "build": chatgpt?.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? ""]]
 }
 private func sockets(_ input: Request) throws -> [String: Any] {
     let deadline = DispatchTime.now().uptimeNanoseconds + 3_000_000_000

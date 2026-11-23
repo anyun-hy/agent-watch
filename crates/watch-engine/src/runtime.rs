@@ -353,6 +353,40 @@ pub fn dispatch_read(request: &Request, paths: Paths) -> Result<Option<Value>> {
             let chatgpt_accounts = claude_watch_runtime::accounts::chatgpt::status(&host.storage, &host.runner)
                 .unwrap_or_else(|err| json!({"error":err.message}));
             let env = host.environment().ok();
+            let ai_versions =
+                claude_watch_runtime::ai_versions::inspect(&host.storage, host.runner.as_ref());
+            let claude_version = if !ai_versions.claude_desktop.selected_version.is_empty() {
+                ai_versions.claude_desktop.selected_version.as_str()
+            } else {
+                env.as_ref()
+                    .and_then(|v| v.pointer("/claude_app/version"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+            };
+            let claude_build = if !ai_versions.claude_desktop.selected_build.is_empty() {
+                ai_versions.claude_desktop.selected_build.as_str()
+            } else {
+                env.as_ref()
+                    .and_then(|v| v.pointer("/claude_app/build"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+            };
+            let chatgpt_version = if !ai_versions.chatgpt_desktop.selected_version.is_empty() {
+                ai_versions.chatgpt_desktop.selected_version.as_str()
+            } else {
+                env.as_ref()
+                    .and_then(|v| v.pointer("/chatgpt_app/version"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+            };
+            let chatgpt_build = if !ai_versions.chatgpt_desktop.selected_build.is_empty() {
+                ai_versions.chatgpt_desktop.selected_build.as_str()
+            } else {
+                env.as_ref()
+                    .and_then(|v| v.pointer("/chatgpt_app/build"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+            };
             let now = native::now();
             let frame = claude_watch_runtime::channel_policy_status::read_frame(&host.storage);
             let frame = StatusFrame::new(&frame, &config, now);
@@ -364,7 +398,11 @@ pub fn dispatch_read(request: &Request, paths: Paths) -> Result<Option<Value>> {
                 "policy_sync_state": policy_sync_state,
                 "repair":host.storage.read_json(&host.storage.paths.base().join("last-repair.json"),Value::Null)?,"guard":evidence,
                 "update_recovery_required":host.storage.paths.base().join("update-transaction.json").exists(),"setup_recovery_required":host.storage.paths.base().join("setup-transaction.json").exists()||host.storage.paths.base().join("service-transaction.json").exists()||host.storage.paths.watch().join("agent-install-transaction.json").exists(),"proxy_groups":[],
-                "claude_version":env.as_ref().and_then(|v|v.pointer("/claude_app/version")).and_then(Value::as_str).unwrap_or("")}),
+                "claude_version":claude_version,
+                "claude_build":claude_build,
+                "chatgpt_version":chatgpt_version,
+                "chatgpt_build":chatgpt_build,
+                "ai_versions":ai_versions}),
             ))
         }
         "check" | "checkdetail" | "environment" | "proxy-check" | "dns-check" => {

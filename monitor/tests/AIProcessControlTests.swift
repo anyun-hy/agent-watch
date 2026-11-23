@@ -128,6 +128,17 @@ struct AIProcessControlTests {
         let echo = try AIProcessInventory.command(URL(fileURLWithPath: "/bin/cat"), arguments: [],
             deadline: ProcessInfo.processInfo.systemUptime + 2, input: planData)
         expect(echo == planData, "actual subprocess stdin preserves the plan")
+        let homeOut = try AIProcessInventory.command(URL(fileURLWithPath: "/bin/sh"), arguments: ["-c", "printf '%s' \"$HOME\""],
+            deadline: ProcessInfo.processInfo.systemUptime + 2)
+        expect(!(String(data: homeOut, encoding: .utf8) ?? "").isEmpty, "subprocess environment preserves HOME for watch-engine")
+        do {
+            _ = try AIProcessInventory.command(URL(fileURLWithPath: "/bin/sh"),
+                arguments: ["-c", "printf '{\"status\":\"error\",\"message\":\"测试中文错误\"}'; exit 4"],
+                deadline: ProcessInfo.processInfo.systemUptime + 2)
+            fatalError("non-zero subprocess exit did not fail")
+        } catch let error as AIProcessInventoryFailure {
+            expect(error.localizedDescription == "测试中文错误", "non-zero command surfaces backend JSON message via LocalizedError")
+        }
         do {
             _ = try AIProcessInventory.command(URL(fileURLWithPath: "/bin/sleep"), arguments: ["5"],
                 deadline: ProcessInfo.processInfo.systemUptime + 0.1, input: Data(repeating: 1, count: 131072))

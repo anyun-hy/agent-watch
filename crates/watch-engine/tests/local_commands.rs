@@ -205,6 +205,11 @@ fn native_mutation_commands_require_apply_before_sampling_or_writing() {
     assert_eq!(code, 0, "{preview}");
     assert_eq!(preview["login_verified"], false);
     assert!(!home.0.join("Library").exists());
+    let (code, prune_preview) = call(&home, &["account", "prune-cli"], None);
+    assert_eq!(code, 0, "{prune_preview}");
+    assert_eq!(prune_preview["applied"], false);
+    assert_eq!(prune_preview["freed_bytes"], 0);
+    assert!(!home.0.join("Library").exists());
 }
 
 #[test]

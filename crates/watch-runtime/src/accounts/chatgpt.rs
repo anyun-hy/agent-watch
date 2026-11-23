@@ -214,9 +214,23 @@ fn status_receipt<R: ReadRunner>(
         row["account_label"] = json!(label);
         row
     });
+    let (app_version, build_version) = {
+        let snapshot = crate::target_discovery::DiscoveryHandle::for_home(&store.paths.home)
+            .refresh(runner, crate::native::now());
+        match snapshot.select(
+            claude_watch_core::processes::LaunchTarget::ChatgptDesktop,
+            None,
+        ) {
+            Ok(record) => (
+                record.app_version.clone().unwrap_or_default(),
+                record.build_version.clone().unwrap_or_default(),
+            ),
+            Err(_) => (String::new(), String::new()),
+        }
+    };
     Ok(
         json!({"schema":1, "product":"chatgpt", "selected": selected, "current": current, "recovery_required":false,
-        "login_checked":login.is_some(), "accounts":accounts,
+        "login_checked":login.is_some(), "app_version": app_version, "build_version": build_version, "accounts":accounts,
         "detail":"两个槽位分别打开自己的桌面资料。登录后可读取当前账号并保存到槽位。"}),
     )
 }
