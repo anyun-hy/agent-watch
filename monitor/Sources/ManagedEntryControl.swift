@@ -73,7 +73,8 @@ final class ManagedEntryControl: ObservableObject {
     private func begin(_ product: MonitoredProduct) -> UUID {
         let id = UUID()
         latest[product] = id
-        states[product] = State(busy: true)
+        let previous = state(for: product)
+        states[product] = State(report: previous.report, candidateSources: previous.candidateSources, busy: true, errorMessage: nil)
         return id
     }
 
@@ -110,7 +111,9 @@ final class ManagedEntryControl: ObservableObject {
             states[product] = state
         } catch {
             guard latest[product] == id else { return }
-            states[product] = State(errorMessage: Task.isCancelled ? nil : error.localizedDescription)
+            let previous = state(for: product)
+            states[product] = State(report: previous.report, candidateSources: previous.candidateSources,
+                                    busy: false, errorMessage: Task.isCancelled ? nil : error.localizedDescription)
         }
     }
 
@@ -144,7 +147,9 @@ final class ManagedEntryControl: ObservableObject {
             return true
         } catch {
             guard latest[product] == id else { return false }
-            states[product] = State(errorMessage: Task.isCancelled ? nil : error.localizedDescription)
+            let previous = state(for: product)
+            states[product] = State(report: previous.report, candidateSources: previous.candidateSources,
+                                    busy: false, errorMessage: Task.isCancelled ? nil : error.localizedDescription)
             return false
         }
     }

@@ -201,13 +201,19 @@ fn listener_event_only_refreshes_vpn_facts_on_change_recovery_or_deadline() {
     assert_eq!(sent.len(), 1);
     assert_eq!(server.request_paths.lock().unwrap().len(), requests);
     assert_eq!(std::fs::read(store.paths.base().join("vpn-observation.json")).unwrap(), original);
-    assert_eq!(observer.state.current_observation().unwrap().valid_until, 1003.5);
+    assert_eq!(
+        observer.state.current_observation().unwrap().valid_until,
+        1000.0 + claude_watch_runtime::vpn_observer::DEFAULT_VPN_OBSERVATION_TTL_SECONDS
+    );
     *frame.lock().unwrap() = captured_listener(&server, 1002.4, 10, "A");
     observer.observe_listener_event(&reader, &expectation, true, 1002.5, || None, |obs| { sent.push(obs.clone()); Ok(()) }).unwrap();
     assert_eq!(sent.len(), 2);
     assert!(server.request_paths.lock().unwrap().len() > requests);
     assert_eq!(sent[1].epoch, sent[0].epoch);
-    assert_eq!(sent[1].valid_until, 1005.9);
+    assert_eq!(
+        sent[1].valid_until,
+        1002.4 + claude_watch_runtime::vpn_observer::DEFAULT_VPN_OBSERVATION_TTL_SECONDS
+    );
     // A replacement during a healthy epoch withdraws evidence before HTTP resumes.
     *frame.lock().unwrap() = captured_listener(&server, 1002.6, 1, "A2");
     observer.observe_listener_event(&reader, &expectation, false, 1002.7, || None, |obs| { sent.push(obs.clone()); Ok(()) }).unwrap();
@@ -225,7 +231,8 @@ fn listener_event_only_refreshes_vpn_facts_on_change_recovery_or_deadline() {
     assert!(sent[4].source_error.is_none());
     assert_ne!(sent[4].epoch, sent[3].epoch);
     let count = server.request_paths.lock().unwrap().len();
-    for (at, sequence, expected) in [(1003.2, 1, "vpn_listener_snapshot_out_of_order"), (995.0, 2, "vpn_listener_snapshot_stale")] {
+    let stale_at = 1003.3 - claude_watch_runtime::vpn_observer::DEFAULT_VPN_OBSERVATION_TTL_SECONDS - 1.0;
+    for (at, sequence, expected) in [(1003.2, 1, "vpn_listener_snapshot_out_of_order"), (stale_at, 2, "vpn_listener_snapshot_stale")] {
         *frame.lock().unwrap() = captured_listener(&server, at, sequence, "B");
         let error = observer.observe_listener_event(&reader, &expectation, false, 1003.3, || None, |_| panic!("invalid frame published")).unwrap_err();
         assert_eq!(error.code, expected);
@@ -289,14 +296,15 @@ fn batch_listener_reads_are_two_per_sample_and_same_frame_cannot_renew_evidence(
             Some(snapshot.clone())
         }));
     let mut observer = VpnObserver::new("snapshot", None);
+    let ttl = claude_watch_runtime::vpn_observer::DEFAULT_VPN_OBSERVATION_TTL_SECONDS;
     for now in [1000.0, 1001.0] {
         let result = observer.observe_from_reader(&reader, &expectation, false, now).unwrap();
         assert_eq!(result.verdict, VpnMatch::Matched);
-        assert_eq!(result.observation.valid_until, 1002.5);
+        assert_eq!(result.observation.valid_until, 999.0 + ttl);
         assert_eq!(result.observation.observed_at, now);
     }
     assert_eq!(calls.load(Ordering::SeqCst), 4);
-    let expired = observer.observe_from_reader(&reader, &expectation, false, 1003.0).unwrap();
+    let expired = observer.observe_from_reader(&reader, &expectation, false, 999.0 + ttl + 0.5).unwrap();
     assert_eq!(expired.observation.source_error.as_deref(), Some("vpn_listener_snapshot_stale"));
     assert!(matches!(expired.verdict, VpnMatch::Unknown { .. }));
 }
@@ -331,19 +339,20 @@ fn fresh_frame_handoff_preserves_original_deadline_and_listener_errors() {
     let (server, expectation) = live_owner_fixture();
     // Reproduce the captured timing: frame 1282 expires at 1010.580;
     // the newly delivered frame must replace it before that deadline.
+    let ttl = claude_watch_runtime::vpn_observer::DEFAULT_VPN_OBSERVATION_TTL_SECONDS;
     let frame = Arc::new(Mutex::new(captured_listener(&server, 1007.080, 1282, "collector-A")));
     let input = frame.clone();
     let reader = HttpControllerVpnReader::new_live("tag", server.credentials())
         .with_listener_snapshot_result(Box::new(move |_| Ok(input.lock().unwrap().clone())));
     let mut observer = VpnObserver::new("handoff", None);
     let old = observer.observe_from_reader(&reader, &expectation, false, 1008.0).unwrap();
-    assert_eq!(old.observation.valid_until, 1010.580);
+    assert_eq!(old.observation.valid_until, 1007.080 + ttl);
     *frame.lock().unwrap() = captured_listener(&server, 1009.402, 1283, "collector-A");
     let fresh = observer.observe_from_reader(&reader, &expectation, false, 1010.144).unwrap();
     assert!(fresh.verdict.is_matched());
-    assert_eq!(fresh.observation.valid_until, 1012.902);
+    assert_eq!(fresh.observation.valid_until, 1009.402 + ttl);
     assert!(claude_watch_core::vpn::compare_vpn(&expectation, &fresh.observation, 1010.823).is_matched());
-    assert_eq!(claude_watch_core::vpn::compare_vpn(&expectation, &fresh.observation, 1012.902), VpnMatch::Stale);
+    assert_eq!(claude_watch_core::vpn::compare_vpn(&expectation, &fresh.observation, 1009.402 + ttl), VpnMatch::Stale);
 
     struct FailedListener;
     impl ReadRunner for FailedListener {
@@ -947,4 +956,71 @@ fn r2_rules_digest_cache_invalidates_on_revision_or_instance_change_before_reuse
         parse_scutil_proxy_output(scutil_disabled, "127.0.0.1", Some(7890)),
         ObservedField::Known(false)
     );
+}
+
+#[test]
+fn steady_state_controller_check_extends_valid_until_without_rotating_epoch_and_catches_node_switch() {
+    use claude_watch_runtime::vpn_observer::DEFAULT_VPN_OBSERVATION_TTL_SECONDS;
+
+    let (server, expectation) = live_owner_fixture();
+    let pid = std::process::id();
+    let frame_count = Arc::new(AtomicUsize::new(0));
+    let frame_count_probe = frame_count.clone();
+    let initial_frame = captured_listener(&server, 2000.0, 1, "fixture-origin");
+    let reader = HttpControllerVpnReader::new_live("tag", server.credentials())
+        .with_listener_snapshot_result(Box::new(move |_| {
+            let seq = frame_count_probe.fetch_add(1, Ordering::SeqCst) as u64 + 1;
+            let mut f = initial_frame.clone();
+            f.sequence = Some(seq);
+            Ok(f)
+        }));
+
+    let mut observer = VpnObserver::new("steady-state", None);
+    let mut published = Vec::new();
+    observer
+        .observe_listener_event(&reader, &expectation, true, 2000.0, || None, |obs| {
+            published.push(obs.clone());
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(observer.observed_listener_pid(), Some(pid));
+    let initial = published.last().unwrap().clone();
+    assert_eq!(initial.epoch.change_generation, 1);
+    let frames_after_initial = frame_count.load(Ordering::SeqCst);
+
+    // Steady-state check at t+15s must NOT query listener frames or rotate VpnEpoch,
+    // and must extend valid_until cleanly.
+    let ran = observer
+        .observe_steady_state_controller(&reader, &expectation, 2015.0, || None, |obs| {
+            published.push(obs.clone());
+            Ok(())
+        })
+        .unwrap();
+    assert!(ran);
+    assert_eq!(
+        frame_count.load(Ordering::SeqCst),
+        frames_after_initial,
+        "steady-state check must not contend on listener frames"
+    );
+    let renewed = published.last().unwrap().clone();
+    assert_eq!(renewed.epoch.change_generation, 1);
+    assert!(renewed.sample_seq > initial.sample_seq);
+    assert_eq!(renewed.valid_until, 2015.0 + DEFAULT_VPN_OBSERVATION_TTL_SECONDS);
+
+    // Real in-memory node switch is caught immediately and rotates VpnEpoch.
+    let mut drifted_exp = expectation.clone();
+    drifted_exp.expected_node = Some("Different-Node".into());
+    drifted_exp.expected_chain = vec!["AI".into(), "Different-Node".into()];
+    let ran_drift = observer
+        .observe_steady_state_controller(&reader, &drifted_exp, 2030.0, || None, |obs| {
+            published.push(obs.clone());
+            Ok(())
+        })
+        .unwrap();
+    assert!(ran_drift);
+    let latest = published.last().unwrap();
+    assert!(matches!(
+        claude_watch_core::vpn::compare_vpn(&drifted_exp, latest, 2030.0),
+        VpnMatch::Mismatched { .. }
+    ));
 }

@@ -1126,21 +1126,44 @@ impl<R: ReadRunner + ?Sized> Scan<'_, R> {
                     break;
                 }
                 self.remaining -= 1;
+                let mut direct_helper_bins = Vec::new();
                 let helper_apps: Vec<PathBuf> = if helper.extension().is_some_and(|v| v == "app") {
                     vec![helper]
                 } else if helper.extension().is_some_and(|v| v == "framework") {
                     let helpers_dir = helper.join("Versions/Current/Helpers");
                     if helpers_dir.is_dir() {
-                        self.entries(&helpers_dir)
-                            .into_iter()
-                            .filter(|p| p.extension().is_some_and(|v| v == "app"))
-                            .collect()
+                        let mut apps = Vec::new();
+                        for entry in self.entries(&helpers_dir) {
+                            if entry.extension().is_some_and(|v| v == "app") {
+                                apps.push(entry);
+                            } else {
+                                direct_helper_bins.push(entry);
+                            }
+                        }
+                        apps
                     } else {
                         vec![]
                     }
                 } else {
                     vec![]
                 };
+                for file in direct_helper_bins {
+                    if self.remaining == 0 {
+                        self.issues.push("discovery_source_budget_exhausted".into());
+                        break;
+                    }
+                    self.remaining -= 1;
+                    self.watch(&file);
+                    if let Ok(file) = fs::canonicalize(file) {
+                        self.watch(&file);
+                        if file.starts_with(bundle)
+                            && executable_file(&file)
+                            && !record.child_executables.contains(&file)
+                        {
+                            record.child_executables.push(file);
+                        }
+                    }
+                }
                 for helper_app in helper_apps {
                     for file in self.entries(&helper_app.join("Contents/MacOS")) {
                         if self.remaining == 0 {
@@ -1157,6 +1180,25 @@ impl<R: ReadRunner + ?Sized> Scan<'_, R> {
                             {
                                 record.child_executables.push(file);
                             }
+                        }
+                    }
+                }
+            }
+            for extra_dir in [bundle.join("Contents/Helpers"), bundle.join("Contents/Resources/native")] {
+                for file in self.entries(&extra_dir) {
+                    if self.remaining == 0 {
+                        self.issues.push("discovery_source_budget_exhausted".into());
+                        break;
+                    }
+                    self.remaining -= 1;
+                    self.watch(&file);
+                    if let Ok(file) = fs::canonicalize(file) {
+                        self.watch(&file);
+                        if file.starts_with(bundle)
+                            && executable_file(&file)
+                            && !record.child_executables.contains(&file)
+                        {
+                            record.child_executables.push(file);
                         }
                     }
                 }
@@ -1484,6 +1526,11 @@ impl<R: ReadRunner + ?Sized> Scan<'_, R> {
         }
     }
 }
+fn is_deep_bundle_interior(path: &Path) -> bool {
+    let text = path.to_string_lossy();
+    text.contains(".app/Contents/Frameworks/") || text.contains(".app/Contents/Resources/")
+}
+
 fn executable_file(path: &Path) -> bool {
     fs::metadata(path).is_ok_and(|m| m.is_file() && m.mode() & 0o111 != 0)
 }
@@ -1721,15 +1768,31 @@ impl DiscoveryHandle {
     pub fn subscribe_publications(&self) -> std::io::Result<std::os::unix::net::UnixStream> {
         self.2.publications.subscribe()
     }
+    pub fn home_dir(&self) -> PathBuf {
+        self.0.lock().unwrap().inputs.home.clone()
+    }
     pub fn installed_target_paths(&self) -> Vec<PathBuf> {
         let view = self.2.published.lock().unwrap().clone();
         let mut paths = BTreeSet::new();
         if let Some(view) = view {
             paths.insert(view.hint_path.clone());
             for record in &view.snapshot.targets {
-                paths.insert(record.entry_path.clone());
-                paths.extend(record.executable.iter().chain(&record.script_entry).chain(&record.interpreter).chain(&record.child_executables).cloned());
-                if let Some(bundle) = &record.bundle { paths.insert(bundle.join("Contents/Info.plist")); }
+                if !is_deep_bundle_interior(&record.entry_path) {
+                    paths.insert(record.entry_path.clone());
+                }
+                paths.extend(
+                    record
+                        .executable
+                        .iter()
+                        .chain(&record.script_entry)
+                        .chain(&record.interpreter)
+                        .chain(&record.child_executables)
+                        .filter(|p| !is_deep_bundle_interior(p))
+                        .cloned(),
+                );
+                if let Some(bundle) = &record.bundle {
+                    paths.insert(bundle.join("Contents/Info.plist"));
+                }
             }
         }
         paths.into_iter().collect()
@@ -1741,11 +1804,26 @@ impl DiscoveryHandle {
         let mut paths: BTreeSet<_> = self.installed_target_paths().into_iter().collect();
         let cache = self.0.lock().unwrap();
         paths.extend(cache.inputs.application_roots.iter().cloned());
-        paths.extend(cache.signature.iter().map(|(path, _, _)| path)
-            .filter(|path| cache.directories.contains_key(*path)).cloned());
+        paths.extend(
+            cache
+                .signature
+                .iter()
+                .map(|(path, _, _)| path)
+                .filter(|path| {
+                    cache.directories.contains_key(*path) && !is_deep_bundle_interior(path)
+                })
+                .cloned(),
+        );
         paths.extend(cache.inputs.prefixes.iter().map(|prefix| prefix.join("bin")));
-        paths.extend(cache.inputs.daemon_path.iter().chain(&cache.inputs.caller_path)
-            .chain(cache.inputs.caller_paths.values().flatten()).cloned());
+        paths.extend(
+            cache
+                .inputs
+                .daemon_path
+                .iter()
+                .chain(&cache.inputs.caller_path)
+                .chain(cache.inputs.caller_paths.values().flatten())
+                .cloned(),
+        );
         paths.into_iter().collect()
     }
     pub fn subscribe_background_requests(&self) -> std::io::Result<std::os::unix::net::UnixStream> {

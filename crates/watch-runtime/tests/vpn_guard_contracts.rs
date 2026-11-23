@@ -403,6 +403,7 @@ fn stable_vpn_cutoff_refreshes_live_execution_evidence_without_reissuing_command
 
     let (receipt_tx, receipt_rx) = mpsc::channel();
     enforcer.set_receipt_event_sink(move |receipt| { receipt_tx.send(receipt).unwrap(); }).unwrap();
+    let refresh_interval = claude_watch_core::channel::MAX_ENFORCEMENT_RECEIPT_AGE / 3.0;
     // Frequent deadline ticks refresh before expiry without publishing on every tick.
     for quarter in 1..=13 {
         supervisor.handle_event(SupervisionEvent::LeaseExpired {
@@ -410,14 +411,15 @@ fn stable_vpn_cutoff_refreshes_live_execution_evidence_without_reissuing_command
         }).unwrap();
     }
     assert!(receipt_rx.try_recv().is_err());
+    let refresh_at = now + 4.0 + refresh_interval + 0.5;
     supervisor.handle_event(SupervisionEvent::LeaseExpired {
-        observed_at: now + 7.5, woke_from_sleep: false,
+        observed_at: refresh_at, woke_from_sleep: false,
     }).unwrap();
     assert!(receipt_rx.try_recv().is_err(), "inline refresh must not queue a duplicate");
     let frame = claude_watch_runtime::channel_policy_status::read_frame(&store);
-    assert_eq!(frame["enforcement_receipts"]["claude"]["observed_at"], now + 7.5);
+    assert_eq!(frame["enforcement_receipts"]["claude"]["observed_at"], refresh_at);
 
-    for elapsed in [20.0, 70.0, 210.0] {
+    for elapsed in [4.0 + refresh_interval * 2.0 + 1.0, 4.0 + refresh_interval * 4.0 + 1.0, 210.0] {
         let current = supervisor.handle_event(SupervisionEvent::LeaseExpired {
             observed_at: now + elapsed, woke_from_sleep: false }).unwrap();
         let state = &current.families["claude"];
@@ -437,14 +439,15 @@ fn stable_vpn_cutoff_refreshes_live_execution_evidence_without_reissuing_command
     }
 
     // A later read must reflect lost confinement, not just stamp the old blocked receipt.
-    enforcer.configure_seatbelt_backend(false, now + 214.0).unwrap();
+    let lost_at = now + 210.0 + refresh_interval + 1.0;
+    enforcer.configure_seatbelt_backend(false, lost_at).unwrap();
     let unavailable = supervisor.handle_event(SupervisionEvent::LeaseExpired {
-        observed_at: now + 214.0, woke_from_sleep: false }).unwrap();
+        observed_at: lost_at, woke_from_sleep: false }).unwrap();
     assert_eq!(unavailable.families["claude"].display_state, ChannelMonitorDisplayState::Failed);
     let persisted = store.read_json(&store.paths.watch().join("state/channel-supervision.json"), Value::Null).unwrap();
     let receipt: claude_watch_core::channel::ChannelEnforcementReceipt =
         serde_json::from_value(persisted["enforcement_receipts"]["claude"].clone()).unwrap();
-    assert_eq!(receipt.observed_at, now + 214.0);
+    assert_eq!(receipt.observed_at, lost_at);
     assert!(!receipt.interception_active);
     assert_eq!(receipt.enforcement_state, ChannelEnforcementState::Failed);
 }
@@ -1617,6 +1620,8 @@ fn f02_f03_gateway_process_crash_preserves_target_for_5s_and_stalled_supervisor_
             interpreter: None,
             interpreter_fingerprint: None,
             script_source: None,
+            desktop_sandbox_compat_no_sandbox: false,
+            extra_deny_read_write_paths: vec![],
         };
         // Production helper owns apply -> verified registration -> exec. Standard streams
         // inherit through the host; killing that host must not close the child's copies.
@@ -2157,6 +2162,8 @@ fn r3_verified_orphan_child_retains_gateway_permission_and_survives_revocation()
         interpreter: None,
         interpreter_fingerprint: None,
         script_source: None,
+        desktop_sandbox_compat_no_sandbox: false,
+        extra_deny_read_write_paths: vec![],
     };
     let mut parent = Command::new(helper)
         .arg("--launch-json")
@@ -2355,4 +2362,162 @@ fn r3_verified_orphan_child_retains_gateway_permission_and_survives_revocation()
     gateway_thread.join().unwrap();
     reg_thread.join().unwrap();
     echo_thread.join().unwrap();
+}
+
+#[test]
+fn permitted_lease_proactively_renews_before_expiry_without_permit_lease_expired_or_generation_bump() {
+    let (_tmp, _store, cfg, enforcer, mut supervisor, _rx, _token, start) =
+        setup_active_session_and_supervisor(|_, _| {}, |obs| {
+            obs.valid_until = start_plus_60(obs.observed_at);
+        });
+    fn start_plus_60(t: f64) -> f64 { t + 60.0 }
+    let initial = supervisor.snapshot(start);
+    let initial_gen = initial.families["claude"].permit_generation;
+    assert_eq!(initial.families["claude"].permit_state, ChannelPermitState::Permitted);
+    assert_eq!(initial.families["claude"].valid_until, Some(start + 60.0));
+
+    // Fresh VPN + egress evidence arrives early (while > half-life remains on the old permit).
+    let mut refreshed_obs = sample_vpn_observation(start + 20.0, 1);
+    refreshed_obs.sample_seq = 2;
+    refreshed_obs.valid_until = start + 80.0;
+    let mut refreshed_egress = controlled_egress(&cfg, start + 20.0, "1.1.1.1", "US", Some(refreshed_obs.epoch.clone()));
+    refreshed_egress["policy_version"] = json!(supervisor.saved_policy_version());
+    supervisor.handle_event(SupervisionEvent::VpnObservationUpdated {
+        observation: refreshed_obs.clone(),
+        observed_at: start + 20.0,
+    }).unwrap();
+    supervisor.handle_event(SupervisionEvent::EnvironmentUpdated {
+        egress: refreshed_egress,
+        local_guard: json!({"proxy": "ok", "tun": "disabled", "context_id": "ctx-vpn"}),
+        observed_at: start + 20.0,
+    }).unwrap();
+
+    // Advance to the proactive renewal window (15s before the old 60s expiry).
+    let deadline = supervisor.next_evidence_deadline(start + 20.0).unwrap();
+    assert!(
+        deadline < start + 60.0,
+        "supervisor must wake BEFORE permit.valid_until for proactive renewal, got {deadline} vs {}",
+        start + 60.0
+    );
+    let renew_at = start + 46.0;
+    enforcer.enforce_active_deadlines(renew_at, false).unwrap();
+    let renewed = supervisor.handle_event(SupervisionEvent::LeaseExpired {
+        observed_at: renew_at,
+        woke_from_sleep: false,
+    }).unwrap();
+    assert_eq!(renewed.families["claude"].permit_state, ChannelPermitState::Permitted);
+    assert_eq!(renewed.families["claude"].permit_generation, initial_gen, "silent renewal must keep generation");
+    assert_eq!(renewed.families["claude"].valid_until, Some(start + 80.0));
+    let receipt = enforcer.receipt_for("claude", renew_at).unwrap().unwrap();
+    assert_eq!(receipt.enforcement_state, ChannelEnforcementState::Forwarding);
+    assert_ne!(receipt.error_code.as_deref(), Some("permit_lease_expired"));
+
+    // Confirmed VPN mismatch still revokes immediately.
+    let mut mismatched = sample_vpn_observation(start + 47.0, 2);
+    mismatched.sample_seq = 3;
+    mismatched.valid_until = start + 107.0;
+    mismatched.selected_node = ObservedField::Known("CN-Direct".into());
+    let revoked = supervisor.handle_event(SupervisionEvent::VpnObservationUpdated {
+        observation: mismatched,
+        observed_at: start + 47.0,
+    }).unwrap();
+    assert_eq!(revoked.families["claude"].permit_state, ChannelPermitState::Revoked);
+}
+
+#[test]
+fn single_transient_local_guard_unknown_preserves_permitted_flow_but_second_consecutive_or_fail_revokes() {
+    let (_tmp, store, cfg, enforcer, mut supervisor, _rx, token, start) =
+        setup_active_session_and_supervisor(|_, _| {}, |obs| {
+            obs.valid_until = obs.observed_at + 60.0;
+        });
+    let mut fresh_eg = controlled_egress(&cfg, start + 1.0, "1.1.1.1", "US", supervisor.latest_vpn_observation().map(|o| o.epoch.clone()));
+    fresh_eg["policy_version"] = json!(supervisor.saved_policy_version());
+
+    // 1. Single transient `local_guard = unknown` while egress is fresh preserves Permitted!
+    let snap1 = supervisor.handle_event(SupervisionEvent::EnvironmentUpdated {
+        egress: fresh_eg.clone(),
+        local_guard: json!({"proxy": "unknown", "tun": "unknown", "code": "proxy_listener_unavailable"}),
+        observed_at: start + 1.0,
+    }).unwrap();
+    assert_eq!(
+        snap1.families["claude"].permit_state,
+        ChannelPermitState::Permitted,
+        "single transient unknown must preserve Permitted, got reason_code={}",
+        snap1.families["claude"].reason_code,
+    );
+    assert_eq!(enforcer.receipt_for("claude", start + 1.0).unwrap().unwrap().enforcement_state, ChannelEnforcementState::Forwarding);
+
+    // 1b. Also verify on a strictly Phase::Active session (the normal production path).
+    let sessions = SessionStore::for_family(store.clone(), "claude");
+    let active_pending = sessions.begin_verified(
+        &ReceiptStore { storage: store.clone() },
+        &fixture_audit_val(&store, start + 1.2, "1.1.1.1", "US"),
+        &fresh_eg,
+        start + 1.2,
+    ).unwrap();
+    sessions.bind_desktop(
+        &active_pending.session_id,
+        Desktop { pid: 5100, start_seconds: 900, start_microseconds: 1 },
+        start + 1.2,
+    ).unwrap();
+    let active_ok = supervisor.handle_event(SupervisionEvent::EnvironmentUpdated {
+        egress: fresh_eg.clone(),
+        local_guard: json!({"proxy": "ok", "tun": "disabled", "context_id": "ctx-vpn"}),
+        observed_at: start + 1.2,
+    }).unwrap();
+    assert_eq!(active_ok.families["claude"].permit_state, ChannelPermitState::Permitted);
+    assert_eq!(sessions.load(start + 1.2).unwrap().unwrap().state, claude_watch_core::session::Phase::Active);
+    let active_transient = supervisor.handle_event(SupervisionEvent::EnvironmentUpdated {
+        egress: fresh_eg.clone(),
+        local_guard: json!({"proxy": "unknown", "tun": "unknown", "code": "proxy_listener_unavailable"}),
+        observed_at: start + 1.3,
+    }).unwrap();
+    assert_eq!(active_transient.families["claude"].permit_state, ChannelPermitState::Permitted);
+    assert_eq!(sessions.load(start + 1.3).unwrap().unwrap().state, claude_watch_core::session::Phase::Active);
+
+    // 2. Unrelated inventory event must NOT count as a second consecutive unknown!
+    let snap_inv = supervisor.handle_event(SupervisionEvent::ProcessInventoryUpdated {
+        family: "claude".into(),
+        desktops: vec![(Desktop { pid: 5100, start_seconds: 900, start_microseconds: 1 }, true, "u501:900:1".into())],
+        processes: vec![token.clone()],
+        observed_at: start + 1.5,
+    }).unwrap();
+    assert_eq!(snap_inv.families["claude"].permit_state, ChannelPermitState::Permitted);
+
+    // 3. Recovery on next EnvironmentUpdated resets the transient counter.
+    let snap_ok = supervisor.handle_event(SupervisionEvent::EnvironmentUpdated {
+        egress: fresh_eg.clone(),
+        local_guard: json!({"proxy": "ok", "tun": "disabled", "context_id": "ctx-vpn"}),
+        observed_at: start + 2.0,
+    }).unwrap();
+    assert_eq!(snap_ok.families["claude"].permit_state, ChannelPermitState::Permitted);
+
+    // 4. Two consecutive `unknown`s fail closed immediately!
+    supervisor.handle_event(SupervisionEvent::EnvironmentUpdated {
+        egress: fresh_eg.clone(),
+        local_guard: json!({"proxy": "unknown", "tun": "unknown", "code": "process_observation_changed"}),
+        observed_at: start + 3.0,
+    }).unwrap();
+    let snap2 = supervisor.handle_event(SupervisionEvent::EnvironmentUpdated {
+        egress: fresh_eg.clone(),
+        local_guard: json!({"proxy": "unknown", "tun": "unknown", "code": "process_observation_changed"}),
+        observed_at: start + 4.0,
+    }).unwrap();
+    assert_eq!(snap2.families["claude"].permit_state, ChannelPermitState::Revoked);
+    assert_eq!(snap2.families["claude"].reason_code, "local_guard_unverified");
+
+    // 5. Confirmed `fail` has ZERO tolerance (revokes on 1st event).
+    let (_tmp2, _store2, cfg2, _enf2, mut sup2, _rx2, _tok2, start2) =
+        setup_active_session_and_supervisor(|_, _| {}, |obs| {
+            obs.valid_until = obs.observed_at + 60.0;
+        });
+    let mut eg2 = controlled_egress(&cfg2, start2 + 1.0, "1.1.1.1", "US", sup2.latest_vpn_observation().map(|o| o.epoch.clone()));
+    eg2["policy_version"] = json!(sup2.saved_policy_version());
+    let snap_fail = sup2.handle_event(SupervisionEvent::EnvironmentUpdated {
+        egress: eg2,
+        local_guard: json!({"proxy": "fail", "tun": "disabled", "context_id": "ctx-vpn"}),
+        observed_at: start2 + 1.0,
+    }).unwrap();
+    assert_eq!(snap_fail.families["claude"].permit_state, ChannelPermitState::Revoked);
+    assert_eq!(snap_fail.families["claude"].reason_code, "proxy_or_tun_failed");
 }

@@ -148,7 +148,8 @@ impl Fixture {
             args:vec![self.gateway.port().to_string(), self.upstream.port().to_string()], cwd:Some(self.root.to_string_lossy().into_owned()),
             proxy_adaptation:ProxyAdaptationKind::EnvOnly, gateway_endpoint:self.gateway.to_string(), policy_version:self.policy.clone(),
             vpn_epoch:Some(claude_watch_core::vpn::VpnEpoch::new("vpn-obs-boot-1", 1)), launch_nonce:uuid::Uuid::new_v4().to_string(), executor_boot_id:"managed-cli-boot".into(),
-            script_entry: None, script_fingerprint: None, interpreter: None, interpreter_fingerprint: None, script_source: None }
+            script_entry: None, script_fingerprint: None, interpreter: None, interpreter_fingerprint: None, script_source: None,
+            desktop_sandbox_compat_no_sandbox: false, extra_deny_read_write_paths: vec![] }
     }
     fn launch_command(&self, executable: &Path) -> Command {
         let mut command = Command::new(&self.helper);

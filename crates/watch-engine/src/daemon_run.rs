@@ -53,6 +53,43 @@ use std::{
 /// A single ownership-transfer slot: newer producer rounds replace pending
 /// ones. Consumed rounds are never retained here or timestamped again.
 #[derive(Default)]
+struct ActiveGuardState {
+    active_families: std::sync::Mutex<std::collections::BTreeSet<String>>,
+    needs_immediate_probe: AtomicBool,
+    has_active_managed: AtomicBool,
+}
+
+impl ActiveGuardState {
+    fn update_families(&self, families: Vec<String>) -> bool {
+        let next: std::collections::BTreeSet<String> = families.into_iter().collect();
+        self.has_active_managed.store(!next.is_empty(), Ordering::Release);
+        let mut guard = self.active_families.lock().unwrap_or_else(|e| e.into_inner());
+        let added = next.iter().any(|family| !guard.contains(family));
+        *guard = next;
+        if added {
+            self.needs_immediate_probe.store(true, Ordering::Release);
+        }
+        added
+    }
+
+    fn request_immediate_probe(&self) {
+        self.needs_immediate_probe.store(true, Ordering::Release);
+    }
+
+    fn take_immediate_probe(&self) -> bool {
+        self.needs_immediate_probe.swap(false, Ordering::AcqRel)
+    }
+
+    fn active_families(&self) -> std::collections::BTreeSet<String> {
+        self.active_families.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    fn has_active_managed(&self) -> bool {
+        self.has_active_managed.load(Ordering::Acquire)
+    }
+}
+
+#[derive(Default)]
 struct GuardRoundHandoff {
     state: std::sync::Mutex<GuardRoundState>,
     ready: std::sync::Condvar,
@@ -82,12 +119,21 @@ impl GuardRoundHandoff {
         self.ready.wait_while(state, |s| s.pending.is_none() && !s.closed)
             .unwrap_or_else(|error| error.into_inner()).pending.take()
     }
-    fn unchanged(&self, current: &claude_watch_runtime::sampler::ProcessRound, backend: &std::path::Path) -> bool {
+    fn unchanged(
+        &self,
+        current: &claude_watch_runtime::sampler::ProcessRound,
+        backend: &std::path::Path,
+        owner_pid: Option<u32>,
+    ) -> bool {
         let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         match state.pending.as_ref() {
-            Some((_, Ok(newer))) => claude_watch_runtime::macos::guard_round_matches(current, newer, backend),
+            Some((_, Ok(newer))) => claude_watch_runtime::macos::guard_round_matches_for_owner(
+                current, newer, backend, owner_pid,
+            ),
             Some((_, Err(_))) => false,
-            None => claude_watch_runtime::macos::guard_round_matches(current, current, backend),
+            None => claude_watch_runtime::macos::guard_round_matches_for_owner(
+                current, current, backend, owner_pid,
+            ),
         }
     }
 }
@@ -121,6 +167,7 @@ pub struct ProductionChannelStack {
     target_refresh_worker: Option<thread::JoinHandle<()>>,
     target_refresh_cancel: Option<UnixStream>,
     backend_refresh_requested: bool,
+    active_guard: Arc<ActiveGuardState>,
     #[cfg(all(test, target_os = "macos"))]
     private_loopback_backend: bool,
 }
@@ -418,8 +465,13 @@ fn spawn_vpn_observation_worker(
     stop: Arc<AtomicBool>,
     event_tx: Sender<SupervisionEvent>,
     lease_watchdog: thread::Thread,
+    active_guard: Arc<ActiveGuardState>,
     custom_reader: Option<Arc<dyn VpnSourceReader>>,
 ) -> Result<(thread::JoinHandle<()>, UnixStream)> {
+    const STEADY_STATE_VPN_CHECK_INTERVAL: Duration = Duration::from_secs(15);
+    const TRANSIENT_VPN_RETRY_DELAY: Duration = Duration::from_secs(1);
+    const MAX_TRANSIENT_VPN_FAILURES: u32 = 2;
+
     let obs_boot_id = format!(
         "vpn-obs-{}-{}",
         std::process::id(),
@@ -436,9 +488,10 @@ fn spawn_vpn_observation_worker(
             let mut observer = VpnObserver::new(obs_boot_id, Some(storage.clone()));
             let mut watcher = watcher;
             let mut first = true;
-            let mut last_due = None;
             let mut awaiting_revision = None;
             let mut retry_after: Option<Instant> = None;
+            let mut last_steady_check: Option<Instant> = None;
+            let mut consecutive_transient_failures: u32 = 0;
             let seen_failure = std::cell::Cell::new(0);
             let failure_tx = event_tx.clone();
             let notice: Arc<claude_watch_runtime::native_listener::ListenerFailureNotice> = Arc::new(move |error| {
@@ -459,18 +512,47 @@ fn spawn_vpn_observation_worker(
                 files.push(storage.paths.home.join("Library/Application Support/com.tag.lab.v2/dns_config.yaml"));
                 watcher.set_watched_files(files);
             };
+            let sync_watched_pid = |watcher: &mut NetworkEventWatcher, observer: &VpnObserver| {
+                if let Some(pid) = observer.observed_listener_pid() {
+                    watcher.set_watched_pids(&[pid]);
+                } else {
+                    watcher.set_watched_pids(&[]);
+                }
+            };
             watch_configs(&mut watcher, &expectation);
             while !stop.load(Ordering::Acquire) {
                 use claude_watch_runtime::vpn_observer::{DEFAULT_VPN_OBSERVATION_TTL_SECONDS, VPN_OBSERVATION_RENEWAL_LEAD_SECONDS};
                 let now = native::now();
-                let expiry = observer.state.current_observation().map(|obs| obs.valid_until);
-                let mut timeout = if first { Some(Duration::ZERO) } else if let Some(at) = expiry.filter(|at| Some(*at) != last_due) {
-                    Some(Duration::from_secs_f64((at - VPN_OBSERVATION_RENEWAL_LEAD_SECONDS - now).clamp(0.0, DEFAULT_VPN_OBSERVATION_TTL_SECONDS)))
-                } else if frames.is_some() || expiry.is_none() {
+                let current_obs = observer.state.current_observation();
+                let expiry = current_obs.map(|obs| obs.valid_until);
+                let renewal_at = current_obs.map(|obs| {
+                    let ttl = (obs.valid_until - obs.observed_at).max(0.0);
+                    let lead = VPN_OBSERVATION_RENEWAL_LEAD_SECONDS.min(ttl / 2.0);
+                    (obs.valid_until - lead).max(obs.observed_at + 0.1)
+                });
+                let mut timeout = if first {
+                    Some(Duration::ZERO)
+                } else if awaiting_revision.is_some() {
+                    // Actively waiting on the listener stream socket for the requested frame;
+                    // keep a bounded wakeup against the safety-net deadline so we never stall.
+                    expiry.map(|at| Duration::from_secs_f64((at - now).clamp(0.1, DEFAULT_VPN_OBSERVATION_TTL_SECONDS)))
+                } else if let Some(at) = renewal_at {
+                    Some(Duration::from_secs_f64((at - now).clamp(0.0, DEFAULT_VPN_OBSERVATION_TTL_SECONDS)))
+                } else if frames.is_some() {
                     None
                 } else {
                     Some(Duration::from_secs_f64(DEFAULT_VPN_OBSERVATION_TTL_SECONDS))
                 };
+                if !first && awaiting_revision.is_none() && custom_reader.is_none()
+                    && expectation.configured
+                    && active_guard.has_active_managed()
+                    && observer.observed_listener_pid().is_some()
+                {
+                    let steady_wait = last_steady_check.map_or(STEADY_STATE_VPN_CHECK_INTERVAL, |at| {
+                        STEADY_STATE_VPN_CHECK_INTERVAL.saturating_sub(at.elapsed())
+                    });
+                    timeout = Some(timeout.map_or(steady_wait, |budget| budget.min(steady_wait)));
+                }
                 if let Some(at) = retry_after {
                     let retry = at.saturating_duration_since(Instant::now());
                     timeout = Some(timeout.map_or(retry, |budget| budget.min(retry)));
@@ -502,7 +584,10 @@ fn spawn_vpn_observation_worker(
                 first = false;
                 if let Some(error) = collector_loss() {
                     // The stream already withdrew the supervisor's evidence at receipt.
-                    if expectation.configured { observer.invalidate_if_changed(&error.code, &expectation, now); }
+                    if expectation.configured {
+                        observer.invalidate_if_changed(&error.code, &expectation, now);
+                        sync_watched_pid(&mut watcher, &observer);
+                    }
                 }
                 let mut invalidation = None;
                 let mut wake = false;
@@ -526,6 +611,9 @@ fn spawn_vpn_observation_worker(
                             let file = path.file_name().and_then(|s| s.to_str()).unwrap_or("watched_file");
                             invalidation = Some(format!("watched_file_changed:{file}"));
                         }
+                        NetworkEventKind::WatchedProcessExited(pid) => {
+                            invalidation = Some(format!("vpn_listener_exited:{pid}"));
+                        }
                         NetworkEventKind::DarwinNotification(name) => {
                             if name == "com.apple.system.clock_set" { lease_watchdog.unpark(); }
                             invalidation = Some(format!("darwin_notification:{name}"));
@@ -541,6 +629,9 @@ fn spawn_vpn_observation_worker(
                 if wake { invalidation = Some("system_wake".into()); }
                 let source_changed = invalidation.is_some();
                 if let Some(reason) = invalidation {
+                    consecutive_transient_failures = 0;
+                    last_steady_check = None;
+                    watcher.set_watched_pids(&[]);
                     if expectation.configured {
                         if let Some(obs) = observer.invalidate_network_event(&reason, &expectation, now) { send(obs); }
                     }
@@ -549,22 +640,142 @@ fn spawn_vpn_observation_worker(
                 if wake {
                     let _ = event_tx.send(SupervisionEvent::LeaseExpired { observed_at: now, woke_from_sleep: true });
                 }
-                let due = expiry.is_some_and(|at| Some(at) != last_due && now + VPN_OBSERVATION_RENEWAL_LEAD_SECONDS >= at);
-                if due { last_due = expiry; }
-                if !refresh && !due && !retry && ready != Some(1) { continue; }
+                let due = renewal_at.is_some_and(|at| now >= at);
+                let steady_due = !source_changed
+                    && awaiting_revision.is_none()
+                    && custom_reader.is_none()
+                    && active_guard.has_active_managed()
+                    && observer.observed_listener_pid().is_some()
+                    && last_steady_check.is_none_or(|at| at.elapsed() >= STEADY_STATE_VPN_CHECK_INTERVAL);
+                if !refresh && !due && !steady_due && !retry && ready != Some(1) { continue; }
 
                 if let Some(reader) = &custom_reader {
                     if let Ok(transition) = observer.observe_from_reader(reader.as_ref(), &expectation, false, now) {
                         send(transition.observation);
                     }
                 } else if expectation.configured {
+                    // Event-driven steady-state check: when no local invalidation occurred
+                    // and we already have a kernel-verified listener PID, verify PID birth
+                    // time + read TAG controller directly without contending on the shared
+                    // `watch-native-collector` stream.
+                    let can_try_steady = !source_changed
+                        && !starting
+                        && awaiting_revision.is_none()
+                        && (due || steady_due || retry)
+                        && observer.observed_listener_pid().is_some();
+                    if can_try_steady {
+                        if live_reader.is_none() {
+                            match resolve_vpn_controller_credentials(&storage, &expectation.proxy_mode) {
+                                Ok(credentials) => {
+                                    live_reader = Some(HttpControllerVpnReader::new_live(expectation.proxy_mode.clone(), credentials)
+                                        .with_listener_snapshot_result(Box::new(|timeout| {
+                                            let runner = super::runtime::runner()?;
+                                            claude_watch_runtime::vpn_observer::read_vpn_kernel_snapshot_checked(runner.as_ref(), timeout)
+                                        })));
+                                }
+                                Err(error) => {
+                                    live_reader = None;
+                                    consecutive_transient_failures = consecutive_transient_failures.saturating_add(1);
+                                    if consecutive_transient_failures < MAX_TRANSIENT_VPN_FAILURES
+                                        && observer.state.current_observation().is_some_and(|obs| obs.is_fresh(native::now()) && obs.source_error.is_none())
+                                    {
+                                        retry_after = Some(Instant::now() + TRANSIENT_VPN_RETRY_DELAY);
+                                        continue;
+                                    }
+                                    watcher.set_watched_pids(&[]);
+                                    if let Some(obs) = observer.invalidate_if_changed(&error.code, &expectation, native::now()) { send(obs); }
+                                    retry_after = Some(Instant::now() + PROCESS_INTERVAL);
+                                    continue;
+                                }
+                            }
+                        }
+                        if let Some(reader) = &live_reader {
+                            let steady_result = observer.observe_steady_state_controller(
+                                reader,
+                                &expectation,
+                                native::now(),
+                                collector_loss,
+                                |obs| {
+                                    let publish = || send(obs.clone());
+                                    if let Some(stream) = &listener_stream {
+                                        stream.send_if_no_new_failure(seen_failure.get(), publish)
+                                    } else {
+                                        publish();
+                                        Ok(())
+                                    }
+                                },
+                            );
+                            match steady_result {
+                                Ok(true) => {
+                                    consecutive_transient_failures = 0;
+                                    retry_after = None;
+                                    last_steady_check = Some(Instant::now());
+                                    sync_watched_pid(&mut watcher, &observer);
+                                    continue;
+                                }
+                                Ok(false) => {
+                                    // No kernel-verified listener frame yet; fall through to full observation.
+                                }
+                                Err(error) if error.code == "vpn_listener_owner_changed_during_sample" => {
+                                    // Confirmed listener PID exit/restart: fail closed immediately and re-sample.
+                                    consecutive_transient_failures = 0;
+                                    last_steady_check = None;
+                                    watcher.set_watched_pids(&[]);
+                                    if let Some(obs) = observer.invalidate_network_event(&error.code, &expectation, native::now()) { send(obs); }
+                                    if let Some(stream) = &listener_stream {
+                                        if let Ok(revision) = stream.request_sample() {
+                                            awaiting_revision = Some(revision);
+                                        } else {
+                                            retry_after = Some(Instant::now() + PROCESS_INTERVAL);
+                                        }
+                                    } else {
+                                        retry_after = Some(Instant::now() + PROCESS_INTERVAL);
+                                    }
+                                    continue;
+                                }
+                                Err(error) => {
+                                    consecutive_transient_failures = consecutive_transient_failures.saturating_add(1);
+                                    if consecutive_transient_failures < MAX_TRANSIENT_VPN_FAILURES
+                                        && observer.state.current_observation().is_some_and(|obs| obs.is_fresh(native::now()) && obs.source_error.is_none())
+                                    {
+                                        retry_after = Some(Instant::now() + TRANSIENT_VPN_RETRY_DELAY);
+                                        continue;
+                                    }
+                                    watcher.set_watched_pids(&[]);
+                                    if let Some(obs) = observer.invalidate_if_changed(&error.code, &expectation, native::now()) { send(obs); }
+                                    retry_after = Some(Instant::now() + PROCESS_INTERVAL);
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+
                     if let Some(stream) = &listener_stream {
                         // Authentication requests the startup frame. A route/config change
-                        // or evidence renewal must wait for its own subsequent capture.
-                        if source_changed || (awaiting_revision.is_none() && (due || retry)) {
+                        // requires a strictly post-change frame (`request_sample`); routine
+                        // recovery/renewal can join an already in-flight frame (`request_or_join_sample`).
+                        if source_changed {
                             match stream.request_sample() {
                                 Ok(revision) => { awaiting_revision = Some(revision); }
                                 Err(error) => {
+                                    watcher.set_watched_pids(&[]);
+                                    if let Some(obs) = observer.invalidate_if_changed(&error.code, &expectation, now) { send(obs); }
+                                    retry_after = Some(Instant::now() + PROCESS_INTERVAL);
+                                    continue;
+                                }
+                            }
+                        } else if awaiting_revision.is_none() && (due || retry) {
+                            match stream.request_or_join_sample() {
+                                Ok(revision) => { awaiting_revision = Some(revision); }
+                                Err(error) => {
+                                    consecutive_transient_failures = consecutive_transient_failures.saturating_add(1);
+                                    if consecutive_transient_failures < MAX_TRANSIENT_VPN_FAILURES
+                                        && observer.state.current_observation().is_some_and(|obs| obs.is_fresh(native::now()) && obs.source_error.is_none())
+                                    {
+                                        retry_after = Some(Instant::now() + TRANSIENT_VPN_RETRY_DELAY);
+                                        continue;
+                                    }
+                                    watcher.set_watched_pids(&[]);
                                     if let Some(obs) = observer.invalidate_if_changed(&error.code, &expectation, now) { send(obs); }
                                     retry_after = Some(Instant::now() + PROCESS_INTERVAL);
                                     continue;
@@ -590,6 +801,7 @@ fn spawn_vpn_observation_worker(
                             }
                             Err(error) => {
                                 live_reader = None;
+                                watcher.set_watched_pids(&[]);
                                 if let Some(obs) = observer.invalidate_if_changed(&error.code, &expectation, native::now()) { send(obs); }
                                 retry_after = Some(Instant::now() + PROCESS_INTERVAL);
                                 continue;
@@ -604,14 +816,29 @@ fn spawn_vpn_observation_worker(
                             else { publish(); Ok(()) }
                         });
                     if let Err(error) = result {
-                        if let Some(obs) = observer.invalidate_if_changed(&error.code, &expectation, native::now()) { send(obs); }
-                        retry_after = Some(Instant::now() + PROCESS_INTERVAL);
+                        consecutive_transient_failures = consecutive_transient_failures.saturating_add(1);
+                        if !source_changed
+                            && consecutive_transient_failures < MAX_TRANSIENT_VPN_FAILURES
+                            && observer.state.current_observation().is_some_and(|obs| obs.is_fresh(native::now()) && obs.source_error.is_none())
+                        {
+                            retry_after = Some(Instant::now() + TRANSIENT_VPN_RETRY_DELAY);
+                        } else {
+                            watcher.set_watched_pids(&[]);
+                            if let Some(obs) = observer.invalidate_if_changed(&error.code, &expectation, native::now()) { send(obs); }
+                            retry_after = Some(Instant::now() + PROCESS_INTERVAL);
+                        }
                     } else {
+                        consecutive_transient_failures = 0;
                         retry_after = None;
+                        last_steady_check = Some(Instant::now());
+                        sync_watched_pid(&mut watcher, &observer);
                     }
                 } else {
                     retry_after = None;
                     awaiting_revision = None;
+                    last_steady_check = None;
+                    consecutive_transient_failures = 0;
+                    watcher.set_watched_pids(&[]);
                     if observer.state.current_observation().is_some() {
                         if let Some(obs) = observer.invalidate_if_changed("vpn_expectation_unconfigured", &expectation, now) { send(obs); }
                     }
@@ -653,13 +880,24 @@ where
     F: Fn(&AsyncAuditRequest) -> Result<(Value, Value, f64)> + Send + Sync + 'static,
 {
     let diagnostics = ChannelDiagnostics::new(storage.clone());
-    assemble_channel_stack_with_diagnostics(storage, stop, activate_local_interception, custom_vpn_reader, diagnostics, std::sync::mpsc::channel(), run_audit)
+    assemble_channel_stack_with_diagnostics(
+        storage,
+        stop,
+        activate_local_interception,
+        custom_vpn_reader,
+        diagnostics,
+        std::sync::mpsc::channel(),
+        Arc::new(ActiveGuardState::default()),
+        run_audit,
+    )
 }
 
 fn assemble_channel_stack_with_diagnostics<F>(
     storage: StateStore, stop: Arc<AtomicBool>, activate_local_interception: bool,
     custom_vpn_reader: Option<Arc<dyn VpnSourceReader>>, diagnostics: ChannelDiagnostics,
-    (event_tx, event_rx): (Sender<SupervisionEvent>, Receiver<SupervisionEvent>), run_audit: F,
+    (event_tx, event_rx): (Sender<SupervisionEvent>, Receiver<SupervisionEvent>),
+    active_guard: Arc<ActiveGuardState>,
+    run_audit: F,
 ) -> Result<ProductionChannelStack>
 where F: Fn(&AsyncAuditRequest) -> Result<(Value, Value, f64)> + Send + Sync + 'static,
 {
@@ -717,6 +955,7 @@ where F: Fn(&AsyncAuditRequest) -> Result<(Value, Value, f64)> + Send + Sync + '
                 stop.clone(),
                 event_tx.clone(),
                 lease_watchdog.thread().clone(),
+                active_guard.clone(),
                 custom_vpn_reader,
             )?;
             (Some(worker), Some(wake))
@@ -764,6 +1003,7 @@ where F: Fn(&AsyncAuditRequest) -> Result<(Value, Value, f64)> + Send + Sync + '
         target_refresh_worker: None,
         target_refresh_cancel: None,
         backend_refresh_requested: false,
+        active_guard,
         #[cfg(all(test, target_os = "macos"))]
         private_loopback_backend: false,
     };
@@ -945,8 +1185,15 @@ impl ProductionChannelStack {
         if let SupervisionEvent::ProcessInventoryUpdated { family, processes, .. } = &event {
             if let Some(reg) = &self.sandbox_registry {
                 let verified_tokens = reg.verified_family_tokens(family, delivered_at);
-                let mut protected_pids: Vec<u32> = processes.iter()
-                    .filter(|token| verified_tokens.contains(token)).map(|t| t.pid).collect();
+                let mut protected_pids: Vec<u32> = processes
+                    .iter()
+                    .filter(|token| {
+                        verified_tokens
+                            .iter()
+                            .any(|verified| verified.same_verified_kernel_identity(token))
+                    })
+                    .map(|t| t.pid)
+                    .collect();
                 protected_pids.sort_unstable();
                 protected_pids.dedup();
                 let mut unprotected_pids: Vec<u32> = processes.iter()
@@ -968,7 +1215,23 @@ impl ProductionChannelStack {
                 }), delivered_at);
             }
         }
+        let prev_vpn_epoch = self.supervisor.latest_vpn_observation().map(|o| o.epoch.clone());
+        let prev_vpn_healthy = self.supervisor.latest_vpn_observation().is_some_and(|o| o.source_error.is_none());
+        let trigger_hint = matches!(
+            &event,
+            SupervisionEvent::PolicyUpdated { .. }
+                | SupervisionEvent::NetworkContextChanged { .. }
+                | SupervisionEvent::ExecutorRestarted { .. }
+                | SupervisionEvent::LeaseExpired { woke_from_sleep: true, .. }
+        );
         self.supervisor.handle_queued_event(event, delivered_at)?;
+        let next_vpn_epoch = self.supervisor.latest_vpn_observation().map(|o| o.epoch.clone());
+        let next_vpn_healthy = self.supervisor.latest_vpn_observation().is_some_and(|o| o.source_error.is_none());
+        let vpn_changed = next_vpn_epoch != prev_vpn_epoch || next_vpn_healthy != prev_vpn_healthy;
+        let families_added = self.active_guard.update_families(self.supervisor.active_managed_families());
+        if trigger_hint || vpn_changed || families_added {
+            self.active_guard.request_immediate_probe();
+        }
         Ok(())
     }
 
@@ -1433,6 +1696,7 @@ pub fn run(request: &Request, paths: Paths) -> Result<Value> {
     // One immutable handoff, not a second observation cache. A slow collector
     // cannot hold up the authority or accumulate unbounded stale rounds.
     let guard_rounds = Arc::new(GuardRoundHandoff::default());
+    let active_guard = Arc::new(ActiveGuardState::default());
     let guard = if request.flag("observe-only") {
         None
     } else {
@@ -1452,6 +1716,7 @@ pub fn run(request: &Request, paths: Paths) -> Result<Value> {
         let guard_events = event_tx.clone();
         let shutdown_rounds = guard_rounds.clone();
         let collector_rounds = guard_rounds.clone();
+        let guard_active = active_guard.clone();
         Some(
             thread::Builder::new()
                 .name("claude-session-guard".into())
@@ -1463,6 +1728,7 @@ pub fn run(request: &Request, paths: Paths) -> Result<Value> {
                         None,
                         guard_channel_diagnostics,
                         (guard_events.clone(), event_rx),
+                        guard_active.clone(),
                         move |req| {
                             let enforcer = claude_watch_runtime::channel_enforcer::registered_production_enforcer(&audit_paths.watch())
                                 .ok_or_else(|| CoreError::new("controlled_channel_missing", "受控诊断执行器不可用，保持待验证"))?;
@@ -1470,9 +1736,12 @@ pub fn run(request: &Request, paths: Paths) -> Result<Value> {
                         },
                     )?;
                     let collector_stop = stop.clone();
+                    let collector_owner_pid = guard_producer.pid;
+                    let collector_active = guard_active;
                     let enforcer = channel_stack.enforcer.clone();
                     let collector = thread::Builder::new().name("watch-guard-collector".into())
                         .spawn(move || -> Result<()> {
+                            const ACTIVE_EGRESS_RECHECK_INTERVAL: Duration = Duration::from_secs(30);
                             let controller = Controller::new(store.clone());
                             let network = host.network.clone();
                             let mut runtime = DesktopRuntime {
@@ -1485,21 +1754,49 @@ pub fn run(request: &Request, paths: Paths) -> Result<Value> {
                             let families: Vec<_> = PolicyCatalog::families().iter()
                                 .filter(|family| PolicyCatalog::guard_target(family).is_some())
                                 .map(|family| family.id).collect();
+                            let mut last_probed_at: Option<Instant> = None;
+                            let mut last_probed_families: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+                            let mut last_was_unknown = false;
                             while !collector_stop.load(Ordering::Acquire) {
                                 let Some((observed_at, round)) = collector_rounds.take() else { break; };
-                                let (mut egress, mut local_guard) = match &round {
-                                    Ok(round) => runtime.sample_guard_environment(&enforcer, &families, round),
-                                    Err(error) => (families.iter().map(|family| ((*family).to_owned(), json!({"state":"unknown","code":error.code}))).collect(),
-                                        json!({"proxy":"unknown","tun":"unknown","code":error.code})),
-                                };
-                                if round.as_ref().is_ok_and(|round| !collector_rounds.unchanged(round, &runtime.storage.paths.watch().join("runtime/watch-engine"))) {
-                                    egress = families.iter().map(|family| ((*family).to_owned(), json!({"state":"unknown","code":"process_observation_changed"}))).collect();
-                                    local_guard = json!({"proxy":"unknown","tun":"unknown","code":"process_observation_changed","process_observed_at":observed_at});
+                                let active_set = collector_active.active_families();
+                                let immediate = collector_active.take_immediate_probe();
+                                let recheck_due = !active_set.is_empty()
+                                    && (active_set != last_probed_families
+                                        || last_probed_at.is_none_or(|at| at.elapsed() >= ACTIVE_EGRESS_RECHECK_INTERVAL));
+                                let should_probe = last_probed_at.is_none()
+                                    || immediate
+                                    || last_was_unknown
+                                    || round.is_err()
+                                    || recheck_due;
+                                if should_probe {
+                                    let probe_families: Vec<&str> = if active_set.is_empty() {
+                                        families.clone()
+                                    } else {
+                                        families.iter().copied().filter(|f| active_set.contains(*f)).collect()
+                                    };
+                                    let (mut egress, mut local_guard) = match &round {
+                                        Ok(round) => runtime.sample_guard_environment(&enforcer, &probe_families, round),
+                                        Err(error) => (probe_families.iter().map(|family| ((*family).to_owned(), json!({"state":"unknown","code":error.code}))).collect(),
+                                            json!({"proxy":"unknown","tun":"unknown","code":error.code})),
+                                    };
+                                    if round.as_ref().is_ok_and(|round| !collector_rounds.unchanged(round, &runtime.storage.paths.watch().join("runtime/watch-engine"), Some(collector_owner_pid))) {
+                                        egress = probe_families.iter().map(|family| ((*family).to_owned(), json!({"state":"unknown","code":"process_observation_changed"}))).collect();
+                                        local_guard = json!({"proxy":"unknown","tun":"unknown","code":"process_observation_changed","process_observed_at":observed_at});
+                                    }
+                                    let observed_at = observed_at.min(local_guard["environment_observed_at"].as_f64().unwrap_or(observed_at));
+                                    let round_unknown = local_guard["proxy"] == "unknown" || local_guard["tun"] == "unknown";
+                                    if round_unknown {
+                                        last_was_unknown = true;
+                                    } else {
+                                        last_was_unknown = false;
+                                        last_probed_at = Some(Instant::now());
+                                        last_probed_families = active_set;
+                                    }
+                                    guard_events.send(SupervisionEvent::EnvironmentUpdated {
+                                        egress: json!({"families":egress}), local_guard, observed_at,
+                                    }).map_err(|_| CoreError::new("guard_authority_closed", "保护监督器已关闭"))?;
                                 }
-                                let observed_at = observed_at.min(local_guard["environment_observed_at"].as_f64().unwrap_or(observed_at));
-                                guard_events.send(SupervisionEvent::EnvironmentUpdated {
-                                    egress: json!({"families":egress}), local_guard, observed_at,
-                                }).map_err(|_| CoreError::new("guard_authority_closed", "保护监督器已关闭"))?;
                                 if collector_stop.load(Ordering::Acquire) { break; }
                                 let receipt = controller.guard_tick(&mut runtime)?;
                                 guard_history.observe(&guard_diagnostics, &receipt, native::now());
@@ -1680,7 +1977,7 @@ pub fn run(request: &Request, paths: Paths) -> Result<Value> {
             }
             let inventory_budget = if snapshot["samplingDiagnostics"]["process_complete"] == true
                 && snapshot["targetDiscovery"]["complete"] != false && snapshot["health"]["state"] == "running" {
-                Duration::from_secs_f64(claude_watch_runtime::process_disposition::INTENT_TTL / 2.0)
+                Duration::from_secs(5)
             } else { PROCESS_INTERVAL };
             let mut deadline = started + inventory_budget;
             if snapshot["samplingDiagnostics"]["network_reused"].is_boolean() {
@@ -1688,8 +1985,15 @@ pub fn run(request: &Request, paths: Paths) -> Result<Value> {
             }
             match wait_for_sampling_event(&mut sampling_events, frames.as_mut(), source.as_deref(),
                 &mut last_revision, &mut requested_revision, deadline, &stop, &shutdown_signals.wake) {
-                Ok(changed) => { network_changed |= changed; }
-                Err(error) => { missing_frame = Some(error); network_changed = true; }
+                Ok(changed) => {
+                    if changed { active_guard.request_immediate_probe(); }
+                    network_changed |= changed;
+                }
+                Err(error) => {
+                    active_guard.request_immediate_probe();
+                    missing_frame = Some(error);
+                    network_changed = true;
+                }
             }
         }
     })();
@@ -1763,15 +2067,32 @@ mod tests {
         assert_eq!(current.observed_at, at, "overwriting queued rounds must never renew their source time");
         let backend = std::path::Path::new("/fixture/runtime/watch-engine");
         handoff.publish(Ok(current.clone()));
-        assert!(handoff.unchanged(&current, backend));
+        assert!(handoff.unchanged(&current, backend, Some(77)));
+        let mut with_audit_child = current.clone();
+        with_audit_child
+            .system_processes
+            .as_mut()
+            .unwrap()
+            .processes
+            .as_mut()
+            .unwrap()
+            .insert(
+                88,
+                json!({"uid":501,"executable":"/fixture/runtime/watch-engine","stamp":"child-start"}),
+            );
+        handoff.publish(Ok(with_audit_child));
+        assert!(
+            handoff.unchanged(&current, backend, Some(77)),
+            "transient same-binary audit/CLI workers must not invalidate daemon guard rounds"
+        );
         round.system_processes.as_mut().unwrap().processes.as_mut().unwrap().insert(43, row);
         handoff.publish(Ok(round.clone()));
-        assert!(!handoff.unchanged(&current, backend), "a newly observed candidate invalidates in-flight results");
+        assert!(!handoff.unchanged(&current, backend, Some(77)), "a newly observed candidate invalidates in-flight results");
         let mut stale = current.clone(); stale.observed_at -= 9.0;
         handoff.publish(Ok(stale));
-        assert!(!handoff.unchanged(&current, backend));
+        assert!(!handoff.unchanged(&current, backend, Some(77)));
         handoff.publish(Err(CoreError::new("sampling_failed", "fixture input")));
-        assert!(!handoff.unchanged(&current, backend));
+        assert!(!handoff.unchanged(&current, backend, Some(77)));
         let (failed_at, failed) = handoff.take().unwrap();
         assert!(failed.is_err());
         assert!(failed_at >= at && failed_at <= native::now());

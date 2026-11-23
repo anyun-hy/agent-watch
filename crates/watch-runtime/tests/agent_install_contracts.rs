@@ -161,6 +161,7 @@ fn native_runtime_installs_without_legacy_backend_or_account_mutation() {
     assert!(plist.contains("<string>daemon</string><string>--apply</string>"));
     assert!(plist.contains("<key>RunAtLoad</key><true/>"));
     assert!(plist.contains("<key>KeepAlive</key><true/>"));
+    assert!(plist.contains("<key>SoftResourceLimits</key><dict><key>NumberOfFiles</key><integer>4096</integer></dict>"));
     fs::remove_dir_all(root).unwrap();
 }
 

@@ -131,14 +131,8 @@ struct FirstRunView: View {
             else { presentApprovalIfNeeded() }
         }
         .onAppear { presentApprovalIfNeeded() }
-        .onChange(of: store.now) { initialization.refreshReadiness() }
+        .onChange(of: store.snapshot?.capturedAt) { initialization.refreshReadiness() }
         .onChange(of: switcher.background?.observed_at) { initialization.refreshReadiness() }
-        .task(id: initialization.nextReadinessDeadline) {
-            guard let deadline = initialization.nextReadinessDeadline else { return }
-            do { try await Task.sleep(for: .seconds(max(0, deadline.timeIntervalSinceNow))) } catch { return }
-            guard !Task.isCancelled else { return }
-            initialization.refreshReadiness()
-        }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             Task { await initialization.returnedFromAccessibilitySettings() }
         }

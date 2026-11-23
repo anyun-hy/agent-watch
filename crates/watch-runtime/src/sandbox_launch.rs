@@ -1388,9 +1388,16 @@ impl SandboxLaunchRegistry {
         let id = guard.pid_to_instance.get(&token.pid)?;
         let inst = guard.instances.get(id)?;
         if inst.family != family || inst.state != ManagedInstanceState::ExecVerified { return None; }
-        let matches = if inst.pid == token.pid { inst.exec_identity.as_ref() == Some(token) } else {
+        let matches = if inst.pid == token.pid {
+            inst.exec_identity
+                .as_ref()
+                .is_some_and(|current| current.same_verified_kernel_identity(token))
+        } else {
             inst.controlled_subtree_pids.contains(&token.pid)
-                && guard.child_identities.get(&token.pid).is_some_and(|(_, current)| current == token)
+                && guard
+                    .child_identities
+                    .get(&token.pid)
+                    .is_some_and(|(_, current)| current.same_verified_kernel_identity(token))
         };
         matches.then(|| id.clone())
     }
@@ -1409,17 +1416,20 @@ impl SandboxLaunchRegistry {
         let Some(inst) = guard.pid_to_instance.get(&token.pid).and_then(|id| guard.instances.get(id)).cloned()
         else { return false; };
         if inst.family != intent.family || intent.target_instances.get(&token.pid) != Some(&inst.instance_id)
-            || !(0.0..10.0).contains(&(now - inst.updated_at))
+            || !(0.0..claude_watch_core::channel::MAX_ENFORCEMENT_RECEIPT_AGE).contains(&(now - inst.updated_at))
             || !Self::script_approval_current(&mut guard, &inst)
             || Self::image_status(&mut guard, &inst.expected_executable, &inst.expected_fingerprint) != ImageStatus::Verified
         { return false; }
         if inst.pid == token.pid {
             return inst.has_verified_main_protection(&guard.executor_boot_id, &guard.policy_version)
-                && inst.exec_identity.as_ref() == Some(token) && inst.expected_executable == process.executable_path;
+                && inst.exec_identity.as_ref().is_some_and(|current| current.same_verified_kernel_identity(token))
+                && inst.expected_executable == process.executable_path;
         }
         inst.has_verified_subtree_protection(&guard.executor_boot_id, &guard.policy_version)
             && inst.controlled_subtree_pids.contains(&token.pid)
-            && guard.child_identities.get(&token.pid).is_some_and(|(exe, stored)| stored == token && exe == &process.executable_path)
+            && guard.child_identities.get(&token.pid).is_some_and(|(exe, stored)| {
+                stored.same_verified_kernel_identity(token) && exe == &process.executable_path
+            })
             && Self::verify_approved_child_executable_fingerprint(&mut guard, &process.executable_path, token, &inst, process)
     }
 
@@ -1463,7 +1473,7 @@ impl SandboxLaunchRegistry {
         ctx: &AcceptedConnectionContext,
         now: f64,
     ) -> Option<(String, BoundProcessToken)> {
-        let (boot_id, policy_version, candidate_pids) = {
+        let (boot_id, policy_version, candidate_pids, has_live_instances) = {
             let guard = self.inner.lock().ok()?;
             if !ctx.is_valid_for_listener(&guard.executor_boot_id) {
                 return None;
@@ -1472,19 +1482,47 @@ impl SandboxLaunchRegistry {
                 return None;
             }
             let pids: Vec<u32> = guard.pid_to_instance.keys().copied().collect();
+            let live = guard.instances.values().any(|inst| {
+                !matches!(inst.state, ManagedInstanceState::Exited | ManagedInstanceState::Failed)
+            });
             (
                 guard.executor_boot_id.clone(),
                 guard.policy_version.clone(),
                 pids,
+                live,
             )
         };
-        if candidate_pids.is_empty() {
+        if candidate_pids.is_empty() && !has_live_instances {
             return None;
         }
 
-        // Kernel socket tuple lookup across registered candidate PIDs (requires unique match)
-        let kernel_id =
-            attribute_loopback_tcp_peer(ctx.peer_addr, ctx.local_addr, &candidate_pids)?;
+        // Kernel socket tuple lookup across registered candidate PIDs (requires unique match).
+        // Event-driven on-demand reconciliation: if a freshly spawned sandboxed child
+        // connects before the periodic tree reconciliation runs, reconcile once on miss.
+        let mut discovered_on_demand = false;
+        let kernel_id = match attribute_loopback_tcp_peer(ctx.peer_addr, ctx.local_addr, &candidate_pids) {
+            Some(found) => found,
+            None if has_live_instances => {
+                let _ = self.reconcile_process_trees(now);
+                let refreshed_pids = {
+                    let guard = self.inner.lock().ok()?;
+                    if guard.executor_boot_id != boot_id
+                        || guard.policy_version != policy_version
+                        || guard.pid_to_instance.len() > claude_watch_system::MAX_TCP_PEER_CANDIDATES
+                    {
+                        return None;
+                    }
+                    guard.pid_to_instance.keys().copied().collect::<Vec<u32>>()
+                };
+                if refreshed_pids == candidate_pids || refreshed_pids.is_empty() {
+                    return None;
+                }
+                let found = attribute_loopback_tcp_peer(ctx.peer_addr, ctx.local_addr, &refreshed_pids)?;
+                discovered_on_demand = !candidate_pids.contains(&found.pid);
+                found
+            }
+            None => return None,
+        };
 
         // Re-verify process identity after socket lookup so a concurrent exit/exec cannot race
         let post_check = inspect_process_identity(kernel_id.pid)?;
@@ -1494,6 +1532,9 @@ impl SandboxLaunchRegistry {
 
         let mut guard = self.inner.lock().ok()?;
         if guard.executor_boot_id != boot_id || guard.policy_version != policy_version { return None; }
+        if discovered_on_demand {
+            guard.changes.publish();
+        }
         let inst_id = guard.pid_to_instance.get(&kernel_id.pid)?.clone();
         let prev_child = guard.child_identities.get(&kernel_id.pid).cloned();
         let original = guard.instances.get(&inst_id)?.clone();

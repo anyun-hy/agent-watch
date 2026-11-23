@@ -185,24 +185,40 @@ fn local_command(request: &claude_watch_core::cli::Request, paths: Paths) -> Res
                 .value(),
         )),
         ("account", Some("prune-cli")) => {
+            let product = request.value("product").unwrap_or("claude");
             if !request.flag("apply") {
-                return claude_watch_runtime::ai_versions::prune_embedded_claude_cli(
-                    &storage, false, false,
+                return claude_watch_runtime::ai_versions::prune_product_cli(
+                    &storage, product, false, false,
                 )
                 .map(Some);
             }
             let mut sampler = Sampler::new(runtime::runner()?, storage.paths.clone());
             let round = sampler.processes()?;
-            let claude_running = round.targets.iter().any(|t| {
-                matches!(
-                    t.kind,
-                    claude_watch_core::processes::Kind::ClaudeMain
-                        | claude_watch_core::processes::Kind::ClaudeHelper
-                )
+            let product_running = round.targets.iter().any(|t| {
+                if product == "chatgpt" {
+                    matches!(
+                        t.kind,
+                        claude_watch_core::processes::Kind::OpenaiMain
+                            | claude_watch_core::processes::Kind::OpenaiHelper
+                            | claude_watch_core::processes::Kind::ChatgptMain
+                            | claude_watch_core::processes::Kind::ChatgptHelper
+                            | claude_watch_core::processes::Kind::CodexMain
+                            | claude_watch_core::processes::Kind::CodexHelper
+                            | claude_watch_core::processes::Kind::CodexCli
+                    )
+                } else {
+                    matches!(
+                        t.kind,
+                        claude_watch_core::processes::Kind::ClaudeMain
+                            | claude_watch_core::processes::Kind::ClaudeHelper
+                            | claude_watch_core::processes::Kind::ClaudeCode
+                    )
+                }
             });
-            claude_watch_runtime::ai_versions::prune_embedded_claude_cli(
+            claude_watch_runtime::ai_versions::prune_product_cli(
                 &storage,
-                claude_running,
+                product,
+                product_running,
                 true,
             )
             .map(Some)

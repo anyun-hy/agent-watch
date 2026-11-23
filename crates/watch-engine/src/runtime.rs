@@ -355,32 +355,32 @@ pub fn dispatch_read(request: &Request, paths: Paths) -> Result<Option<Value>> {
             let env = host.environment().ok();
             let ai_versions =
                 claude_watch_runtime::ai_versions::inspect(&host.storage, host.runner.as_ref());
-            let claude_version = if !ai_versions.claude_desktop.selected_version.is_empty() {
-                ai_versions.claude_desktop.selected_version.as_str()
+            let claude_version = if !ai_versions.claude.desktop.selected_version.is_empty() {
+                ai_versions.claude.desktop.selected_version.as_str()
             } else {
                 env.as_ref()
                     .and_then(|v| v.pointer("/claude_app/version"))
                     .and_then(Value::as_str)
                     .unwrap_or("")
             };
-            let claude_build = if !ai_versions.claude_desktop.selected_build.is_empty() {
-                ai_versions.claude_desktop.selected_build.as_str()
+            let claude_build = if !ai_versions.claude.desktop.selected_build.is_empty() {
+                ai_versions.claude.desktop.selected_build.as_str()
             } else {
                 env.as_ref()
                     .and_then(|v| v.pointer("/claude_app/build"))
                     .and_then(Value::as_str)
                     .unwrap_or("")
             };
-            let chatgpt_version = if !ai_versions.chatgpt_desktop.selected_version.is_empty() {
-                ai_versions.chatgpt_desktop.selected_version.as_str()
+            let chatgpt_version = if !ai_versions.chatgpt.desktop.selected_version.is_empty() {
+                ai_versions.chatgpt.desktop.selected_version.as_str()
             } else {
                 env.as_ref()
                     .and_then(|v| v.pointer("/chatgpt_app/version"))
                     .and_then(Value::as_str)
                     .unwrap_or("")
             };
-            let chatgpt_build = if !ai_versions.chatgpt_desktop.selected_build.is_empty() {
-                ai_versions.chatgpt_desktop.selected_build.as_str()
+            let chatgpt_build = if !ai_versions.chatgpt.desktop.selected_build.is_empty() {
+                ai_versions.chatgpt.desktop.selected_build.as_str()
             } else {
                 env.as_ref()
                     .and_then(|v| v.pointer("/chatgpt_app/build"))

@@ -589,6 +589,19 @@ impl ListenerStream {
         active.send(self.revision.load(Ordering::Acquire) + 1)
     }
 
+    /// Routine renewal callers (not triggered by a network/config invalidation)
+    /// can share an already in-flight collection frame instead of queuing a
+    /// back-to-back follow-up round.
+    pub fn request_or_join_sample(&self) -> Result<u64> {
+        let mut slot = self.requests.lock().map_err(|_| invalid())?;
+        if self.is_finished() { return Err(error("native_listener_worker_failed", "原生采样输入已停止")); }
+        let active = slot.as_mut().ok_or_else(|| error("native_listener_pending", "等待已核验的原生采集器连接"))?;
+        if let Some((revision, _)) = active.outstanding {
+            return Ok(revision);
+        }
+        active.send(self.revision.load(Ordering::Acquire) + 1)
+    }
+
     /// A silent command may hold the authenticated socket open indefinitely.
     /// Let the daemon wait for the reply only while its evidence can be useful.
     pub fn pending_sample_deadline(&self) -> Result<Option<Instant>> {

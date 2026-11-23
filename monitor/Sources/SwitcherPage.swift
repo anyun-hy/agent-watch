@@ -401,10 +401,36 @@ struct SwitcherPage: View {
                     if store.accounts?.recovery_required == true {
                         Button("恢复未完成账号切换") { confirm("恢复账号资料", "将按事务记录找回原目录，保留可能产生的新资料供核对。", ["account", "recover", "--apply"], action: "恢复账号资料") }.disabled(store.busy)
                     }
+                    if let claudeVersions = store.aiVersions?.claude {
+                        ProductVersionsSection(
+                            product: .claude,
+                            info: claudeVersions,
+                            pruneMessage: store.pruneCLIMessages[.claude] ?? "",
+                            disabled: store.busy || store.hasUnsavedSettings || store.accounts?.recovery_required == true,
+                            p: p,
+                            onConfirmPrune: { info in
+                                confirm("清理 Claude 旧版 CLI",
+                                        "将删除 Watch 管理的 Claude 内置 CLI 与独立 CLI 旧版本目录（\(info.prunable_versions.joined(separator: "、"))，约 \(info.prunableMBText)），保留各来源当前最新版本。清理前需确保 Claude 桌面端与 CLI 已退出；不会触碰原版切换器目录。",
+                                        ["account", "prune-cli", "--product", "claude", "--apply"],
+                                        action: "清理旧版本",
+                                        destructive: true)
+                            }
+                        )
+                    }
                 }
             }
-            ChatGPTAccountPanel(store: store, presence: desktopPresence, p: p)
-            aiVersionsCard
+            ChatGPTAccountPanel(
+                store: store,
+                presence: desktopPresence,
+                p: p,
+                onConfirmPrune: { info in
+                    confirm("清理 ChatGPT / Codex 旧版 CLI",
+                            "将删除已检测到的 Codex CLI 旧版本目录（\(info.prunable_versions.joined(separator: "、"))，约 \(info.prunableMBText)），保留当前最新版本。清理前需确保 ChatGPT 桌面端与 Codex CLI 已退出。",
+                            ["account", "prune-cli", "--product", "chatgpt", "--apply"],
+                            action: "清理旧版本",
+                            destructive: true)
+                }
+            )
             launchConditions
             Surface(p) {
                 DisclosureGroup("原版资料迁移与操作记录", isExpanded: $showMigration) {
@@ -430,130 +456,10 @@ struct SwitcherPage: View {
         }
     }
     private var claudeAccountCaption: String {
-        let desktopVer = SwitcherStore.formattedVersion(store.claudeVersion, build: store.claudeBuild)
-        var parts = ["本地 A / B 资料槽位", "Claude \(desktopVer.isEmpty ? "版本未确认" : desktopVer)"]
-        if let latest = store.aiVersions?.claude_embedded_cli.latest, !latest.isEmpty {
-            parts.append("内置 CLI \(latest)")
+        if let id = store.accounts?.current {
+            return "本地 A / B 资料槽位 · 当前使用槽位 \(id)"
         }
-        return parts.joined(separator: " · ")
-    }
-    @ViewBuilder
-    private var aiVersionsCard: some View {
-        if let report = store.aiVersions {
-            Surface(p) {
-                VStack(alignment: .leading, spacing: 12) {
-                    HStack(spacing: 10) {
-                        SectionHeading(title: "AI 软件版本与多版本检查",
-                                       caption: "统一核对本机 Claude、ChatGPT 与 CLI 安装副本及内置旧版残留。", p: p)
-                        Spacer(minLength: 6)
-                        Badge(text: report.has_multi_version_warnings ? "发现多版本" : "版本正常",
-                              color: report.has_multi_version_warnings ? p.amber : p.mint)
-                    }
-                    aiDesktopVersionRow(title: "Claude Desktop", info: report.claude_desktop)
-                    Divider()
-                    aiDesktopVersionRow(title: "ChatGPT Desktop", info: report.chatgpt_desktop)
-                    Divider()
-                    aiEmbeddedCLIRow(info: report.claude_embedded_cli)
-                    Divider()
-                    aiCliVersionRow(title: "Claude Code CLI", info: report.claude_cli)
-                    Divider()
-                    aiCliVersionRow(title: "Codex CLI", info: report.codex_cli)
-                    if !store.pruneCLIMessage.isEmpty {
-                        Text(store.pruneCLIMessage).font(WatchTypography.caption).foregroundStyle(p.secondary)
-                            .textSelection(.enabled)
-                    }
-                }
-            }
-        }
-    }
-    private func aiDesktopVersionRow(title: String, info: AIDesktopVersionsInfo) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
-            HStack(spacing: 8) {
-                Text(title).font(WatchTypography.bodyStrong)
-                let versionText = SwitcherStore.formattedVersion(info.selected_version, build: info.selected_build)
-                Text(versionText.isEmpty ? (info.installs.isEmpty ? "未检测到安装" : "版本未确认") : versionText)
-                    .font(WatchTypography.mono).foregroundStyle(p.secondary)
-                Spacer(minLength: 4)
-                if info.multiple_versions {
-                    Badge(text: "\(info.installs.count) 个副本", color: p.amber)
-                } else if !info.installs.isEmpty {
-                    Text("单版本").font(WatchTypography.small).foregroundStyle(p.secondary)
-                }
-            }
-            if info.multiple_versions {
-                ForEach(info.installs) { install in
-                    let ver = SwitcherStore.formattedVersion(install.version, build: install.build_version)
-                    Text("\(install.selected ? "当前" : "副本") · \(ver.isEmpty ? "版本未知" : ver) · \(install.path)")
-                        .font(WatchTypography.small).foregroundStyle(p.amber).textSelection(.enabled)
-                }
-            } else if !info.selected_path.isEmpty {
-                Text(info.selected_path).font(WatchTypography.small).foregroundStyle(p.secondary).textSelection(.enabled)
-            }
-        }
-    }
-    private func aiCliVersionRow(title: String, info: AICliVersionsInfo) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
-            HStack(spacing: 8) {
-                Text(title).font(WatchTypography.bodyStrong)
-                if !info.selected_version.isEmpty {
-                    Text(info.selected_version).font(WatchTypography.mono).foregroundStyle(p.secondary)
-                } else if info.installs.isEmpty {
-                    Text("未检测到安装").font(WatchTypography.caption).foregroundStyle(p.secondary)
-                } else {
-                    Text("已安装").font(WatchTypography.caption).foregroundStyle(p.secondary)
-                }
-                Spacer(minLength: 4)
-                if info.multiple_versions {
-                    Badge(text: "\(info.installs.count) 个来源", color: p.amber)
-                } else if !info.installs.isEmpty {
-                    Text("单来源").font(WatchTypography.small).foregroundStyle(p.secondary)
-                }
-            }
-            if info.multiple_versions {
-                ForEach(info.installs) { install in
-                    let ver = install.version.isEmpty ? install.source_kind : "\(install.version) (\(install.source_kind))"
-                    Text("\(install.selected ? "当前" : "来源") · \(ver) · \(install.path)")
-                        .font(WatchTypography.small).foregroundStyle(p.amber).textSelection(.enabled)
-                }
-            } else if !info.selected_path.isEmpty {
-                Text(info.selected_path).font(WatchTypography.small).foregroundStyle(p.secondary).textSelection(.enabled)
-            }
-        }
-    }
-    private func aiEmbeddedCLIRow(info: EmbeddedClaudeCLIInfo) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack(spacing: 8) {
-                Text("Claude 内置 CLI").font(WatchTypography.bodyStrong)
-                Text(info.latest.isEmpty ? "未检测到目录" : info.latest)
-                    .font(WatchTypography.mono).foregroundStyle(p.secondary)
-                Spacer(minLength: 4)
-                if !info.redundant_versions.isEmpty {
-                    Badge(text: "\(info.redundant_versions.count) 个旧版 · \(info.redundantMBText)", color: p.amber)
-                } else if !info.latest.isEmpty {
-                    Text("无冗余旧版").font(WatchTypography.small).foregroundStyle(p.secondary)
-                }
-            }
-            if !info.redundant_versions.isEmpty {
-                HStack(alignment: .center, spacing: 10) {
-                    Text("可清理旧版：\(info.redundant_versions.joined(separator: "、"))（保留最新 \(info.latest)）")
-                        .font(WatchTypography.small).foregroundStyle(p.amber)
-                    Spacer(minLength: 4)
-                    Button("清理旧版本…") {
-                        confirm("清理旧版内置 Claude Code",
-                                "将删除 Watch 管理的活动目录与 A/B 槽位中旧版内置 Claude Code（\(info.redundant_versions.joined(separator: "、"))，约 \(info.redundantMBText)），保留最新版本 \(info.latest)。清理前需确保 Claude 桌面端已退出；不会触碰原版切换器目录。",
-                                ["account", "prune-cli", "--apply"],
-                                action: "清理旧版本",
-                                destructive: true)
-                    }
-                    .controlSize(.small)
-                    .disabled(store.busy || store.hasUnsavedSettings || store.accounts?.recovery_required == true)
-                }
-            }
-            if !info.legacy_redundant_versions.isEmpty {
-                Text("原版切换器目录另检测到旧版：\(info.legacy_redundant_versions.joined(separator: "、"))（只读提示，本工具不修改原版目录）")
-                    .font(WatchTypography.small).foregroundStyle(p.secondary)
-            }
-        }
+        return "本地 A / B 资料槽位 · 当前槽位尚未核实"
     }
     private func accountCard(_ account: SwitcherAccountSlot) -> some View {
         let presentation = SwitcherStore.accountSlotPresentation(account, current: store.accounts?.current)

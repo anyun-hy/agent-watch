@@ -83,8 +83,39 @@ impl DesktopManagedEntrySpec {
             .is_some_and(Self::bundle_has_aperitif_components)
     }
 
-    /// Blocks `com.openai.codex` desktop builds whose embedded Aperitif helper
-    /// reapplies Seatbelt during initialization (observed on builds 28661 and 29513).
+    /// Returns true when this desktop bundle requires the controlled network
+    /// sandbox compatibility mode (`B2`: outer `nono` Seatbelt network confinement
+    /// + Keychain Mach allow + canonicalized sensitive directory deny + `--no-sandbox`).
+    pub fn requires_no_sandbox_compat(&self) -> bool {
+        self.target_bundle_id == "com.openai.codex"
+            && Self::bundle_has_aperitif_components(&self.target_bundle_path)
+    }
+
+    /// Sensitive host directories denied for read/write when launching a desktop
+    /// target in `requires_no_sandbox_compat()` (`--no-sandbox`) mode.
+    pub fn compat_deny_read_write_paths(home: &Path) -> Vec<String> {
+        if !home.is_absolute() {
+            return Vec::new();
+        }
+        [
+            "Library/Application Support/ClaudeWatch",
+            "Library/Application Support/Claude",
+            ".aws",
+            ".gnupg",
+        ]
+        .into_iter()
+        .filter_map(|rel| {
+            let joined = home.join(rel);
+            let s = joined.to_str()?;
+            (!s.chars().any(char::is_control) && !s.contains(['"', '\\'])).then(|| s.to_owned())
+        })
+        .collect()
+    }
+
+    /// Verifies that a `com.openai.codex` desktop build has consistent Aperitif
+    /// helper/library components before launching in controlled Seatbelt mode.
+    /// Builds with verified Aperitif components are launched via Upgrade B2
+    /// (`requires_no_sandbox_compat() == true`) rather than blocked.
     pub fn check_seatbelt_compatibility(&self) -> Result<()> {
         const MAIN: &str = "00305cecf34970bd6fffcd108812bb88888fbb89447ffb7d3bf966a43319a13f";
         const HELPER: &str = "564867489d1ebcb6aec6965face332478ae9d73d6fc1f2af8c9fbc496751c53d";
@@ -93,27 +124,32 @@ impl DesktopManagedEntrySpec {
             return Ok(());
         }
         if self.target_fingerprint == MAIN {
-            let framework = self.target_bundle_path.join("Contents/Frameworks/Codex Framework.framework/Versions/Current");
+            let framework = self
+                .target_bundle_path
+                .join("Contents/Frameworks/Codex Framework.framework/Versions/Current");
             let verify = |relative: &str, size: u64, sha: &str| {
                 let path = fs::canonicalize(framework.join(relative)).ok()?;
-                if !path.starts_with(&self.target_bundle_path) { return None; }
-                if fs::metadata(&path).ok()?.len() != size { return Some(false); }
-                crate::executable_verification::VerificationKey::new_regular(path.to_str()?, sha)?.verify()
+                if !path.starts_with(&self.target_bundle_path) {
+                    return None;
+                }
+                if fs::metadata(&path).ok()?.len() != size {
+                    return Some(false);
+                }
+                crate::executable_verification::VerificationKey::new_regular(path.to_str()?, sha)?
+                    .verify()
             };
-            let helper = verify("Helpers/Codex (Aperitif).app/Contents/MacOS/Codex (Aperitif)", 51_568, HELPER);
+            let helper = verify(
+                "Helpers/Codex (Aperitif).app/Contents/MacOS/Codex (Aperitif)",
+                51_568,
+                HELPER,
+            );
             let library = verify("Libraries/libaperitif.dylib", 85_456, LIBRARY);
-            return match (helper, library) {
-                (Some(true), Some(true)) => Err(CoreError::new("desktop_sandbox_incompatible",
-                    "此 ChatGPT 构建（28661）的 Aperitif 辅助进程与当前 Seatbelt 启动方式冲突，已阻止启动。")),
-                _ => Err(CoreError::new("desktop_compatibility_unverified",
-                    "此 ChatGPT 主程序与已知构建相同，Aperitif 组件的身份未能确认，请核对应用更新是否已完成。")),
-            };
-        }
-        if Self::bundle_has_aperitif_components(&self.target_bundle_path) {
-            return Err(CoreError::new(
-                "desktop_sandbox_incompatible",
-                "此 ChatGPT / Codex 桌面构建包含 Aperitif 辅助进程组件，与当前 Seatbelt 启动方式冲突，已阻止启动。",
-            ));
+            if !matches!((helper, library), (Some(true), Some(true))) {
+                return Err(CoreError::new(
+                    "desktop_compatibility_unverified",
+                    "此 ChatGPT 主程序与已知构建相同，Aperitif 组件的身份未能确认，请核对应用更新是否已完成。",
+                ));
+            }
         }
         Ok(())
     }
@@ -293,6 +329,17 @@ pub fn prepare_desktop_managed_launch(
         });
     }
 
+    let compat_no_sandbox = spec.requires_no_sandbox_compat();
+    let extra_deny_read_write_paths = if compat_no_sandbox {
+        std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .filter(|p| p.is_absolute())
+            .as_deref()
+            .map(DesktopManagedEntrySpec::compat_deny_read_write_paths)
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
     let req = ControlledLaunchRequest {
         entry_id: spec.entry_bundle_id.clone(),
         target: spec.target,
@@ -311,6 +358,8 @@ pub fn prepare_desktop_managed_launch(
         interpreter: None,
         interpreter_fingerprint: None,
         script_source: None,
+        desktop_sandbox_compat_no_sandbox: compat_no_sandbox,
+        extra_deny_read_write_paths,
     };
     req.validate()?;
     Ok(DesktopEntryPreparation::ReadyToLaunch { request: req })

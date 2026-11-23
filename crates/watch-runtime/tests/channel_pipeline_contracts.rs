@@ -217,7 +217,7 @@ fn autonomous_rust_cutoffs_require_supervisor_recovery() {
         let mut bogus = before.clone(); bogus.permit_state = ChannelPermitState::Revoked; bogus.permit_generation += 1;
         let unchanged = supervisor.handle_event(SupervisionEvent::EnforcementReceiptArrived { receipt: bogus, received_at: now + 0.1 }).unwrap();
         assert_eq!(unchanged.families["claude"].permit_state, ChannelPermitState::Permitted, "future/wrong identity cannot establish a recovery fence");
-        let cutoff_at = now + 11.;
+        let cutoff_at = now + claude_watch_core::channel::DEFAULT_PERMIT_TTL + 1.0;
         enforcer.enforce_active_deadlines(cutoff_at, false).unwrap();
         let receipt = enforcer.receipt_for("claude", cutoff_at).unwrap().unwrap();
         assert_eq!(receipt.permit_state, ChannelPermitState::Revoked);
@@ -1913,7 +1913,8 @@ fn receiver_clock_and_executor_boot_id_handshake_reject_delayed_or_pre_restart_r
     );
 
     // 2. A receipt with the correct `boot-current-1` and `observed_at = now + 0.2`,
-    // but arriving late at `received_at = now + 15.0` -> rejected by receiver clock!
+    // but arriving late past `MAX_ENFORCEMENT_RECEIPT_AGE` -> rejected by receiver clock!
+    let late_at = now + claude_watch_core::channel::MAX_ENFORCEMENT_RECEIPT_AGE + 5.0;
     let delayed_receipt = ChannelEnforcementReceipt {
         executor_boot_id: "boot-current-1".into(),
         observed_at: now + 0.2,
@@ -1925,7 +1926,7 @@ fn receiver_clock_and_executor_boot_id_handshake_reject_delayed_or_pre_restart_r
     let snap_delayed = supervisor
         .handle_event(SupervisionEvent::EnforcementReceiptArrived {
             receipt: delayed_receipt,
-            received_at: now + 15.0,
+            received_at: late_at,
         })
         .unwrap();
     assert_eq!(
@@ -1941,8 +1942,8 @@ fn receiver_clock_and_executor_boot_id_handshake_reject_delayed_or_pre_restart_r
     // 3. Handshaking a new executor boot ID bumps `permit_generation` so old
     // sequence numbers cannot be reused!
     let prev_gen = snap_delayed.families["claude"].permit_generation;
-    supervisor.register_executor_handshake("boot-current-2", now + 16.0);
-    let snap_handshaken = supervisor.snapshot(now + 16.0);
+    supervisor.register_executor_handshake("boot-current-2", late_at + 1.0);
+    let snap_handshaken = supervisor.snapshot(late_at + 1.0);
     assert_eq!(
         snap_handshaken.families["claude"].permit_generation,
         prev_gen + 1

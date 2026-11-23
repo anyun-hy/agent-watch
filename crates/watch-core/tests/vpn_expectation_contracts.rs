@@ -411,6 +411,8 @@ fn controlled_launch_and_evidence_types_roundtrip_and_validate() {
         interpreter: None,
         interpreter_fingerprint: None,
         script_source: None,
+        desktop_sandbox_compat_no_sandbox: false,
+        extra_deny_read_write_paths: vec![],
     };
     req.validate().unwrap();
     let raw = serde_json::to_value(&req).unwrap();

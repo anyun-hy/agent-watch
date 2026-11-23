@@ -73,10 +73,42 @@ pub struct ControlledLaunchRequest {
     pub interpreter_fingerprint: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub script_source: Option<ScriptSourceProof>,
+    /// True when a desktop bundle (such as Chromium/Aperitif builds) requires
+    /// `--no-sandbox` inside Watch's outer `nono` Seatbelt network sandbox (`B2`).
+    #[serde(default)]
+    pub desktop_sandbox_compat_no_sandbox: bool,
+    /// Canonicalized sensitive host directories denied for read/write when running
+    /// in `desktop_sandbox_compat_no_sandbox` mode.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_deny_read_write_paths: Vec<String>,
 }
 
 impl ControlledLaunchRequest {
     pub fn validate(&self) -> Result<()> {
+        if self.desktop_sandbox_compat_no_sandbox && self.target.cli() {
+            return Err(CoreError::new(
+                "invalid_launch_request",
+                "仅桌面目标允许启用受控沙盒兼容模式",
+            ));
+        }
+        if self.extra_deny_read_write_paths.len() > 32 {
+            return Err(CoreError::new(
+                "invalid_launch_request",
+                "高敏屏蔽路径数量超出上限",
+            ));
+        }
+        for path in &self.extra_deny_read_write_paths {
+            if !path.starts_with('/')
+                || path.len() > 1024
+                || path.chars().any(char::is_control)
+                || path.contains(['"', '\\'])
+            {
+                return Err(CoreError::new(
+                    "invalid_launch_request",
+                    "高敏屏蔽路径必须为不含控制字符或引号的有效绝对路径",
+                ));
+            }
+        }
         if self.entry_id.trim().is_empty()
             || self.entry_id.len() > 128
             || self.entry_id.chars().any(char::is_control)

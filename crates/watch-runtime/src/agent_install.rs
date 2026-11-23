@@ -73,10 +73,16 @@ fn definition(engine: &Path) -> Result<Vec<u8>> {
         .join("logs");
     definition_inner(engine, true, Some(&logs))
 }
-fn definition_for(engine: &Path, supervised: bool) -> Result<Vec<u8>> {
-    definition_inner(engine, supervised, None)
-}
 fn definition_inner(engine: &Path, supervised: bool, logs: Option<&Path>) -> Result<Vec<u8>> {
+    definition_inner_with_limits(engine, supervised, logs, true)
+}
+
+fn definition_inner_with_limits(
+    engine: &Path,
+    supervised: bool,
+    logs: Option<&Path>,
+    with_limits: bool,
+) -> Result<Vec<u8>> {
     let collector = engine
         .parent()
         .ok_or_else(|| err("invalid_runtime", "运行目录无效"))?
@@ -97,6 +103,11 @@ fn definition_inner(engine: &Path, supervised: bool, logs: Option<&Path>) -> Res
     } else {
         ""
     };
+    let limits = if with_limits {
+        "<key>SoftResourceLimits</key><dict><key>NumberOfFiles</key><integer>4096</integer></dict>"
+    } else {
+        ""
+    };
     let logs = logs
         .map(|dir| {
             let out = dir.join("native-agent.out.log");
@@ -107,7 +118,7 @@ fn definition_inner(engine: &Path, supervised: bool, logs: Option<&Path>) -> Res
         })
         .transpose()?
         .unwrap_or_default();
-    Ok(format!("<?xml version=\"1.0\"?><plist version=\"1.0\"><dict><key>Label</key><string>{LABEL}</string><key>ProgramArguments</key><array>{prefix}<string>{escaped}</string><string>daemon</string><string>--apply</string></array><key>RunAtLoad</key><true/><key>KeepAlive</key><true/><key>ThrottleInterval</key><integer>5</integer><key>ProcessType</key><string>Background</string>{logs}</dict></plist>\n").into_bytes())
+    Ok(format!("<?xml version=\"1.0\"?><plist version=\"1.0\"><dict><key>Label</key><string>{LABEL}</string><key>ProgramArguments</key><array>{prefix}<string>{escaped}</string><string>daemon</string><string>--apply</string></array><key>RunAtLoad</key><true/><key>KeepAlive</key><true/><key>ThrottleInterval</key><integer>5</integer><key>ProcessType</key><string>Background</string>{limits}{logs}</dict></plist>\n").into_bytes())
 }
 
 fn ensure_agent_logs(store: &StateStore, uid: u32) -> Result<()> {
@@ -646,20 +657,31 @@ pub fn recover<E: FixedCommandExecutor>(
         .home
         .join(format!("Library/LaunchAgents/{LABEL}.plist"));
     let actual_plist = store.read_bytes(&plist, 256 * 1024)?;
-    let legacy_new_plist = definition_for(
-        &runtime.join("watch-engine"),
-        expected.contains_key(crate::native_listener::SCRIPT),
-    )?;
-    let logged_new_plist = if expected.contains_key(crate::native_listener::SCRIPT) {
-        Some(definition(&runtime.join("watch-engine"))?)
-    } else {
-        None
-    };
+    let engine_path = runtime.join("watch-engine");
+    let supervised_expected = expected.contains_key(crate::native_listener::SCRIPT);
+    let logs_dir = store.paths.watch().join("logs");
+    let mut allowed_definitions = vec![
+        definition_inner_with_limits(&engine_path, supervised_expected, None, true)?,
+        definition_inner_with_limits(&engine_path, supervised_expected, None, false)?,
+    ];
+    if supervised_expected {
+        allowed_definitions.push(definition_inner_with_limits(
+            &engine_path,
+            true,
+            Some(&logs_dir),
+            true,
+        )?);
+        allowed_definitions.push(definition_inner_with_limits(
+            &engine_path,
+            true,
+            Some(&logs_dir),
+            false,
+        )?);
+    }
     if actual_plist != previous_plist
-        && actual_plist.as_deref() != Some(legacy_new_plist.as_slice())
-        && logged_new_plist
-            .as_deref()
-            .is_none_or(|definition| actual_plist.as_deref() != Some(definition))
+        && !allowed_definitions
+            .iter()
+            .any(|def| actual_plist.as_deref() == Some(def.as_slice()))
     {
         return Err(err(
             "runtime_rollback_conflict",

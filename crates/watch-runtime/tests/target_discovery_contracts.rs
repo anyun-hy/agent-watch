@@ -252,6 +252,46 @@ fn background_observation_invalidates_changed_candidate_without_waiting_for_appr
 }
 
 #[test]
+fn deep_bundle_interior_helpers_are_attributed_without_registering_interior_watch_paths() {
+    let fixture = Fixture::new();
+    let app = fixture.home.join("Applications/ChatGPT.app");
+    let _executable = fixture.app(&app, DESKTOP_IDS[1].0, "ChatGPT");
+    let aperitif_helper = app.join(
+        "Contents/Frameworks/Codex Framework.framework/Versions/Current/Helpers/Codex (Aperitif).app/Contents/MacOS/Codex (Aperitif)",
+    );
+    let bundled_cli = app.join("Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex");
+    for helper in [&aperitif_helper, &bundled_cli] {
+        Fixture::image(helper);
+    }
+    let handle = fixture.handle();
+    let snapshot = handle.refresh(&fixture.reader, 100.0);
+    assert!(snapshot.complete);
+    let record = snapshot
+        .targets
+        .iter()
+        .find(|r| !r.target.cli() && r.bundle_id.as_deref() == Some(DESKTOP_IDS[1].0))
+        .expect("ChatGPT bundle discovered");
+    assert!(
+        record
+            .child_executables
+            .iter()
+            .any(|p| p.to_string_lossy().contains("Codex (Aperitif)")),
+        "deep framework helpers remain recorded in child_executables for process attribution"
+    );
+    for path in handle
+        .installed_target_paths()
+        .into_iter()
+        .chain(handle.background_watch_paths())
+    {
+        let text = path.to_string_lossy();
+        assert!(
+            !text.contains(".app/Contents/Frameworks/") && !text.contains(".app/Contents/Resources/"),
+            "kqueue watch paths must not include deep interior bundle path: {text}"
+        );
+    }
+}
+
+#[test]
 fn background_observation_mode_and_mailbox_are_shared_by_canonical_home_handles() {
     let fixture = Fixture::new();
     let alias = fixture.root.join("home-alias");
@@ -1616,12 +1656,26 @@ fn desktop_discovery_reads_versions_and_framework_helpers() {
     let helper = app.join(
         "Contents/Frameworks/Codex Framework.framework/Versions/Current/Helpers/Codex Helper (Renderer).app/Contents/MacOS/Codex Helper (Renderer)",
     );
+    let native_helper = app.join("Contents/Resources/native/bare-modifier-monitor");
+    let crashpad_helper = app.join(
+        "Contents/Frameworks/Codex Framework.framework/Versions/Current/Helpers/chrome_crashpad_handler",
+    );
+    let contents_helper = app.join("Contents/Helpers/codex-aux-helper");
     fs::create_dir_all(exe.parent().unwrap()).unwrap();
     fs::create_dir_all(helper.parent().unwrap()).unwrap();
+    fs::create_dir_all(native_helper.parent().unwrap()).unwrap();
+    fs::create_dir_all(crashpad_helper.parent().unwrap()).unwrap();
+    fs::create_dir_all(contents_helper.parent().unwrap()).unwrap();
     fs::write(&exe, b"#!/bin/sh\n").unwrap();
     fs::write(&helper, b"#!/bin/sh\n").unwrap();
+    fs::write(&native_helper, b"#!/bin/sh\n").unwrap();
+    fs::write(&crashpad_helper, b"#!/bin/sh\n").unwrap();
+    fs::write(&contents_helper, b"#!/bin/sh\n").unwrap();
     fs::set_permissions(&exe, fs::Permissions::from_mode(0o755)).unwrap();
     fs::set_permissions(&helper, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::set_permissions(&native_helper, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::set_permissions(&crashpad_helper, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::set_permissions(&contents_helper, fs::Permissions::from_mode(0o755)).unwrap();
     fs::write(
         app.join("Contents/Info.plist"),
         serde_json::to_vec(&serde_json::json!({
@@ -1639,10 +1693,31 @@ fn desktop_discovery_reads_versions_and_framework_helpers() {
     assert_eq!(selected.app_version.as_deref(), Some("26.1117.31558"));
     assert_eq!(selected.build_version.as_deref(), Some("29513"));
     let canon_helper = fs::canonicalize(&helper).unwrap();
+    let canon_native = fs::canonicalize(&native_helper).unwrap();
+    let canon_crashpad = fs::canonicalize(&crashpad_helper).unwrap();
+    let canon_contents_helper = fs::canonicalize(&contents_helper).unwrap();
     assert!(
         selected.child_executables.contains(&canon_helper),
         "expected framework helper {:?} in {:?}",
         canon_helper,
+        selected.child_executables
+    );
+    assert!(
+        selected.child_executables.contains(&canon_native),
+        "expected native resource helper {:?} in {:?}",
+        canon_native,
+        selected.child_executables
+    );
+    assert!(
+        selected.child_executables.contains(&canon_crashpad),
+        "expected direct framework helper {:?} in {:?}",
+        canon_crashpad,
+        selected.child_executables
+    );
+    assert!(
+        selected.child_executables.contains(&canon_contents_helper),
+        "expected Contents/Helpers executable {:?} in {:?}",
+        canon_contents_helper,
         selected.child_executables
     );
 }

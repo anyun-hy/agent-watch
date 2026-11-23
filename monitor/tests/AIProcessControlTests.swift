@@ -144,6 +144,26 @@ struct AIProcessControlTests {
                 deadline: ProcessInfo.processInfo.systemUptime + 0.1, input: Data(repeating: 1, count: 131072))
             fatalError("non-reading child escaped the input deadline")
         } catch AIProcessInventoryFailure.timeout { passed += 1 }
+        do {
+            let statusReply = Data(#"{"status":"ok","status_report":{"target":"chatgpt-desktop","entry_generated":false,"activation_configured":false,"status_label":"入口未生成","entry_path":"/Applications/ClaudeWatchManagedChatGPT.app"},"candidate_sources":["/Applications/ChatGPT.app"]}"#.utf8)
+            let entryControl = ManagedEntryControl(command: { args, _ in
+                if args == ["entry", "status", "--target", "chatgpt-desktop"] {
+                    return statusReply
+                }
+                return Data(#"{"status":"error","message":"激活入口失败"}"#.utf8)
+            })
+            await entryControl.refresh(for: .openAI)
+            expect(entryControl.state(for: .openAI).report?.status_label == "入口未生成" &&
+                   entryControl.state(for: .openAI).candidateSources == ["/Applications/ChatGPT.app"],
+                   "ManagedEntryControl loads initial report and candidateSources")
+            let activated = await entryControl.setEnabled(true, for: .openAI)
+            let failedState = entryControl.state(for: .openAI)
+            expect(!activated &&
+                   failedState.report?.status_label == "入口未生成" &&
+                   failedState.candidateSources == ["/Applications/ChatGPT.app"] &&
+                   failedState.errorMessage == "激活入口失败",
+                   "failed setEnabled preserves existing report and candidateSources instead of wiping state to unknown")
+        }
         print("AIProcessControlTests: \(passed) assertions passed; monitored-app requests mocked")
     }
 }

@@ -195,6 +195,8 @@ fn i01_and_i04_helper_registration_verifies_kernel_peer_and_rejects_spoofing_or_
         interpreter: None,
         interpreter_fingerprint: None,
         script_source: None,
+        desktop_sandbox_compat_no_sandbox: false,
+        extra_deny_read_write_paths: vec![],
     };
     let resp = register_helper_with_daemon(&sock_path, valid_req.clone(), true, &sbpl)
         .expect("register valid");
@@ -421,6 +423,8 @@ fn i02_and_p01_live_loopback_tcp_socket_attribution_and_protocol_relay() {
         interpreter: None,
         interpreter_fingerprint: None,
         script_source: None,
+        desktop_sandbox_compat_no_sandbox: false,
+        extra_deny_read_write_paths: vec![],
     };
     let reg_resp = register_helper_with_daemon(&sock_path, launch_req, true, &sbpl).expect("reg");
     assert!(reg_resp.accepted);
@@ -1071,6 +1075,8 @@ while True:
         interpreter: None,
         interpreter_fingerprint: None,
         script_source: None,
+        desktop_sandbox_compat_no_sandbox: false,
+        extra_deny_read_write_paths: vec![],
     };
     let wire_resp = register_helper_with_daemon(&reg_sock, launch_req, true, &sbpl).unwrap();
     assert!(wire_resp.accepted);

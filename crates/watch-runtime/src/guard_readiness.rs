@@ -137,13 +137,14 @@ mod tests {
         let p = |v: &Value, at, live| {
             project(&StatusFrame::new(v, &config, at), true, false, None, &Value::Null, &heartbeat, live)
         };
+        let receipt_ttl = claude_watch_core::channel::MAX_ENFORCEMENT_RECEIPT_AGE;
         assert_eq!(p(&channel,103.0,true),"gateway_identity_unverified");
         assert_ne!(p(&channel,103.0,false),"gateway_identity_unverified");
-        assert_ne!(p(&channel,112.0,true),"gateway_identity_unverified");
+        assert_ne!(p(&channel,102.0 + receipt_ttl,true),"gateway_identity_unverified");
         for (path,replacement) in [
             ("/executor_boot_id",json!("old")), ("/producer_boot_id",json!("old")),
             ("/saved_policy_version/policy_digest",json!("old")),
-            ("/enforcement_receipts/claude/observed_at",json!(90.0)),
+            ("/enforcement_receipts/claude/observed_at",json!(103.0 - receipt_ttl - 1.0)),
             ("/enforcement_receipts/claude/executor_boot_id",json!("old")),
             ("/enforcement_receipts/claude/policy_version/policy_digest",json!("old")),
             ("/enforcement_receipts/claude/command_seq",json!(1)),

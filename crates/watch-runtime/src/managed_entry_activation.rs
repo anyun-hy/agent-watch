@@ -735,6 +735,7 @@ pub fn observe_entry(
     let mut activity = EntryActivity::default();
     let mut managed = BTreeMap::new();
     let mut pending_instances = BTreeSet::new();
+    let mut reparented_crashpad_pids = Vec::new();
     for p in snapshot_running_processes()? {
         let matches = Path::new(&p.executable) == source.executable()
             || match source {
@@ -752,6 +753,14 @@ pub fn observe_entry(
                 _ => false,
             };
         let desktop_member = matches && matches!(source, EntrySource::Desktop { .. });
+        let is_reparented_crashpad = desktop_member
+            && p.ppid == 1
+            && Path::new(&p.executable)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|name| {
+                    matches!(name, "chrome_crashpad_handler" | "browser_crashpad_handler")
+                });
         let mut candidates = instances.iter().filter_map(|row| {
             let i = &row.instance;
             if i.target != target || i.family != family || i.uid != p.uid
@@ -797,7 +806,10 @@ pub fn observe_entry(
                     && fresh(at) && i.controlled_subtree_pids.contains(&live.pid) && member.currently_verified
                     && member.verified_executable.as_deref() == Some(live.executable_path.as_str())
                     && member.audit_identity_digest == claude_watch_system::sha256_bytes_hex(audit.as_bytes())
-                    && child_tokens.iter().any(|token| token.role == ProcessRole::Child && matches_live(token))
+                    && child_tokens.iter().any(|token| {
+                        matches!(token.role, ProcessRole::Child | ProcessRole::DesktopHelper)
+                            && matches_live(token)
+                    })
             } else {
                 i.has_verified_main_protection(boot, &policy)
                     && i.verified_executable.as_deref() == Some(live.executable_path.as_str())
@@ -815,9 +827,17 @@ pub fn observe_entry(
                 pending_instances.extend(candidates.map(|(other, _)| &other.instance_id));
             }
             activity.pending.push(identity.pid);
+        } else if is_reparented_crashpad {
+            reparented_crashpad_pids.push(identity.pid);
         } else {
             activity.unmanaged.push(identity.pid);
         }
+    }
+    // Chromium Crashpad double-forks to PID 1 immediately after desktop launch.
+    // Never grant it gateway permission; only report it as an unmanaged source
+    // instance when no verified/managed instance of this bundle is running.
+    if managed.is_empty() && pending_instances.is_empty() {
+        activity.unmanaged.extend(reparented_crashpad_pids);
     }
     activity.managed = managed.len();
     activity.protected = managed.into_iter().filter(|(id, protected)| *protected && !pending_instances.contains(id)).count();

@@ -91,7 +91,8 @@ def production_models() -> str:
         (SWITCHER, "AIDesktopVersionsInfo"),
         (SWITCHER, "AICliInstallInfo"),
         (SWITCHER, "AICliVersionsInfo"),
-        (SWITCHER, "EmbeddedClaudeCLIInfo"),
+        (SWITCHER, "AIEmbeddedCLIVersionsInfo"),
+        (SWITCHER, "AIProductVersionsInfo"),
         (SWITCHER, "AIVersionsReceipt"),
         (MODELS, "Health"),
         (MODELS, "WatchedProcess"),
@@ -154,7 +155,7 @@ struct RustSwiftReceiptContract {
         let aiVersions = try decoder.decode(AIVersionsReceipt.self, from: nested(status, "ai_versions", arguments[0]))
         require(!accounts.detail.isEmpty, "status.accounts.detail is empty")
         require(!serviceFromStatus.services.isEmpty, "status.service_status.services is empty")
-        require(aiVersions.claude_desktop.installs.count >= 0, "status.ai_versions did not decode")
+        require(aiVersions.claude.desktop.installs.count >= 0 && aiVersions.chatgpt.desktop.installs.count >= 0, "status.ai_versions did not decode")
         // SwitcherStore intentionally treats status.audit as optional.  A new
         // private --home has no persisted audit, while a populated receipt must
         // still decode with the same production EnvironmentAuditReceipt model.

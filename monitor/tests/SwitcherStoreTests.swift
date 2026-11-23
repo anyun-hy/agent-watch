@@ -355,8 +355,11 @@ struct SwitcherStoreTests {
                "unavailable daemon invalidates the initialization receipt and preserves its reason")
         await store.load()
         expect(store.chatgptVersion == "26.1117.31558" && store.chatgptBuild == "29513" &&
-               store.aiVersions?.claude_embedded_cli.latest == "2.1.328",
-               "status load populates ChatGPT version/build and AI version inspection receipt")
+               store.aiVersions?.claude.embedded_cli.latest == "2.1.328" &&
+               store.aiVersions?.chatgpt.embedded_cli.bundled_in_app == true &&
+               store.aiVersions?.chatgpt.standalone_cli.selected_source_label == "Homebrew Cask" &&
+               store.aiVersions?.chatgpt.desktop.sandbox_compat_mode == true,
+               "status load populates ChatGPT version/build and symmetrical AI product version inspection receipt")
         let coordinated = SwitcherStore(isFixture: true)
         await coordinated.load()
         coordinated.fixtureEnvironmentReadDelayNanoseconds = 150_000_000
@@ -459,8 +462,11 @@ struct SwitcherStoreTests {
         expect(store.settings["locale"] as? String == "en_GB" && store.hasUnsavedSettings, "refreshing actual services preserves a draft")
         await store.load()
         expect(store.chatgptVersion == "26.1117.31558" && store.chatgptBuild == "29513" &&
-               store.aiVersions?.claude_embedded_cli.latest == "2.1.328",
-               "status load populates ChatGPT version/build and AI version inspection receipt")
+               store.aiVersions?.claude.embedded_cli.latest == "2.1.328" &&
+               store.aiVersions?.chatgpt.embedded_cli.bundled_in_app == true &&
+               store.aiVersions?.chatgpt.standalone_cli.selected_source_label == "Homebrew Cask" &&
+               store.aiVersions?.chatgpt.desktop.sandbox_compat_mode == true,
+               "status load populates ChatGPT version/build and symmetrical AI product version inspection receipt")
         expect(store.settings["locale"] as? String == "en_GB" && store.hasUnsavedSettings, "reloading authoritative status cannot replace a draft")
         store.discardChanges()
         expect(store.settings["locale"] as? String == "" && !store.hasUnsavedSettings, "discard restores the saved settings without saving")

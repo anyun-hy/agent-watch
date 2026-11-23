@@ -1,23 +1,51 @@
-//! Network-only integration with the pinned nono library. Watch does not add
-//! file, keychain or process isolation to the product's network-control scope.
+//! Network-only integration with the pinned nono library, plus explicit Keychain
+//! Mach service restoration and optional canonicalized sensitive-directory denies
+//! for desktop `--no-sandbox` compatibility mode (`B2`).
 use nono::CapabilitySet;
-use std::net::SocketAddr;
+use std::{
+    collections::BTreeSet,
+    fs,
+    net::SocketAddr,
+    path::{Path, PathBuf},
+};
 
+pub const KEYCHAIN_MACH_SERVICES: [&str; 5] = [
+    "com.apple.SecurityServer",
+    "com.apple.securityd",
+    "com.apple.security.keychaind",
+    "com.apple.secd",
+    "com.apple.security.agent",
+];
+
+#[cfg(test)]
 pub fn capabilities(gateway: SocketAddr, denied_ports: &[u16]) -> Result<CapabilitySet, String> {
+    capabilities_with_denied_paths(gateway, denied_ports, &[])
+}
+
+pub fn capabilities_with_denied_paths(
+    gateway: SocketAddr,
+    denied_ports: &[u16],
+    extra_deny_read_write_paths: &[String],
+) -> Result<CapabilitySet, String> {
     if gateway.ip() != std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
-        || gateway.port() == 0 || denied_ports.contains(&gateway.port())
+        || gateway.port() == 0
+        || denied_ports.contains(&gateway.port())
     {
         return Err("gateway must be a distinct nonzero 127.0.0.1 endpoint".into());
     }
-    // nono emits non-network platform rules before its ProxyOnly network
-    // section. Preserve the application's normal non-network access, then let
-    // that section deny network* and permit only localhost:gateway. DNS and
-    // Unix socket relay exceptions are deliberately absent.
+    // nono emits non-network platform rules after its hardcoded keychain Mach
+    // denies and before its ProxyOnly network section. Preserve the application's
+    // normal non-network access and explicitly re-allow macOS Keychain Mach
+    // services so desktop safeStorage and CLI keychain lookups work cleanly.
     let mut caps = CapabilitySet::new()
         .proxy_only(gateway.port())
         .block_dns()
         .platform_rule("(allow default)")
         .map_err(|error| error.to_string())?;
+    for service in KEYCHAIN_MACH_SERVICES {
+        caps.add_platform_rule(format!("(allow mach-lookup (global-name \"{service}\"))"))
+            .map_err(|error| error.to_string())?;
+    }
     // Chromium / Electron applications (e.g. ChatGPT / Codex / Claude) require
     // AF_UNIX bind in system temp folders for ProcessSingleton locking.
     caps.add_platform_rule("(allow system-socket (socket-domain AF_UNIX))")
@@ -26,6 +54,36 @@ pub fn capabilities(gateway: SocketAddr, denied_ports: &[u16]) -> Result<Capabil
         "(allow network-bind (subpath \"/var/folders\") (subpath \"/private/var/folders\") (subpath \"/tmp\") (subpath \"/private/tmp\"))",
     )
     .map_err(|error| error.to_string())?;
+
+    let mut deny_subpaths = BTreeSet::new();
+    for raw in extra_deny_read_write_paths {
+        if !raw.starts_with('/')
+            || raw.len() > 1024
+            || raw.chars().any(char::is_control)
+            || raw.contains(['"', '\\'])
+        {
+            return Err("extra_deny_read_write_paths must be clean absolute paths".into());
+        }
+        let resolved = canonicalize_or_resolve_parent(Path::new(raw));
+        let resolved_str = resolved
+            .to_str()
+            .ok_or_else(|| "canonicalized deny path is not valid UTF-8".to_string())?;
+        if !resolved_str.starts_with('/')
+            || resolved_str.chars().any(char::is_control)
+            || resolved_str.contains(['"', '\\'])
+        {
+            return Err("canonicalized deny path contains unsupported characters".into());
+        }
+        deny_subpaths.insert(resolved_str.to_owned());
+        deny_subpaths.insert(raw.clone());
+    }
+    for subpath in deny_subpaths {
+        caps.add_platform_rule(format!(
+            "(deny file-read* file-write* (subpath \"{subpath}\"))"
+        ))
+        .map_err(|error| error.to_string())?;
+    }
+
     // Seatbelt only accepts `localhost` or `*` here, not a literal IP. Its
     // localhost grant includes more than the configured 127.0.0.1 spelling.
     // Production therefore requires the system broker to reserve this port
@@ -38,6 +96,29 @@ pub fn capabilities(gateway: SocketAddr, denied_ports: &[u16]) -> Result<Capabil
         .map_err(|error| error.to_string())?;
     }
     Ok(caps)
+}
+
+fn canonicalize_or_resolve_parent(path: &Path) -> PathBuf {
+    if let Ok(canon) = fs::canonicalize(path) {
+        return canon;
+    }
+    let mut suffix = Vec::new();
+    let mut cur = path;
+    while let Some(name) = cur.file_name() {
+        suffix.push(name.to_os_string());
+        let Some(parent) = cur.parent() else {
+            break;
+        };
+        if let Ok(canon_parent) = fs::canonicalize(parent) {
+            let mut out = canon_parent;
+            for part in suffix.into_iter().rev() {
+                out.push(part);
+            }
+            return out;
+        }
+        cur = parent;
+    }
+    path.to_path_buf()
 }
 
 pub fn apply(capabilities: &CapabilitySet) -> Result<(), String> {
@@ -318,5 +399,78 @@ mod tests {
         assert!(TcpStream::connect(vpn.local_addr().unwrap()).is_ok());
         assert!(UnixStream::connect(&unix_path).is_ok());
         fs::remove_dir_all(&scratch).unwrap();
+    }
+
+    #[test]
+    fn nono_apply_allows_keychain_and_enforces_canonical_denied_paths_in_child() {
+        if std::env::var("CW_NONO_B2_CHILD").as_deref() == Ok("1") {
+            let gw: SocketAddr = std::env::var("CW_NONO_B2_GW").unwrap().parse().unwrap();
+            let denied_dir = PathBuf::from(std::env::var("CW_NONO_B2_DENIED").unwrap());
+            let allowed_file = PathBuf::from(std::env::var("CW_NONO_B2_ALLOWED").unwrap());
+            let secret_file = denied_dir.join("secret.txt");
+            let caps = capabilities_with_denied_paths(
+                gw,
+                &[],
+                &[denied_dir.to_string_lossy().into_owned()],
+            )
+            .unwrap();
+            apply(&caps).unwrap();
+
+            // 1. Normal file access outside denied paths remains allowed.
+            fs::write(&allowed_file, b"allowed").unwrap();
+            assert_eq!(fs::read(&allowed_file).unwrap(), b"allowed");
+
+            // 2. Canonicalized sensitive directory read & write must be denied by Seatbelt.
+            let read_err = fs::read(&secret_file).unwrap_err();
+            assert_eq!(
+                read_err.kind(),
+                std::io::ErrorKind::PermissionDenied,
+                "expected PermissionDenied reading denied path, got: {read_err:?}"
+            );
+            let write_err = fs::write(denied_dir.join("new.txt"), b"blocked").unwrap_err();
+            assert_eq!(
+                write_err.kind(),
+                std::io::ErrorKind::PermissionDenied,
+                "expected PermissionDenied writing denied path, got: {write_err:?}"
+            );
+
+            // 3. Keychain Mach services are explicitly allowed (`security list-keychains` succeeds).
+            let sec = Command::new("/usr/bin/security")
+                .arg("list-keychains")
+                .output()
+                .expect("run /usr/bin/security list-keychains");
+            assert!(
+                sec.status.success(),
+                "security list-keychains failed under nono Seatbelt: stderr={}",
+                String::from_utf8_lossy(&sec.stderr)
+            );
+            println!("b2_keychain_and_canonical_deny=verified");
+            return;
+        }
+
+        // Use `/tmp/...` (which is a symlink to `/private/tmp/...` on macOS) to prove
+        // that `canonicalize_or_resolve_parent` resolves `/tmp` -> `/private/tmp` so
+        // Seatbelt subpath matching cannot be bypassed by symlinked parent directories.
+        let scratch = PathBuf::from("/tmp").join(format!("cw-nono-b2-{}", std::process::id()));
+        let denied_dir = scratch.join("sensitive-dir");
+        fs::create_dir_all(&denied_dir).unwrap();
+        fs::write(denied_dir.join("secret.txt"), b"top-secret").unwrap();
+        let allowed_file = scratch.join("allowed.txt");
+
+        let test_thread = std::thread::current();
+        let test_name = test_thread.name().expect("test harness thread name");
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test_name, "--nocapture"])
+            .env("CW_NONO_B2_CHILD", "1")
+            .env("CW_NONO_B2_GW", "127.0.0.1:18799")
+            .env("CW_NONO_B2_DENIED", &denied_dir)
+            .env("CW_NONO_B2_ALLOWED", &allowed_file)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        fs::remove_dir_all(&scratch).unwrap();
+        assert!(output.status.success(), "{stdout}\n{stderr}");
+        assert!(stdout.contains("b2_keychain_and_canonical_deny=verified"));
     }
 }

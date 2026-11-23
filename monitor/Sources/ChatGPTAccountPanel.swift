@@ -50,6 +50,7 @@ struct ChatGPTAccountPanel: View {
     @ObservedObject var store: SwitcherStore
     let presence: WorkspaceDesktopPresence?
     let p: Palette
+    var onConfirmPrune: ((AIProductVersionsInfo) -> Void)? = nil
     @State private var activation = 0
 
     private struct StatusRequest: Equatable {
@@ -87,10 +88,15 @@ struct ChatGPTAccountPanel: View {
                     Text(store.chatGPTAccountsError ?? (store.loaded ? "当前后台未提供 ChatGPT 桌面账号切换。" : "正在读取桌面账号…"))
                         .font(WatchTypography.caption).foregroundStyle(p.secondary)
                 }
-                if store.aiVersions?.chatgpt_desktop.seatbelt_incompatible == true {
-                    InlineNotice(title: "当前 ChatGPT 构建暂不兼容受控 Seatbelt 启动",
-                                 detail: "已检测到包内包含 Aperitif 辅助进程组件，从「代理与连接」受控启动时会自动拦截以防止崩溃。",
-                                 symbol: "exclamationmark.shield", tint: p.amber, p: p)
+                if let info = store.aiVersions?.chatgpt {
+                    ProductVersionsSection(
+                        product: .openAI,
+                        info: info,
+                        pruneMessage: store.pruneCLIMessages[.openAI] ?? "",
+                        disabled: store.busy || store.hasUnsavedSettings || store.switchingChatGPTSlot != nil,
+                        p: p,
+                        onConfirmPrune: onConfirmPrune
+                    )
                 }
             }
         }.task(id: StatusRequest(presence: presence, loaded: store.loaded, activation: activation)) {
@@ -101,13 +107,15 @@ struct ChatGPTAccountPanel: View {
     }
 
     private var selectionSummary: String {
-        let base: String
-        if let id = store.switchingChatGPTSlot { base = "正在打开账号 \(id) 并核对桌面状态…" }
-        else if let id = store.chatGPTAccounts?.current { base = "桌面正在使用槽位 \(id)" }
-        else if let id = store.chatGPTAccounts?.selected { base = "上次选用槽位 \(id)，当前桌面实例尚未核实" }
-        else { base = "当前桌面使用的账号槽位尚未核实" }
-        let versionText = SwitcherStore.formattedVersion(store.chatgptVersion, build: store.chatgptBuild)
-        return versionText.isEmpty ? base : "\(base) · ChatGPT \(versionText)"
+        if let id = store.switchingChatGPTSlot {
+            return "本地 A / B 资料槽位 · 正在切换到槽位 \(id)…"
+        } else if let id = store.chatGPTAccounts?.current {
+            return "本地 A / B 资料槽位 · 桌面正在使用槽位 \(id)"
+        } else if let id = store.chatGPTAccounts?.selected {
+            return "本地 A / B 资料槽位 · 上次选用槽位 \(id)（当前桌面未运行）"
+        } else {
+            return "本地 A / B 资料槽位 · 当前槽位尚未核实"
+        }
     }
 
     private func slotSummary(_ slot: SwitcherAccountSlot) -> String {
@@ -139,12 +147,13 @@ struct DesktopAccountControls: View {
 
     private var capture: DesktopAccountCapture? { store.manualAccounts[product] }
     private var name: String { product == .claude ? "Claude" : "ChatGPT" }
+    private var moduleTitle: String { product == .claude ? "Claude" : "ChatGPT / Codex" }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 10) {
                 BrandLogo(brand: product == .claude ? .claude : .chatgpt, size: 18)
-                SectionHeading(title: name + " 账号", caption: caption, p: p)
+                SectionHeading(title: moduleTitle, caption: caption, p: p)
                 Spacer(minLength: 6)
                 Button {
                     Task {
@@ -165,7 +174,7 @@ struct DesktopAccountControls: View {
                         .font(WatchTypography.small).foregroundStyle(p.secondary)
                 }
             }
-            if let capture, !capture.canSave {
+            if let capture, !capture.canSave, capture.state != "app_closed" {
                 Text(capture.detail).font(WatchTypography.caption).foregroundStyle(p.secondary)
                 if product == .claude, capture.state == "access_required" {
                     Button("打开辅助功能设置") { store.openClaudeWatchAccessibilitySettings() }.buttonStyle(.borderless)
@@ -218,6 +227,150 @@ struct DesktopAccountControls: View {
         case "app_closed": return name + " 未运行"
         case "access_required": return "需要辅助功能权限"
         default: return "未能核实当前账号"
+        }
+    }
+}
+
+struct ProductVersionsSection: View {
+    let product: MonitoredProduct
+    let info: AIProductVersionsInfo
+    let pruneMessage: String
+    let disabled: Bool
+    let p: Palette
+    var onConfirmPrune: ((AIProductVersionsInfo) -> Void)? = nil
+
+    private var desktopTitle: String { product == .claude ? "Claude Desktop" : "ChatGPT Desktop" }
+    private var embeddedTitle: String { product == .claude ? "Claude 内置 CLI" : "ChatGPT 随包 CLI" }
+    private var standaloneTitle: String { product == .claude ? "Claude Code CLI（独立安装）" : "Codex CLI（独立安装）" }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Divider()
+            HStack(spacing: 8) {
+                Text("桌面端与 CLI 版本管理").font(WatchTypography.captionStrong).foregroundStyle(p.secondary)
+                Spacer(minLength: 4)
+                Badge(text: info.has_warnings ? "发现多版本 / 旧版" : "版本正常",
+                      color: info.has_warnings ? p.amber : p.mint)
+            }
+            desktopRow
+            embeddedCLIRow
+            standaloneCLIRow
+            if !info.prunable_versions.isEmpty {
+                HStack(alignment: .center, spacing: 10) {
+                    Text("可清理旧版本：\(info.prunable_versions.joined(separator: "、"))（约 \(info.prunableMBText)）")
+                        .font(WatchTypography.small).foregroundStyle(p.amber)
+                    Spacer(minLength: 4)
+                    if let onConfirmPrune {
+                        Button("清理旧版本…") {
+                            onConfirmPrune(info)
+                        }
+                        .controlSize(.small)
+                        .disabled(disabled)
+                    }
+                }
+            }
+            if !pruneMessage.isEmpty {
+                Text(pruneMessage).font(WatchTypography.caption).foregroundStyle(p.secondary)
+                    .textSelection(.enabled)
+            }
+        }
+    }
+
+    private var desktopRow: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            HStack(spacing: 8) {
+                Text(desktopTitle).font(WatchTypography.bodyStrong)
+                let versionText = SwitcherStore.formattedVersion(info.desktop.selected_version, build: info.desktop.selected_build)
+                Text(versionText.isEmpty ? (info.desktop.installs.isEmpty ? "未检测到安装" : "版本未确认") : versionText)
+                    .font(WatchTypography.mono).foregroundStyle(p.secondary)
+                Spacer(minLength: 4)
+                if info.desktop.multiple_versions {
+                    Badge(text: "\(info.desktop.installs.count) 个副本", color: p.amber)
+                } else if !info.desktop.installs.isEmpty {
+                    Text("单版本").font(WatchTypography.small).foregroundStyle(p.secondary)
+                }
+            }
+            if info.desktop.multiple_versions {
+                ForEach(info.desktop.installs) { install in
+                    let ver = SwitcherStore.formattedVersion(install.version, build: install.build_version)
+                    Text("\(install.selected ? "当前" : "副本") · \(ver.isEmpty ? "版本未知" : ver) · \(install.path)")
+                        .font(WatchTypography.small).foregroundStyle(p.amber).textSelection(.enabled)
+                }
+            } else if !info.desktop.selected_path.isEmpty {
+                Text(info.desktop.selected_path).font(WatchTypography.small).foregroundStyle(p.secondary).textSelection(.enabled)
+            }
+            if info.desktop.sandbox_compat_mode {
+                Text("受控网络沙盒兼容模式：检测到 Aperitif 组件，受控启动将自动启用外层网络沙盒 + 钥匙串放行 + 高敏目录隔离 + --no-sandbox。")
+                    .font(WatchTypography.small).foregroundStyle(p.blue)
+            }
+        }
+    }
+
+    private var embeddedCLIRow: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            HStack(spacing: 8) {
+                Text(embeddedTitle).font(WatchTypography.bodyStrong)
+                if info.embedded_cli.present {
+                    Text(info.embedded_cli.latest.isEmpty ? "已内置" : info.embedded_cli.latest)
+                        .font(WatchTypography.mono).foregroundStyle(p.secondary)
+                    if !info.embedded_cli.source_label.isEmpty {
+                        Text("· " + info.embedded_cli.source_label)
+                            .font(WatchTypography.small).foregroundStyle(p.secondary)
+                    }
+                } else {
+                    Text("未检测到").font(WatchTypography.caption).foregroundStyle(p.secondary)
+                }
+                Spacer(minLength: 4)
+                if !info.embedded_cli.redundant_versions.isEmpty {
+                    Badge(text: "\(info.embedded_cli.redundant_versions.count) 个旧版 · \(info.embedded_cli.redundantMBText)", color: p.amber)
+                } else if info.embedded_cli.bundled_in_app && info.embedded_cli.present {
+                    Text("随应用包").font(WatchTypography.small).foregroundStyle(p.secondary)
+                } else if info.embedded_cli.present {
+                    Text("无冗余旧版").font(WatchTypography.small).foregroundStyle(p.secondary)
+                }
+            }
+            if !info.embedded_cli.path.isEmpty {
+                Text(info.embedded_cli.path).font(WatchTypography.small).foregroundStyle(p.secondary).textSelection(.enabled)
+            }
+            if !info.embedded_cli.legacy_redundant_versions.isEmpty {
+                Text("原版切换器目录另检测到旧版：\(info.embedded_cli.legacy_redundant_versions.joined(separator: "、"))（只读提示，本工具不修改原版目录）")
+                    .font(WatchTypography.small).foregroundStyle(p.secondary)
+            }
+        }
+    }
+
+    private var standaloneCLIRow: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            HStack(spacing: 8) {
+                Text(standaloneTitle).font(WatchTypography.bodyStrong)
+                if !info.standalone_cli.selected_version.isEmpty {
+                    Text(info.standalone_cli.selected_version).font(WatchTypography.mono).foregroundStyle(p.secondary)
+                    if !info.standalone_cli.selected_source_label.isEmpty {
+                        Text("· " + info.standalone_cli.selected_source_label)
+                            .font(WatchTypography.small).foregroundStyle(p.secondary)
+                    }
+                } else if info.standalone_cli.installs.isEmpty {
+                    Text("未检测到独立安装").font(WatchTypography.caption).foregroundStyle(p.secondary)
+                } else {
+                    Text("已安装").font(WatchTypography.caption).foregroundStyle(p.secondary)
+                }
+                Spacer(minLength: 4)
+                if info.standalone_cli.multiple_versions {
+                    Badge(text: "\(info.standalone_cli.installs.count) 个安装来源", color: p.amber)
+                } else if !info.standalone_cli.installs.isEmpty {
+                    Text("单来源").font(WatchTypography.small).foregroundStyle(p.secondary)
+                }
+            }
+            if info.standalone_cli.multiple_versions {
+                ForEach(info.standalone_cli.installs) { install in
+                    let label = install.source_label.isEmpty ? install.source_kind : install.source_label
+                    let ver = install.version.isEmpty ? label : "\(install.version)（\(label)）"
+                    Text("\(install.selected ? "当前" : "其他来源") · \(ver) · \(install.path)")
+                        .font(WatchTypography.small).foregroundStyle(p.amber).textSelection(.enabled)
+                }
+            } else if !info.standalone_cli.selected_path.isEmpty {
+                Text(info.standalone_cli.selected_path).font(WatchTypography.small).foregroundStyle(p.secondary).textSelection(.enabled)
+            }
         }
     }
 }

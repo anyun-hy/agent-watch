@@ -536,6 +536,10 @@ struct InitializationTests {
         expect(recovery.initializationContext != nil && recovery.leakChecks.dns.verdict.state == .matched &&
                recovery.leakChecks.initializationReceiptIsCurrent(.dns),
                "a directly verified current proxy remains usable after the separate ten-second gap grace")
+        recovery.advanceClock(at: base.addingTimeInterval(12))
+        expect(recovery.initializationContext != nil,
+               "an already accepted fresh snapshot retains initializationContext across the 8s snapshot cadence while its proxy sample is within 30s")
+        recovery.advanceClock(at: afterGap)
         let noProxy = MonitorSnapshot(capturedAt: afterGap.timeIntervalSince1970, health: firstSnapshot.health,
             installed: true, autoStart: true, keepAlive: true, hasBaseline: false,
             stderrBytes: 0, processes: [], events: [], proxy: nil, proxyError: nil,

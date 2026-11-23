@@ -115,16 +115,18 @@ fn chatgpt_known_main_with_changed_aperitif_components_is_unverified() {
         fs::write(path, vec![0; size]).unwrap();
     }
     assert_eq!(spec.check_seatbelt_compatibility().unwrap_err().code, "desktop_compatibility_unverified");
-    // Updated builds (e.g. 29513 with a new main executable SHA/size) that still
-    // bundle Aperitif components must also be blocked before Seatbelt launch.
+    // Updated builds (e.g. 29513 / 29803 with a new main executable SHA/size) that
+    // bundle Aperitif components are permitted via Upgrade B2 compatibility mode.
     spec.target_fingerprint = "f".repeat(64);
     assert!(DesktopManagedEntrySpec::bundle_has_aperitif_components(&spec.target_bundle_path));
-    assert_eq!(spec.check_seatbelt_compatibility().unwrap_err().code, "desktop_sandbox_incompatible");
-    // Once Aperitif components are absent, a different build is allowed.
+    assert!(spec.check_seatbelt_compatibility().is_ok());
+    assert!(spec.requires_no_sandbox_compat());
+    // Once Aperitif components are absent, standard mode is used without --no-sandbox.
     fs::remove_file(&helper).unwrap();
     fs::remove_file(&library).unwrap();
     assert!(!DesktopManagedEntrySpec::bundle_has_aperitif_components(&spec.target_bundle_path));
     assert!(spec.check_seatbelt_compatibility().is_ok());
+    assert!(!spec.requires_no_sandbox_compat());
 }
 
 #[test]
@@ -311,6 +313,8 @@ fn d03_and_d04_direct_child_inherits_protection_while_out_of_tree_launchd_proces
         interpreter: None,
         interpreter_fingerprint: None,
         script_source: None,
+        desktop_sandbox_compat_no_sandbox: false,
+        extra_deny_read_write_paths: vec![],
     };
     let resp = register_helper_with_daemon(&sock_path, req, true, &sbpl).unwrap();
     assert!(resp.accepted, "owned hardened peer registration: {resp:?}");
@@ -830,6 +834,8 @@ app.run()
         interpreter: None,
         interpreter_fingerprint: None,
         script_source: None,
+        desktop_sandbox_compat_no_sandbox: false,
+        extra_deny_read_write_paths: vec![],
     };
     let req_json = serde_json::to_string(&req_template).unwrap();
     let real_helper_dispatch = tmp.0.join("watch-helper-dispatch");
@@ -1172,6 +1178,8 @@ fn n3b_legacy_script_fields_cannot_replace_current_approval() {
         interpreter: script_ctx.interpreter.clone(),
         interpreter_fingerprint: script_ctx.interpreter_fingerprint.clone(),
         script_source: None,
+        desktop_sandbox_compat_no_sandbox: false,
+        extra_deny_read_write_paths: vec![],
     };
     assert_eq!(req.validate().unwrap_err().code, "invalid_script_launch_contract");
 

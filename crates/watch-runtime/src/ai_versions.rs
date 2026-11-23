@@ -1,17 +1,17 @@
-//! Authoritative AI desktop and CLI version inspection and safe embedded
-//! Claude Code CLI pruning.
+//! Authoritative per-product AI desktop, embedded CLI, and standalone CLI
+//! version inspection and safe old-version cleanup (`claude` and `chatgpt`).
 //!
 //! All installation discovery, multi-version detection, and disk pruning run in
 //! Rust using the same `target_discovery` catalog and `StateStore` boundaries.
-//! Legacy `~/.claude-switcher` directories are strictly read-only and are never
-//! mutated or deleted.
+//! Legacy `~/.claude-switcher` directories and signed `.app` bundles are
+//! strictly read-only and are never mutated or deleted.
 
 use crate::{
     commands::ReadRunner,
     managed_entry::DesktopManagedEntrySpec,
     native,
     storage::StateStore,
-    target_discovery::{DiscoveredTarget, DiscoveryHandle, DiscoverySnapshot},
+    target_discovery::{isolated_home, DiscoveredTarget, DiscoveryHandle, DiscoverySnapshot},
 };
 use claude_watch_core::{
     error::{CoreError, Result},
@@ -21,8 +21,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
     cmp::Ordering,
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs,
+    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
 };
 
@@ -36,7 +37,7 @@ pub struct DesktopInstallInfo {
     pub version: String,
     pub build_version: String,
     pub selected: bool,
-    pub seatbelt_incompatible: bool,
+    pub sandbox_compat_mode: bool,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -45,7 +46,7 @@ pub struct AiDesktopVersions {
     pub selected_build: String,
     pub selected_path: String,
     pub selected_bundle_id: String,
-    pub seatbelt_incompatible: bool,
+    pub sandbox_compat_mode: bool,
     pub installs: Vec<DesktopInstallInfo>,
     pub multiple_versions: bool,
 }
@@ -54,6 +55,7 @@ pub struct AiDesktopVersions {
 pub struct CliInstallInfo {
     pub path: String,
     pub source_kind: String,
+    pub source_label: String,
     pub version: String,
     pub selected: bool,
 }
@@ -62,13 +64,20 @@ pub struct CliInstallInfo {
 pub struct AiCliVersions {
     pub selected_version: String,
     pub selected_path: String,
+    pub selected_source_label: String,
     pub installs: Vec<CliInstallInfo>,
     pub multiple_versions: bool,
+    pub redundant_versions: Vec<String>,
+    pub redundant_bytes: u64,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
-pub struct EmbeddedClaudeCliInfo {
+pub struct EmbeddedCliVersions {
+    pub present: bool,
     pub latest: String,
+    pub path: String,
+    pub source_label: String,
+    pub bundled_in_app: bool,
     pub versions: Vec<String>,
     pub redundant_versions: Vec<String>,
     pub redundant_bytes: u64,
@@ -76,21 +85,30 @@ pub struct EmbeddedClaudeCliInfo {
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProductVersionsReport {
+    pub product: String,
+    pub desktop: AiDesktopVersions,
+    pub embedded_cli: EmbeddedCliVersions,
+    pub standalone_cli: AiCliVersions,
+    pub prunable_versions: Vec<String>,
+    pub prunable_bytes: u64,
+    pub has_warnings: bool,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AiVersionsReport {
-    pub claude_desktop: AiDesktopVersions,
-    pub chatgpt_desktop: AiDesktopVersions,
-    pub claude_embedded_cli: EmbeddedClaudeCliInfo,
-    pub claude_cli: AiCliVersions,
-    pub codex_cli: AiCliVersions,
+    pub claude: ProductVersionsReport,
+    pub chatgpt: ProductVersionsReport,
     pub has_multi_version_warnings: bool,
 }
 
 /// Parses a dotted numeric version string such as `2.1.328` into integer segments.
 pub fn parse_numeric_version(raw: &str) -> Option<Vec<u64>> {
-    if raw.is_empty() || raw.len() > 64 {
+    let trimmed = raw.strip_prefix('v').unwrap_or(raw);
+    if trimmed.is_empty() || trimmed.len() > 64 {
         return None;
     }
-    let parts: Vec<&str> = raw.split('.').collect();
+    let parts: Vec<&str> = trimmed.split('.').collect();
     if parts.is_empty() || parts.len() > 4 {
         return None;
     }
@@ -132,30 +150,115 @@ impl PartialOrd for NumericVersionKey {
     }
 }
 
+pub fn cli_source_label(executable: &Path, source_kind: &str) -> String {
+    let exe_str = executable.to_string_lossy();
+    if source_kind == "verified_bundle_cli" || exe_str.contains(".app/Contents/Resources/") {
+        return "桌面应用内置".into();
+    }
+    if source_kind == "homebrew"
+        || exe_str.contains("/Caskroom/")
+        || exe_str.contains("/Cellar/")
+        || exe_str.starts_with("/opt/homebrew/")
+    {
+        return "Homebrew 安装".into();
+    }
+    if source_kind == "claude_native" || exe_str.contains(".local/share/claude/versions") {
+        return "官方原生安装".into();
+    }
+    if exe_str.contains(".local/share/codex/versions") {
+        return "本地版本目录".into();
+    }
+    match source_kind {
+        "nvm" => "NVM (Node) 安装".into(),
+        "fnm" => "FNM (Node) 安装".into(),
+        "volta" | "volta_package" => "Volta 安装".into(),
+        "npm" => "npm 全局安装".into(),
+        "explicit_path" => "环境变量指定".into(),
+        "supported_alias" => "标准命令入口".into(),
+        "caller_path" | "daemon_path" => {
+            if exe_str.contains("node_modules") {
+                "npm 全局安装".into()
+            } else {
+                "系统 PATH".into()
+            }
+        }
+        _ => {
+            if exe_str.contains("node_modules") {
+                "npm 全局安装".into()
+            } else {
+                "本地安装".into()
+            }
+        }
+    }
+}
+
 pub fn inspect(store: &StateStore, runner: &dyn ReadRunner) -> AiVersionsReport {
     let snapshot = DiscoveryHandle::for_home(&store.paths.home).refresh(runner, native::now());
     inspect_from_snapshot(store, &snapshot)
 }
 
 pub fn inspect_from_snapshot(store: &StateStore, snapshot: &DiscoverySnapshot) -> AiVersionsReport {
-    let claude_desktop = collect_desktop_versions(snapshot, LaunchTarget::ClaudeDesktop);
-    let chatgpt_desktop = collect_desktop_versions(snapshot, LaunchTarget::ChatgptDesktop);
-    let claude_embedded_cli = scan_embedded_claude_cli(store);
-    let claude_cli = collect_cli_versions(snapshot, LaunchTarget::ClaudeCli);
-    let codex_cli = collect_cli_versions(snapshot, LaunchTarget::CodexCli);
-    let has_multi_version_warnings = claude_desktop.multiple_versions
-        || chatgpt_desktop.multiple_versions
-        || claude_cli.multiple_versions
-        || codex_cli.multiple_versions
-        || !claude_embedded_cli.redundant_versions.is_empty()
-        || !claude_embedded_cli.legacy_redundant_versions.is_empty();
+    let claude = build_claude_report(store, snapshot);
+    let chatgpt = build_chatgpt_report(store, snapshot);
+    let has_multi_version_warnings = claude.has_warnings || chatgpt.has_warnings;
     AiVersionsReport {
-        claude_desktop,
-        chatgpt_desktop,
-        claude_embedded_cli,
-        claude_cli,
-        codex_cli,
+        claude,
+        chatgpt,
         has_multi_version_warnings,
+    }
+}
+
+fn build_claude_report(store: &StateStore, snapshot: &DiscoverySnapshot) -> ProductVersionsReport {
+    let desktop = collect_desktop_versions(snapshot, LaunchTarget::ClaudeDesktop);
+    let embedded_cli = scan_embedded_claude_cli(store);
+    let standalone_cli =
+        collect_standalone_cli_versions(store, snapshot, LaunchTarget::ClaudeCli);
+
+    let mut prunable_versions = embedded_cli.redundant_versions.clone();
+    for v in &standalone_cli.redundant_versions {
+        if !prunable_versions.contains(v) {
+            prunable_versions.push(v.clone());
+        }
+    }
+    let prunable_bytes = embedded_cli
+        .redundant_bytes
+        .saturating_add(standalone_cli.redundant_bytes);
+    let has_warnings = desktop.multiple_versions
+        || standalone_cli.multiple_versions
+        || !prunable_versions.is_empty()
+        || !embedded_cli.legacy_redundant_versions.is_empty();
+
+    ProductVersionsReport {
+        product: "claude".into(),
+        desktop,
+        embedded_cli,
+        standalone_cli,
+        prunable_versions,
+        prunable_bytes,
+        has_warnings,
+    }
+}
+
+fn build_chatgpt_report(store: &StateStore, snapshot: &DiscoverySnapshot) -> ProductVersionsReport {
+    let desktop = collect_desktop_versions(snapshot, LaunchTarget::ChatgptDesktop);
+    let embedded_cli = collect_bundled_chatgpt_cli(snapshot, &desktop);
+    let standalone_cli =
+        collect_standalone_cli_versions(store, snapshot, LaunchTarget::CodexCli);
+
+    let prunable_versions = standalone_cli.redundant_versions.clone();
+    let prunable_bytes = standalone_cli.redundant_bytes;
+    let has_warnings = desktop.multiple_versions
+        || standalone_cli.multiple_versions
+        || !prunable_versions.is_empty();
+
+    ProductVersionsReport {
+        product: "chatgpt".into(),
+        desktop,
+        embedded_cli,
+        standalone_cli,
+        prunable_versions,
+        prunable_bytes,
+        has_warnings,
     }
 }
 
@@ -186,7 +289,7 @@ fn collect_desktop_versions(
         let version = record.app_version.clone().unwrap_or_default();
         let build_version = record.build_version.clone().unwrap_or_default();
         let selected = selected_bundle.as_ref() == Some(&bundle_path);
-        let seatbelt_incompatible = bundle_id == "com.openai.codex"
+        let sandbox_compat_mode = bundle_id == "com.openai.codex"
             && DesktopManagedEntrySpec::bundle_has_aperitif_components(&bundle_path);
 
         by_bundle
@@ -199,7 +302,7 @@ fn collect_desktop_versions(
                     existing.build_version = build_version.clone();
                 }
                 existing.selected |= selected;
-                existing.seatbelt_incompatible |= seatbelt_incompatible;
+                existing.sandbox_compat_mode |= sandbox_compat_mode;
             })
             .or_insert(DesktopInstallInfo {
                 path: bundle_path.to_string_lossy().into_owned(),
@@ -207,7 +310,7 @@ fn collect_desktop_versions(
                 version,
                 build_version,
                 selected,
-                seatbelt_incompatible,
+                sandbox_compat_mode,
             });
     }
 
@@ -228,23 +331,28 @@ fn collect_desktop_versions(
         })
         .or_else(|| installs.first());
 
-    let (selected_version, selected_build, selected_path, selected_bundle_id, seatbelt_incompatible) =
-        match primary {
-            Some(item) => (
-                item.version.clone(),
-                item.build_version.clone(),
-                item.path.clone(),
-                item.bundle_id.clone(),
-                item.seatbelt_incompatible,
-            ),
-            None => (
-                String::new(),
-                String::new(),
-                String::new(),
-                String::new(),
-                false,
-            ),
-        };
+    let (
+        selected_version,
+        selected_build,
+        selected_path,
+        selected_bundle_id,
+        sandbox_compat_mode,
+    ) = match primary {
+        Some(item) => (
+            item.version.clone(),
+            item.build_version.clone(),
+            item.path.clone(),
+            item.bundle_id.clone(),
+            item.sandbox_compat_mode,
+        ),
+        None => (
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            false,
+        ),
+    };
 
     let multiple_versions = installs.len() > 1;
     AiDesktopVersions {
@@ -252,13 +360,71 @@ fn collect_desktop_versions(
         selected_build,
         selected_path,
         selected_bundle_id,
-        seatbelt_incompatible,
+        sandbox_compat_mode,
         installs,
         multiple_versions,
     }
 }
 
-fn collect_cli_versions(snapshot: &DiscoverySnapshot, target: LaunchTarget) -> AiCliVersions {
+fn is_bundled_cli_record(record: &DiscoveredTarget, executable: &Path) -> bool {
+    record.source_kind == "verified_bundle_cli"
+        || executable
+            .to_string_lossy()
+            .contains(".app/Contents/Resources/")
+}
+
+fn collect_bundled_chatgpt_cli(
+    snapshot: &DiscoverySnapshot,
+    desktop: &AiDesktopVersions,
+) -> EmbeddedCliVersions {
+    for record in &snapshot.targets {
+        if record.target != LaunchTarget::CodexCli || !record.valid() {
+            continue;
+        }
+        let Some(executable) = record.executable.as_ref() else {
+            continue;
+        };
+        if !is_bundled_cli_record(record, executable) {
+            continue;
+        }
+        let version = record
+            .app_version
+            .clone()
+            .filter(|v| !v.is_empty())
+            .or_else(|| {
+                (!desktop.selected_version.is_empty()).then(|| desktop.selected_version.clone())
+            })
+            .unwrap_or_else(|| "随附于桌面端".into());
+        return EmbeddedCliVersions {
+            present: true,
+            latest: version.clone(),
+            path: executable.to_string_lossy().into_owned(),
+            source_label: "ChatGPT 桌面应用内置".into(),
+            bundled_in_app: true,
+            versions: vec![version],
+            redundant_versions: vec![],
+            redundant_bytes: 0,
+            legacy_redundant_versions: vec![],
+        };
+    }
+    EmbeddedCliVersions {
+        present: false,
+        latest: String::new(),
+        path: String::new(),
+        source_label: "ChatGPT 桌面应用内置".into(),
+        bundled_in_app: true,
+        versions: vec![],
+        redundant_versions: vec![],
+        redundant_bytes: 0,
+        legacy_redundant_versions: vec![],
+    }
+}
+
+fn collect_standalone_cli_versions(
+    store: &StateStore,
+    snapshot: &DiscoverySnapshot,
+    target: LaunchTarget,
+) -> AiCliVersions {
     let selected_exe = snapshot
         .select(target, None)
         .ok()
@@ -272,14 +438,20 @@ fn collect_cli_versions(snapshot: &DiscoverySnapshot, target: LaunchTarget) -> A
         let Some(executable) = record.executable.as_ref() else {
             continue;
         };
+        // Bundled ChatGPT.app CLI belongs to `embedded_cli`, not standalone CLI installs.
+        if is_bundled_cli_record(record, executable) {
+            continue;
+        }
         let selected = selected_exe.as_ref() == Some(executable);
         let version = infer_cli_version(record).unwrap_or_default();
+        let label = cli_source_label(executable, &record.source_kind);
         let entry = by_exe.entry(executable.clone());
         match entry {
             std::collections::btree_map::Entry::Vacant(slot) => {
                 slot.insert(CliInstallInfo {
                     path: executable.to_string_lossy().into_owned(),
                     source_kind: record.source_kind.clone(),
+                    source_label: label,
                     version,
                     selected,
                 });
@@ -291,6 +463,7 @@ fn collect_cli_versions(snapshot: &DiscoverySnapshot, target: LaunchTarget) -> A
                     && record.source_kind != "supported_alias"
                 {
                     existing.source_kind = record.source_kind.clone();
+                    existing.source_label = label;
                 }
                 if existing.version.is_empty() && !version.is_empty() {
                     existing.version = version;
@@ -306,17 +479,38 @@ fn collect_cli_versions(snapshot: &DiscoverySnapshot, target: LaunchTarget) -> A
             .then_with(|| a.path.cmp(&b.path))
     });
 
+    // If the snapshot selected a bundled CLI, mark the first standalone install as selected
+    // for standalone display if there is exactly one standalone install.
+    if !installs.is_empty() && !installs.iter().any(|i| i.selected) && installs.len() == 1 {
+        installs[0].selected = true;
+    }
+
     let primary = installs.iter().find(|i| i.selected).or_else(|| installs.first());
-    let (selected_version, selected_path) = match primary {
-        Some(item) => (item.version.clone(), item.path.clone()),
-        None => (String::new(), String::new()),
+    let (selected_version, selected_path, selected_source_label) = match primary {
+        Some(item) => (
+            item.version.clone(),
+            item.path.clone(),
+            item.source_label.clone(),
+        ),
+        None => (String::new(), String::new(), String::new()),
     };
     let multiple_versions = installs.len() > 1;
+    let active_paths: BTreeSet<PathBuf> = installs
+        .iter()
+        .filter(|i| i.selected)
+        .map(|i| PathBuf::from(&i.path))
+        .collect();
+    let (redundant_versions, redundant_bytes, _) =
+        scan_prunable_standalone_cli_entries(store, target, &active_paths);
+
     AiCliVersions {
         selected_version,
         selected_path,
+        selected_source_label,
         installs,
         multiple_versions,
+        redundant_versions,
+        redundant_bytes,
     }
 }
 
@@ -411,17 +605,45 @@ fn legacy_embedded_cli_roots(store: &StateStore) -> Vec<PathBuf> {
     ]
 }
 
-fn scan_version_dirs_in_root(
-    store: &StateStore,
-    root: &Path,
-) -> Vec<(NumericVersionKey, String, PathBuf)> {
-    if store.guarded(root).is_err() {
-        return vec![];
+fn standalone_cli_version_roots(store: &StateStore, target: LaunchTarget) -> Vec<PathBuf> {
+    let home = &store.paths.home;
+    let isolated = isolated_home(home);
+    match target {
+        LaunchTarget::ClaudeCli => {
+            let mut roots = vec![
+                home.join(".local/share/claude/versions"),
+                home.join("homebrew/Caskroom/claude-code"),
+            ];
+            if !isolated {
+                roots.push(PathBuf::from("/opt/homebrew/Caskroom/claude-code"));
+                roots.push(PathBuf::from("/usr/local/Caskroom/claude-code"));
+            }
+            roots
+        }
+        LaunchTarget::CodexCli => {
+            let mut roots = vec![
+                home.join(".local/share/codex/versions"),
+                home.join("homebrew/Caskroom/codex"),
+            ];
+            if !isolated {
+                roots.push(PathBuf::from("/opt/homebrew/Caskroom/codex"));
+                roots.push(PathBuf::from("/usr/local/Caskroom/codex"));
+            }
+            roots
+        }
+        _ => vec![],
     }
+}
+
+fn scan_version_entries_in_root(
+    root: &Path,
+    allow_regular_files: bool,
+) -> Vec<(NumericVersionKey, String, PathBuf)> {
+    let uid = claude_watch_system::effective_uid();
     let Ok(meta) = fs::symlink_metadata(root) else {
         return vec![];
     };
-    if !meta.is_dir() || meta.file_type().is_symlink() {
+    if !meta.is_dir() || meta.file_type().is_symlink() || meta.uid() != uid {
         return vec![];
     }
     let Ok(entries) = fs::read_dir(root) else {
@@ -432,6 +654,9 @@ fn scan_version_dirs_in_root(
         let Ok(name) = entry.file_name().into_string() else {
             continue;
         };
+        if name.starts_with('.') {
+            continue;
+        }
         let Some(parsed) = parse_numeric_version(&name) else {
             continue;
         };
@@ -439,15 +664,36 @@ fn scan_version_dirs_in_root(
         let Ok(child_meta) = fs::symlink_metadata(&path) else {
             continue;
         };
-        if !child_meta.is_dir() || child_meta.file_type().is_symlink() {
+        if child_meta.file_type().is_symlink() || child_meta.uid() != uid {
             continue;
         }
-        found.push((NumericVersionKey(parsed), name, path));
+        if child_meta.is_dir() || (allow_regular_files && child_meta.is_file()) {
+            found.push((NumericVersionKey(parsed), name, path));
+        }
     }
     found
 }
 
-fn dir_size_no_symlink(root: &Path) -> u64 {
+fn scan_version_dirs_in_root(
+    store: &StateStore,
+    root: &Path,
+) -> Vec<(NumericVersionKey, String, PathBuf)> {
+    if store.guarded(root).is_err() {
+        return vec![];
+    }
+    scan_version_entries_in_root(root, false)
+}
+
+fn entry_size_no_symlink(root: &Path) -> u64 {
+    let Ok(meta) = fs::symlink_metadata(root) else {
+        return 0;
+    };
+    if meta.file_type().is_symlink() {
+        return 0;
+    }
+    if meta.is_file() {
+        return meta.len();
+    }
     let mut total: u64 = 0;
     let mut stack = vec![root.to_path_buf()];
     let mut seen = 0usize;
@@ -477,7 +723,46 @@ fn dir_size_no_symlink(root: &Path) -> u64 {
     total
 }
 
-fn scan_embedded_claude_cli(store: &StateStore) -> EmbeddedClaudeCliInfo {
+fn scan_prunable_standalone_cli_entries(
+    store: &StateStore,
+    target: LaunchTarget,
+    active_paths: &BTreeSet<PathBuf>,
+) -> (Vec<String>, u64, Vec<(String, PathBuf, u64)>) {
+    let mut prunable_map: BTreeMap<NumericVersionKey, String> = BTreeMap::new();
+    let mut total_bytes: u64 = 0;
+    let mut prunable_paths: Vec<(String, PathBuf, u64)> = Vec::new();
+
+    for root in standalone_cli_version_roots(store, target) {
+        let entries = scan_version_entries_in_root(&root, true);
+        if entries.len() <= 1 {
+            continue;
+        }
+        let Some(latest_key) = entries.iter().map(|(k, _, _)| k).max().cloned() else {
+            continue;
+        };
+        for (key, name, path) in entries {
+            if key >= latest_key {
+                continue;
+            }
+            // Never prune a path that is currently selected/active or contains an active binary.
+            let is_active = active_paths
+                .iter()
+                .any(|active| active == &path || active.starts_with(&path));
+            if is_active {
+                continue;
+            }
+            let bytes = entry_size_no_symlink(&path);
+            total_bytes = total_bytes.saturating_add(bytes);
+            prunable_map.entry(key).or_insert_with(|| name.clone());
+            prunable_paths.push((name, path, bytes));
+        }
+    }
+
+    let versions: Vec<String> = prunable_map.into_values().rev().collect();
+    (versions, total_bytes, prunable_paths)
+}
+
+fn scan_embedded_claude_cli(store: &StateStore) -> EmbeddedCliVersions {
     let mut managed_entries = Vec::new();
     let mut managed_map: BTreeMap<NumericVersionKey, String> = BTreeMap::new();
     for root in managed_embedded_cli_roots(store) {
@@ -493,6 +778,15 @@ fn scan_embedded_claude_cli(store: &StateStore) -> EmbeddedClaudeCliInfo {
         .and_then(|k| managed_map.get(k))
         .cloned()
         .unwrap_or_default();
+    let latest_path = latest_key
+        .as_ref()
+        .and_then(|lk| {
+            managed_entries
+                .iter()
+                .find(|(k, _, _)| k == lk)
+                .map(|(_, _, p)| p.to_string_lossy().into_owned())
+        })
+        .unwrap_or_default();
 
     let versions: Vec<String> = managed_map.values().rev().cloned().collect();
     let mut redundant_versions = Vec::new();
@@ -505,7 +799,7 @@ fn scan_embedded_claude_cli(store: &StateStore) -> EmbeddedClaudeCliInfo {
         }
         for (k, _, path) in &managed_entries {
             if k < latest_k {
-                redundant_bytes = redundant_bytes.saturating_add(dir_size_no_symlink(path));
+                redundant_bytes = redundant_bytes.saturating_add(entry_size_no_symlink(path));
             }
         }
     }
@@ -533,8 +827,12 @@ fn scan_embedded_claude_cli(store: &StateStore) -> EmbeddedClaudeCliInfo {
         None => vec![],
     };
 
-    EmbeddedClaudeCliInfo {
+    EmbeddedCliVersions {
+        present: !latest.is_empty(),
         latest,
+        path: latest_path,
+        source_label: "Claude 桌面端内置".into(),
+        bundled_in_app: false,
         versions,
         redundant_versions,
         redundant_bytes,
@@ -587,34 +885,80 @@ pub fn prune_claude_code_dir(profile_root: &Path) {
     }
 }
 
-/// Preview or execute safe cleanup of redundant older embedded Claude Code CLI
-/// versions in Watch-managed locations (`active/claude-code` and Watch account
-/// slots). Never touches legacy `~/.claude-switcher`.
 pub fn prune_embedded_claude_cli(
     store: &StateStore,
     claude_running: bool,
     apply: bool,
 ) -> Result<Value> {
+    prune_product_cli(store, "claude", claude_running, apply)
+}
+
+/// Preview or execute safe cleanup of redundant older CLI versions for `claude`
+/// (embedded Claude Code + standalone native/Caskroom old versions) or `chatgpt`
+/// (standalone Codex CLI old versions). Never touches legacy `~/.claude-switcher`
+/// or signed `.app` bundles.
+pub fn prune_product_cli(
+    store: &StateStore,
+    product: &str,
+    product_running: bool,
+    apply: bool,
+) -> Result<Value> {
+    let (target, product_display, running_code, running_msg) = match product {
+        "claude" => (
+            LaunchTarget::ClaudeCli,
+            "Claude Code",
+            "claude_running",
+            "请先退出 Claude 桌面端与 CLI，再清理旧版 Claude Code",
+        ),
+        "chatgpt" => (
+            LaunchTarget::CodexCli,
+            "Codex CLI",
+            "chatgpt_running",
+            "请先退出 ChatGPT / Codex，再清理旧版 Codex CLI",
+        ),
+        _ => {
+            return Err(CoreError::new("invalid_arguments", "不支持的产品标识"));
+        }
+    };
+
+    let embedded_before = if product == "claude" {
+        scan_embedded_claude_cli(store)
+    } else {
+        EmbeddedCliVersions::default()
+    };
+    let (standalone_redundant, standalone_bytes, standalone_paths) =
+        scan_prunable_standalone_cli_entries(store, target, &BTreeSet::new());
+
     if !apply {
-        let info = scan_embedded_claude_cli(store);
-        let message = if info.redundant_versions.is_empty() {
-            "当前没有可清理的旧版内置 Claude Code。".to_owned()
+        let mut preview_versions = embedded_before.redundant_versions.clone();
+        for v in &standalone_redundant {
+            if !preview_versions.contains(v) {
+                preview_versions.push(v.clone());
+            }
+        }
+        let preview_bytes = embedded_before
+            .redundant_bytes
+            .saturating_add(standalone_bytes);
+        let message = if preview_versions.is_empty() {
+            format!("当前没有可清理的旧版 {product_display}。")
         } else {
             format!(
-                "预览：可清理 {} 个旧版内置 Claude Code（保留最新 {}），预计释放 {:.1} MB。",
-                info.redundant_versions.len(),
-                info.latest,
-                info.redundant_bytes as f64 / (1024.0 * 1024.0)
+                "预览：可清理 {} 个旧版 {}（{}），预计释放 {:.1} MB。",
+                preview_versions.len(),
+                product_display,
+                preview_versions.join("、"),
+                preview_bytes as f64 / (1024.0 * 1024.0)
             )
         };
         return Ok(json!({
             "status": "ok",
+            "product": product,
             "applied": false,
-            "latest": info.latest,
-            "pruned_versions": info.redundant_versions,
-            "freed_bytes": info.redundant_bytes,
-            "remaining_versions": info.versions,
-            "legacy_redundant_versions": info.legacy_redundant_versions,
+            "latest": embedded_before.latest,
+            "pruned_versions": preview_versions,
+            "freed_bytes": preview_bytes,
+            "remaining_versions": embedded_before.versions,
+            "legacy_redundant_versions": embedded_before.legacy_redundant_versions,
             "message": message
         }));
     }
@@ -626,77 +970,101 @@ pub fn prune_embedded_claude_cli(
             "存在未完成的账号切换事务，请先恢复后再清理旧版本",
         ));
     }
-    if claude_running {
-        return Err(CoreError::new(
-            "claude_running",
-            "请先退出 Claude 桌面端，再清理旧版内置 Claude Code",
-        ));
+    if product_running {
+        return Err(CoreError::new(running_code, running_msg));
     }
 
-    let mut managed_entries = Vec::new();
-    let mut managed_map: BTreeMap<NumericVersionKey, String> = BTreeMap::new();
-    for root in managed_embedded_cli_roots(store) {
-        for (key, name, path) in scan_version_dirs_in_root(store, &root) {
-            managed_map.entry(key.clone()).or_insert_with(|| name.clone());
-            managed_entries.push((key, name, path));
+    let uid = claude_watch_system::effective_uid();
+    let mut pruned_versions: Vec<String> = Vec::new();
+    let mut freed_bytes: u64 = 0;
+
+    // 1. Prune Watch-managed embedded Claude Code directories if product == "claude"
+    if product == "claude" {
+        let mut managed_entries = Vec::new();
+        let mut managed_map: BTreeMap<NumericVersionKey, String> = BTreeMap::new();
+        for root in managed_embedded_cli_roots(store) {
+            for (key, name, path) in scan_version_dirs_in_root(store, &root) {
+                managed_map.entry(key.clone()).or_insert_with(|| name.clone());
+                managed_entries.push((key, name, path));
+            }
+        }
+        if let Some(latest_key) = managed_map.keys().next_back().cloned() {
+            for (key, name, path) in managed_entries {
+                if key >= latest_key {
+                    continue;
+                }
+                store.guarded(&path)?;
+                let meta = fs::symlink_metadata(&path).map_err(|_| {
+                    CoreError::new("prune_cli_failed", "待清理的内置 Claude Code 目录不可读取")
+                })?;
+                if !meta.is_dir() || meta.file_type().is_symlink() || meta.uid() != uid {
+                    return Err(CoreError::new(
+                        "unsafe_path",
+                        "拒绝清理非常规目录或符号链接",
+                    ));
+                }
+                let bytes = entry_size_no_symlink(&path);
+                fs::remove_dir_all(&path).map_err(|_| {
+                    CoreError::new("prune_cli_failed", "清理旧版内置 Claude Code 失败")
+                })?;
+                freed_bytes = freed_bytes.saturating_add(bytes);
+                if !pruned_versions.contains(&name) {
+                    pruned_versions.push(name);
+                }
+            }
         }
     }
 
-    let Some(latest_key) = managed_map.keys().next_back().cloned() else {
-        return Ok(json!({
-            "status": "ok",
-            "applied": true,
-            "latest": "",
-            "pruned_versions": [],
-            "freed_bytes": 0,
-            "remaining_versions": [],
-            "message": "当前未检测到内置 Claude Code 版本目录。"
-        }));
-    };
-    let latest = managed_map.get(&latest_key).cloned().unwrap_or_default();
-
-    let mut pruned_set: BTreeMap<NumericVersionKey, String> = BTreeMap::new();
-    let mut freed_bytes: u64 = 0;
-    for (key, name, path) in managed_entries {
-        if key >= latest_key {
+    // 2. Prune standalone old versions in user-owned version roots
+    for (name, path, bytes) in standalone_paths {
+        let path_str = path.to_string_lossy();
+        if path_str.contains(".claude-switcher") || path_str.contains(".app/") {
             continue;
         }
-        store.guarded(&path)?;
         let meta = fs::symlink_metadata(&path).map_err(|_| {
-            CoreError::new("prune_cli_failed", "待清理的内置 Claude Code 目录不可读取")
+            CoreError::new("prune_cli_failed", "待清理的 CLI 旧版本路径不可读取")
         })?;
-        if !meta.is_dir() || meta.file_type().is_symlink() {
+        if meta.file_type().is_symlink() || meta.uid() != uid {
             return Err(CoreError::new(
                 "unsafe_path",
-                "拒绝清理非常规目录或符号链接",
+                "拒绝清理符号链接或非当前用户所有的版本目录",
             ));
         }
-        let bytes = dir_size_no_symlink(&path);
-        fs::remove_dir_all(&path).map_err(|_| {
-            CoreError::new("prune_cli_failed", "清理旧版内置 Claude Code 失败")
-        })?;
+        if meta.is_dir() {
+            fs::remove_dir_all(&path)
+                .map_err(|_| CoreError::new("prune_cli_failed", "清理旧版 CLI 目录失败"))?;
+        } else if meta.is_file() {
+            fs::remove_file(&path)
+                .map_err(|_| CoreError::new("prune_cli_failed", "清理旧版 CLI 文件失败"))?;
+        }
         freed_bytes = freed_bytes.saturating_add(bytes);
-        pruned_set.entry(key).or_insert(name);
+        if !pruned_versions.contains(&name) {
+            pruned_versions.push(name);
+        }
     }
 
-    let pruned_versions: Vec<String> = pruned_set.into_values().rev().collect();
-    let after = scan_embedded_claude_cli(store);
+    let after = if product == "claude" {
+        scan_embedded_claude_cli(store)
+    } else {
+        EmbeddedCliVersions::default()
+    };
     let message = if pruned_versions.is_empty() {
-        "当前没有可清理的旧版内置 Claude Code。".to_owned()
+        format!("当前没有可清理的旧版 {product_display}。")
     } else {
         format!(
-            "已清理 {} 个旧版内置 Claude Code（{}），释放 {:.1} MB，保留最新 {}。",
+            "已清理 {} 个旧版 {}（{}），释放 {:.1} MB。",
             pruned_versions.len(),
+            product_display,
             pruned_versions.join("、"),
             freed_bytes as f64 / (1024.0 * 1024.0),
-            latest
         )
     };
 
     Ok(json!({
         "status": "ok",
+        "product": product,
         "applied": true,
-        "latest": latest,
+        "latest": after.latest,
         "pruned_versions": pruned_versions,
         "freed_bytes": freed_bytes,
         "remaining_versions": after.versions,
@@ -725,13 +1093,14 @@ mod tests {
         let v328 = NumericVersionKey(parse_numeric_version("2.1.328").unwrap());
         assert!(v9 < v10);
         assert!(v10 < v328);
+        assert!(parse_numeric_version("v0.170.0").is_some());
         assert!(parse_numeric_version("latest").is_none());
         assert!(parse_numeric_version("2.1.3.4.5").is_none());
         assert!(parse_numeric_version("../2.1.0").is_none());
     }
 
     #[test]
-    fn desktop_deduplicates_same_bundle_and_flags_multiple_installs() {
+    fn desktop_deduplicates_same_bundle_and_separates_bundled_chatgpt_cli_from_standalone() {
         let (home, store) = make_temp_store("cw-ai-ver-desktop");
         let make_target = |source_kind: &str, bundle: &str, bundle_id: &str, ver: &str, build: &str| {
             DiscoveredTarget {
@@ -751,57 +1120,106 @@ mod tests {
                 error_code: None,
             }
         };
-        // Two discovery sources for the same bundle should deduplicate to 1 install.
+        let bundled_cli = DiscoveredTarget {
+            target: LaunchTarget::CodexCli,
+            source_kind: "verified_bundle_cli".into(),
+            source_id: "codex-cli:verified_bundle_cli:/Applications/ChatGPT.app".into(),
+            entry_path: "/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex".into(),
+            bundle: Some("/Applications/ChatGPT.app".into()),
+            bundle_id: Some("com.openai.codex".into()),
+            app_version: Some("26.1117.41037".into()),
+            build_version: Some("29803".into()),
+            executable: Some("/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex".into()),
+            script_entry: None,
+            interpreter: None,
+            launcher_supported: true,
+            child_executables: vec![],
+            error_code: None,
+        };
+        let brew_cli = DiscoveredTarget {
+            target: LaunchTarget::CodexCli,
+            source_kind: "daemon_path".into(),
+            source_id: "codex-cli:daemon_path:/opt/homebrew/bin/codex".into(),
+            entry_path: "/opt/homebrew/bin/codex".into(),
+            bundle: None,
+            bundle_id: None,
+            app_version: None,
+            build_version: None,
+            executable: Some("/opt/homebrew/Caskroom/codex/0.170.0/bin/codex".into()),
+            script_entry: None,
+            interpreter: None,
+            launcher_supported: true,
+            child_executables: vec![],
+            error_code: None,
+        };
+        // Bundled CLI + 1 Homebrew standalone CLI must NOT trigger a false multi-version warning!
         let single = DiscoverySnapshot {
             revision: "r1".into(),
             prior_revision: None,
             complete: true,
             targets: vec![
-                make_target("applications_root", "/Applications/ChatGPT.app", "com.openai.codex", "26.1117.31558", "29513"),
-                make_target("registered_application", "/Applications/ChatGPT.app", "com.openai.codex", "26.1117.31558", "29513"),
+                make_target("applications_root", "/Applications/ChatGPT.app", "com.openai.codex", "26.1117.41037", "29803"),
+                make_target("registered_application", "/Applications/ChatGPT.app", "com.openai.codex", "26.1117.41037", "29803"),
+                bundled_cli,
+                brew_cli,
             ],
             issues: vec![],
             preferred_sources: BTreeMap::new(),
         };
         let report = inspect_from_snapshot(&store, &single);
-        assert_eq!(report.chatgpt_desktop.installs.len(), 1);
-        assert!(!report.chatgpt_desktop.multiple_versions);
-        assert_eq!(report.chatgpt_desktop.selected_version, "26.1117.31558");
-        assert_eq!(report.chatgpt_desktop.selected_build, "29513");
+        assert_eq!(report.chatgpt.desktop.installs.len(), 1);
+        assert!(!report.chatgpt.desktop.multiple_versions);
+        assert_eq!(report.chatgpt.desktop.selected_version, "26.1117.41037");
+        assert_eq!(report.chatgpt.desktop.selected_build, "29803");
+        assert!(report.chatgpt.embedded_cli.present);
+        assert!(report.chatgpt.embedded_cli.bundled_in_app);
+        assert_eq!(report.chatgpt.embedded_cli.source_label, "ChatGPT 桌面应用内置");
+        assert_eq!(report.chatgpt.standalone_cli.installs.len(), 1);
+        assert!(!report.chatgpt.standalone_cli.multiple_versions);
+        assert_eq!(report.chatgpt.standalone_cli.selected_version, "0.170.0");
+        assert_eq!(report.chatgpt.standalone_cli.selected_source_label, "Homebrew 安装");
+        assert!(!report.chatgpt.has_warnings);
+        assert!(!report.has_multi_version_warnings);
 
-        // Two distinct bundles should trigger `multiple_versions`.
+        // Two distinct desktop bundles should trigger `multiple_versions` and `has_warnings`.
         let multi = DiscoverySnapshot {
             revision: "r2".into(),
             prior_revision: None,
             complete: true,
             targets: vec![
-                make_target("applications_root", "/Applications/ChatGPT.app", "com.openai.codex", "26.1117.31558", "29513"),
+                make_target("applications_root", "/Applications/ChatGPT.app", "com.openai.codex", "26.1117.41037", "29803"),
                 make_target("applications_root", "/Users/u/Applications/ChatGPT.app", "com.openai.chat", "1.2025.0", "100"),
             ],
             issues: vec![],
             preferred_sources: BTreeMap::new(),
         };
         let report2 = inspect_from_snapshot(&store, &multi);
-        assert_eq!(report2.chatgpt_desktop.installs.len(), 2);
-        assert!(report2.chatgpt_desktop.multiple_versions);
+        assert_eq!(report2.chatgpt.desktop.installs.len(), 2);
+        assert!(report2.chatgpt.desktop.multiple_versions);
+        assert!(report2.chatgpt.has_warnings);
         assert!(report2.has_multi_version_warnings);
         fs::remove_dir_all(home).unwrap();
     }
 
     #[test]
-    fn embedded_cli_scan_and_prune_respect_safety_and_preserve_legacy() {
+    fn embedded_and_standalone_cli_scan_and_prune_respect_safety_and_preserve_legacy() {
         let (home, store) = make_temp_store("cw-ai-ver-prune");
         let active_cli = store.paths.active().join("claude-code");
         let slot_a_cli = store.paths.accounts().join("A/profile/claude-code");
         let legacy_cli = store.paths.home.join(".claude-switcher/accounts/A/claude-code");
+        let codex_cask = store.paths.home.join("homebrew/Caskroom/codex");
         fs::create_dir_all(active_cli.join("2.1.9")).unwrap();
         fs::create_dir_all(active_cli.join("2.1.10")).unwrap();
         fs::create_dir_all(slot_a_cli.join("2.1.8")).unwrap();
         fs::create_dir_all(legacy_cli.join("2.0.5")).unwrap();
+        fs::create_dir_all(codex_cask.join("0.160.0")).unwrap();
+        fs::create_dir_all(codex_cask.join("0.170.0")).unwrap();
         fs::write(active_cli.join("2.1.9/bin"), vec![1u8; 4096]).unwrap();
         fs::write(active_cli.join("2.1.10/bin"), vec![2u8; 4096]).unwrap();
         fs::write(slot_a_cli.join("2.1.8/bin"), vec![3u8; 2048]).unwrap();
         fs::write(legacy_cli.join("2.0.5/bin"), vec![4u8; 1024]).unwrap();
+        fs::write(codex_cask.join("0.160.0/codex"), vec![5u8; 8192]).unwrap();
+        fs::write(codex_cask.join("0.170.0/codex"), vec![6u8; 8192]).unwrap();
         // Symlink decoy must be ignored and never deleted.
         let decoy_target = home.join("keep-me");
         fs::create_dir_all(&decoy_target).unwrap();
@@ -835,6 +1253,16 @@ mod tests {
         assert!(active_cli.join("2.1.10/bin").exists());
         assert!(decoy_target.join("precious").exists());
         assert!(legacy_cli.join("2.0.5/bin").exists());
+
+        // ChatGPT / Codex standalone old version pruning
+        let gpt_err = prune_product_cli(&store, "chatgpt", true, true).unwrap_err();
+        assert_eq!(gpt_err.code, "chatgpt_running");
+        let gpt_applied = prune_product_cli(&store, "chatgpt", false, true).unwrap();
+        assert_eq!(gpt_applied["applied"], true);
+        assert_eq!(gpt_applied["pruned_versions"], json!(["0.160.0"]));
+        assert_eq!(gpt_applied["freed_bytes"], 8192);
+        assert!(!codex_cask.join("0.160.0").exists());
+        assert!(codex_cask.join("0.170.0/codex").exists());
 
         fs::remove_dir_all(home).unwrap();
     }

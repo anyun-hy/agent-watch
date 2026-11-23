@@ -122,6 +122,7 @@ impl Fixture {
             launch_nonce: uuid::Uuid::new_v4().to_string(),
             executor_boot_id: BOOT.into(),
             script_entry: None, script_fingerprint: None, interpreter: None, interpreter_fingerprint: None, script_source: None,
+            desktop_sandbox_compat_no_sandbox: false, extra_deny_read_write_paths: vec![],
         };
         let mut owned = Owned(Command::new(&self.helper).arg("--launch-json").arg(serde_json::to_string(&request).unwrap())
             .arg("--registration-socket").arg(self.root.join("reg.sock")).stdin(Stdio::null()).spawn().unwrap());

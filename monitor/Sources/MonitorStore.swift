@@ -42,6 +42,7 @@ final class MonitorStore: ObservableObject {
     private var publications: MonitorPublicationObserver?
     private var expiryTask: DispatchWorkItem?
     private var rereadExpiredSnapshot: Double?
+    private var lastAcceptedFreshSnapshotAt: Double?
     private var wakeToken: NSObjectProtocol?
     private var workspaceObserver: WorkspaceAppObserver?
     private var lastBackgroundRead: Date = .distantPast
@@ -306,6 +307,11 @@ final class MonitorStore: ObservableObject {
         // Backend capture time remains authoritative; rereads cannot renew it.
         now = max(receivedAt, Date(timeIntervalSince1970: value.capturedAt))
         error = nil
+        if MonitorSnapshotTiming.isCurrent(capturedAt: value.capturedAt, now: now.timeIntervalSince1970) {
+            lastAcceptedFreshSnapshotAt = value.capturedAt
+        } else {
+            lastAcceptedFreshSnapshotAt = nil
+        }
         let transition = observeDiagnosticContext(from: value, at: receivedAt)
         snapshot = value
         if let channel = value.channelSupervision { channelSubscription.applySnapshot(channel) }
@@ -446,7 +452,18 @@ final class MonitorStore: ObservableObject {
     private func currentDiagnosticContext() -> String? {
         context(from: freshProxy(in: snapshot, at: now))
     }
-    var initializationContext: String? { currentDiagnosticContext() }
+    var initializationContext: String? {
+        context(from: freshInitializationProxy(in: snapshot, at: now))
+    }
+    private func freshInitializationProxy(in snapshot: MonitorSnapshot?, at date: Date) -> ProxySnapshot? {
+        guard error == nil, let snapshot, snapshot.proxyError == nil,
+              lastAcceptedFreshSnapshotAt == snapshot.capturedAt,
+              MonitorSnapshotTiming.isCurrent(capturedAt: snapshot.capturedAt, now: date.timeIntervalSince1970,
+                                              maximumAge: MonitorSnapshotTiming.proxyMaximumAge),
+              let value = snapshot.proxy else { return nil }
+        let age = date.timeIntervalSince1970 - value.observedAt
+        return (0...MonitorSnapshotTiming.proxyMaximumAge).contains(age) ? value : nil
+    }
     func beginInitialization(startSnapshotPolling: Bool = true) {
         initializing = true
         if startSnapshotPolling { start() }

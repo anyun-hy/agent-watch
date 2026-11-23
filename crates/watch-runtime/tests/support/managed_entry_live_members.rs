@@ -110,6 +110,16 @@ int main(int argc, char **argv) {
         let rejected = status();
         assert!(!rejected.current_invocation_verified && rejected.pending_pids.contains(&pid), "{key}: {rejected:?}");
     }
+    let mut helper_role = snapshot.clone();
+    let token = helper_role["families"]["claude"]["active_members"].as_array_mut().unwrap().iter_mut()
+        .find(|token| token["pid"] == pid).unwrap();
+    token["role"] = json!("desktop_helper");
+    fixture.storage.atomic_json(&state, &helper_role).unwrap();
+    let desktop_helper_positive = status();
+    assert_eq!(desktop_helper_positive.active_managed_count, 1, "{desktop_helper_positive:?}");
+    assert!(desktop_helper_positive.current_invocation_verified && desktop_helper_positive.unmanaged_pids.is_empty() && desktop_helper_positive.pending_pids.is_empty());
+    fixture.storage.atomic_json(&state, &snapshot).unwrap();
+
     let mut stale = snapshot.clone();
     let token = stale["families"]["claude"]["active_members"].as_array_mut().unwrap().iter_mut()
         .find(|token| token["pid"] == pid).unwrap();

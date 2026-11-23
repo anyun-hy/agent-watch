@@ -198,7 +198,7 @@ impl Request {
             let product = request.value("product").unwrap_or("claude");
             match (product, action) {
                 ("claude", Some("status" | "current" | "save" | "switch" | "recover" | "import" | "prune-cli")) |
-                ("chatgpt", Some("status" | "identity" | "save" | "switch")) => {}
+                ("chatgpt", Some("status" | "identity" | "save" | "switch" | "prune-cli")) => {}
                 _ => return Err(invalid()),
             }
             if let Some(target) = positionals.first() {
@@ -410,8 +410,11 @@ mod cli_target_contracts {
         assert!(parse(&["account", "prune-cli"]).is_ok());
         let prune_apply = parse(&["account", "prune-cli", "--apply"]).unwrap();
         prune_apply.require_apply().unwrap();
+        let prune_chatgpt = parse(&["account", "prune-cli", "--product", "chatgpt", "--apply"]).unwrap();
+        assert_eq!(prune_chatgpt.namespace()["product"], "chatgpt");
+        prune_chatgpt.require_apply().unwrap();
         assert!(parse(&["account", "prune-cli", "A"]).is_err());
-        assert!(parse(&["account", "prune-cli", "--product", "chatgpt"]).is_err());
+        assert!(parse(&["account", "prune-cli", "A", "--product", "chatgpt"]).is_err());
         for product in ["chatgpt", "claude"] {
             let save = parse(&["account", "save", "B", "--product", product, "--apply"]).unwrap();
             assert_eq!(save.target.as_deref(), Some("B"));

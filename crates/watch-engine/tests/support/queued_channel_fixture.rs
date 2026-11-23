@@ -156,6 +156,8 @@ impl Target {
             interpreter: None,
             interpreter_fingerprint: None,
             script_source: None,
+            desktop_sandbox_compat_no_sandbox: false,
+            extra_deny_read_write_paths: vec![],
         };
         let mut child = Command::new(helper)
             .env_clear()

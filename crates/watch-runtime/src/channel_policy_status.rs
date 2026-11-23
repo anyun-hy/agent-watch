@@ -535,7 +535,7 @@ mod tests {
             let mut stale = value.clone(); *stale.pointer_mut(pointer).unwrap() = json!(123456789);
             assert_ne!(project(&stale, &identity, now)["state"], "protected", "{pointer}");
         }
-        assert_ne!(project(&value, &identity, now+11.0)["state"], "protected");
+        assert_ne!(project(&value, &identity, now + MAX_ENFORCEMENT_RECEIPT_AGE + 1.0)["state"], "protected");
         let mut reused = identity.clone(); reused.start_microseconds += 1;
         assert_ne!(project(&value, &reused, now)["state"], "protected");
         let mut no_endpoint = value.clone(); no_endpoint["families"]["claude"]["coverage_scope"]["gateway_endpoint_protection_verified"] = json!(false);
@@ -767,7 +767,7 @@ mod tests {
         };
         assert_eq!(project(&value, 103.0, true), PolicySyncState::Applied);
         assert_eq!(project(&value, 103.0, false), PolicySyncState::PendingApply);
-        assert_eq!(project(&value, 112.0, true), PolicySyncState::PendingApply);
+        assert_eq!(project(&value, 102.0 + MAX_ENFORCEMENT_RECEIPT_AGE, true), PolicySyncState::PendingApply);
         for pointer in [
             "/executor_boot_id",
             "/saved_policy_version/policy_digest",
@@ -849,7 +849,7 @@ mod tests {
         let (guard, sync) = project(&ahead, 103.0);
         assert_eq!(guard["channel_state"], "blocked");
         assert_eq!(sync, PolicySyncState::PendingApply);
-        let (guard, sync) = project(&value, 111.0);
+        let (guard, sync) = project(&value, 101.0 + MAX_ENFORCEMENT_RECEIPT_AGE);
         assert_eq!(guard["channel_supervision"]["code"], "enforcement_receipt_expired");
         assert_eq!(guard["channel_state"], "pending_verification");
         assert_eq!(sync, PolicySyncState::PendingApply);

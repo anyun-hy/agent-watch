@@ -176,11 +176,13 @@ enum SnapshotProcessTransport {
         source.setRegistrationHandler { exited.signal() }
         source.activate()
         defer { source.cancel() }
-        while exited.wait(timeout: DispatchTime(uptimeNanoseconds: deadline)) == .success {
+        while monotonicNow() < deadline {
             let state = collect()
             guard case .running = state else { return state }
+            let slice = min(deadline, monotonicNow() + nanoseconds(0.05))
+            _ = exited.wait(timeout: DispatchTime(uptimeNanoseconds: slice))
         }
-        return .running
+        return collect()
     }
 
     /// Signals only the direct, still-unreaped child. A PID is never signalled

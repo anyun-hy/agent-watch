@@ -252,6 +252,39 @@ fn guard_round_listener_binding_accepts_explicit_default_port_and_ipv6_but_not_a
         assert_eq!(fixture.sample(&round).1["proxy"],"unknown","a different loopback bind cannot confirm {endpoint}");
     }
     let fixture=Fixture::new(true,false); let round=fixture.sampler().processes_with_system_metadata().unwrap();
-    {let mut state=fixture.source.state.lock().unwrap();state.lsof_missing=true;state.kernel_captured_at=Some(native::now()-4.0);}
+    {let mut state=fixture.source.state.lock().unwrap();state.lsof_missing=true;state.kernel_captured_at=Some(native::now()-(claude_watch_runtime::vpn_observer::DEFAULT_VPN_OBSERVATION_TTL_SECONDS + 1.0));}
     assert_eq!(fixture.sample(&round).1["code"],"proxy_listener_unavailable");
+}
+
+#[test]
+fn guard_round_ignores_transient_same_binary_worker_when_daemon_owner_is_bound() {
+    let fixture = Fixture::new(false, false);
+    let backend = fixture.store.paths.watch().join("runtime/watch-engine");
+    let daemon = fixture.source.state.lock().unwrap().processes[&77].clone();
+    fixture.store.atomic_bytes(
+        &fixture.store.paths.watch().join("state/heartbeat"),
+        format!("{}|{}|{}|ok|GUARD\n", daemon.pid, daemon.start_stamp, native::now().floor()).as_bytes(),
+        0o600,
+    ).unwrap();
+    let round = fixture.sampler().processes_with_system_metadata().unwrap();
+    let source = fixture.source.clone();
+    let backend_for_child = backend.to_string_lossy().into_owned();
+    *fixture.http.effect.lock().unwrap() = Some(Box::new(move || {
+        // Simulate spawning a transient `--channel-audit-worker` subprocess during egress I/O.
+        source.state.lock().unwrap().processes.insert(78, identity(78, 501, backend_for_child));
+    }));
+    let (_, local) = fixture.sample(&round);
+    assert_eq!(local["proxy"], "ok", "transient same-binary worker must not fail guard round: {local}");
+    let newer = fixture.sampler().processes_with_system_metadata().unwrap();
+    assert!(
+        claude_watch_runtime::macos::guard_round_matches_for_owner(&round, &newer, &backend, Some(77)),
+        "guard_round_matches_for_owner must ignore transient same-binary child PID 78"
+    );
+    // Mutating the actual daemon owner PID 77 must still invalidate the round.
+    fixture.source.state.lock().unwrap().processes.get_mut(&77).unwrap().start_microseconds += 1;
+    let mutated = fixture.sampler().processes_with_system_metadata().unwrap();
+    assert!(
+        !claude_watch_runtime::macos::guard_round_matches_for_owner(&round, &mutated, &backend, Some(77)),
+        "daemon owner PID mutation must still invalidate the round"
+    );
 }

@@ -444,6 +444,27 @@ impl<R: ReadRunner> NativeDesktop<R> {
                 }
             }
         }
+        let native_helpers_dir = bundle_root.join("Contents/Resources/native");
+        if let Ok(entries) = fs::read_dir(&native_helpers_dir) {
+            for (index, entry) in entries.enumerate() {
+                if index >= 256 {
+                    return Err(CoreError::new(
+                        "discovery_budget_exhausted",
+                        "应用辅助程序目录超过发现预算",
+                    ));
+                }
+                let Ok(entry) = entry else { continue };
+                if let Ok(canon) = fs::canonicalize(entry.path()) {
+                    if canon.starts_with(bundle_root)
+                        && fs::metadata(&canon).is_ok_and(|m| {
+                            m.is_file() && (m.permissions().mode() & 0o111 != 0)
+                        })
+                    {
+                        results.push(canon);
+                    }
+                }
+            }
+        }
         for rel in [
             "Contents/Resources/codex",
             "Contents/Resources/codex-cli/bin/codex",
@@ -621,6 +642,8 @@ impl<R: ReadRunner> NativeDesktop<R> {
             interpreter: script.as_ref().map(|s| s.interpreter_path.clone()),
             interpreter_fingerprint: script.as_ref().map(|s| s.interpreter_fingerprint.clone()),
             script_source: script.as_ref().map(|s| s.source_proof()),
+            desktop_sandbox_compat_no_sandbox: false,
+            extra_deny_read_write_paths: Vec::new(),
         };
         req.validate()?;
         let req_json = serde_json::to_string(&req).map_err(|_| {
@@ -837,6 +860,21 @@ impl<R: ReadRunner> NativeDesktop<R> {
             }
             profile.configure(&mut command, &mut args);
         }
+        let compat_no_sandbox = spec.requires_no_sandbox_compat();
+        let extra_deny_read_write_paths = if compat_no_sandbox {
+            let home = self
+                .discovery
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|d| d.home_dir())
+                .or_else(|| std::env::var_os("HOME").map(PathBuf::from));
+            home.as_deref()
+                .map(crate::managed_entry::DesktopManagedEntrySpec::compat_deny_read_write_paths)
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         let req = claude_watch_core::controlled_launch::ControlledLaunchRequest {
             entry_id: spec.entry_bundle_id.clone(),
             target: spec.target,
@@ -855,6 +893,8 @@ impl<R: ReadRunner> NativeDesktop<R> {
             interpreter: None,
             interpreter_fingerprint: None,
             script_source: None,
+            desktop_sandbox_compat_no_sandbox: compat_no_sandbox,
+            extra_deny_read_write_paths,
         };
         req.validate()?;
         let req_json = serde_json::to_string(&req).map_err(|_| {
@@ -977,13 +1017,33 @@ impl<R: ReadRunner, T: Transport, S: AuditSystem + ServiceSystem> DesktopRuntime
             let context = before["context_id"].as_str().filter(|s| !s.is_empty())
                 .ok_or_else(|| CoreError::new("missing_context_id", "当前环境上下文无法确认"))?;
             let mut egress = std::collections::BTreeMap::new();
-            for &family in families {
-                let probe = enforcer.probe_via_controlled_diagnostic_channel(family, context, native::now(), |proxy| {
-                    self.network.fast_egress_via(Some(proxy)).data
-                        .ok_or_else(|| CoreError::new("controlled_probe_failed", "受控出口采样失败"))
-                }).map(|(data, evidence)| with_controlled_path_evidence(data, evidence))
-                    .unwrap_or_else(|error| unknown_guard_egress(family, &error.code));
-                egress.insert(family.to_owned(), probe);
+            if families.len() <= 1 {
+                for &family in families {
+                    let probe = enforcer.probe_via_controlled_diagnostic_channel(family, context, native::now(), |proxy| {
+                        self.network.fast_egress_via(Some(proxy)).data
+                            .ok_or_else(|| CoreError::new("controlled_probe_failed", "受控出口采样失败"))
+                    }).map(|(data, evidence)| with_controlled_path_evidence(data, evidence))
+                        .unwrap_or_else(|error| unknown_guard_egress(family, &error.code));
+                    egress.insert(family.to_owned(), probe);
+                }
+            } else {
+                let network = &self.network;
+                let results: Vec<(String, Value)> = std::thread::scope(|scope| {
+                    let handles: Vec<_> = families.iter().map(|&family| {
+                        scope.spawn(move || {
+                            let probe = enforcer.probe_via_controlled_diagnostic_channel(family, context, native::now(), |proxy| {
+                                network.fast_egress_via(Some(proxy)).data
+                                    .ok_or_else(|| CoreError::new("controlled_probe_failed", "受控出口采样失败"))
+                            }).map(|(data, evidence)| with_controlled_path_evidence(data, evidence))
+                                .unwrap_or_else(|error| unknown_guard_egress(family, &error.code));
+                            (family.to_owned(), probe)
+                        })
+                    }).collect();
+                    handles.into_iter().filter_map(|handle| handle.join().ok()).collect()
+                });
+                for (family, probe) in results {
+                    egress.insert(family, probe);
+                }
             }
             let latest = configs.load()?;
             let mut after = self.system.local_from_process_round(&latest, self.desktop.target(), round)?;

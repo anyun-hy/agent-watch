@@ -565,7 +565,10 @@ pub fn classify_role(
             return Some(role(name, label, "runtime_component"));
         }
     }
-    if basename(executable) == "chrome_crashpad_handler" {
+    if matches!(
+        basename(executable),
+        "chrome_crashpad_handler" | "browser_crashpad_handler"
+    ) {
         return Some(role(
             "chromium_crashpad",
             "Chromium 崩溃报告",

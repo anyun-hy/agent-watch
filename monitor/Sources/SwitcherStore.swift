@@ -424,7 +424,7 @@ struct AIDesktopInstallInfo: Decodable, Equatable, Identifiable {
     let version: String
     let build_version: String
     let selected: Bool
-    let seatbelt_incompatible: Bool
+    let sandbox_compat_mode: Bool
     var id: String { path }
 }
 struct AIDesktopVersionsInfo: Decodable, Equatable {
@@ -432,13 +432,14 @@ struct AIDesktopVersionsInfo: Decodable, Equatable {
     let selected_build: String
     let selected_path: String
     let selected_bundle_id: String
-    let seatbelt_incompatible: Bool
+    let sandbox_compat_mode: Bool
     let installs: [AIDesktopInstallInfo]
     let multiple_versions: Bool
 }
 struct AICliInstallInfo: Decodable, Equatable, Identifiable {
     let path: String
     let source_kind: String
+    let source_label: String
     let version: String
     let selected: Bool
     var id: String { path }
@@ -446,11 +447,18 @@ struct AICliInstallInfo: Decodable, Equatable, Identifiable {
 struct AICliVersionsInfo: Decodable, Equatable {
     let selected_version: String
     let selected_path: String
+    let selected_source_label: String
     let installs: [AICliInstallInfo]
     let multiple_versions: Bool
+    let redundant_versions: [String]
+    let redundant_bytes: UInt64
 }
-struct EmbeddedClaudeCLIInfo: Decodable, Equatable {
+struct AIEmbeddedCLIVersionsInfo: Decodable, Equatable {
+    let present: Bool
     let latest: String
+    let path: String
+    let source_label: String
+    let bundled_in_app: Bool
     let versions: [String]
     let redundant_versions: [String]
     let redundant_bytes: UInt64
@@ -461,12 +469,23 @@ struct EmbeddedClaudeCLIInfo: Decodable, Equatable {
         return String(format: "%.1f MB", mb)
     }
 }
+struct AIProductVersionsInfo: Decodable, Equatable {
+    let product: String
+    let desktop: AIDesktopVersionsInfo
+    let embedded_cli: AIEmbeddedCLIVersionsInfo
+    let standalone_cli: AICliVersionsInfo
+    let prunable_versions: [String]
+    let prunable_bytes: UInt64
+    let has_warnings: Bool
+
+    var prunableMBText: String {
+        let mb = Double(prunable_bytes) / (1024.0 * 1024.0)
+        return String(format: "%.1f MB", mb)
+    }
+}
 struct AIVersionsReceipt: Decodable, Equatable {
-    let claude_desktop: AIDesktopVersionsInfo
-    let chatgpt_desktop: AIDesktopVersionsInfo
-    let claude_embedded_cli: EmbeddedClaudeCLIInfo
-    let claude_cli: AICliVersionsInfo
-    let codex_cli: AICliVersionsInfo
+    let claude: AIProductVersionsInfo
+    let chatgpt: AIProductVersionsInfo
     let has_multi_version_warnings: Bool
 }
 struct AccountSlotPresentation {
@@ -846,7 +865,8 @@ final class SwitcherStore: ObservableObject {
     @Published private(set) var chatgptVersion = ""
     @Published private(set) var chatgptBuild = ""
     @Published private(set) var aiVersions: AIVersionsReceipt?
-    @Published private(set) var pruneCLIMessage = ""
+    @Published private(set) var pruneCLIMessages: [MonitoredProduct: String] = [:]
+    var pruneCLIMessage: String { pruneCLIMessages[.claude] ?? "" }
     @Published private(set) var loaded = false
     @Published private(set) var hasUnsavedSettings = false
     @Published private(set) var proxyGroups: [String] = []
@@ -1888,7 +1908,8 @@ final class SwitcherStore: ObservableObject {
                 }
                 else if args.first == "logs" { operationLog = "隔离记录：没有访问真实操作日志。" }
                 else if args.starts(with: ["account", "prune-cli"]) {
-                    pruneCLIMessage = "隔离预览：未删除真实内置 Claude Code 目录。"
+                    let targetProduct: MonitoredProduct = args.contains("chatgpt") ? .openAI : .claude
+                    pruneCLIMessages[targetProduct] = "隔离预览：未删除真实 CLI 旧版本目录。"
                 }
                 else if args.starts(with: ["account", "switch"]), args.count > 2 {
                     if args.contains("chatgpt"), let previous = chatGPTAccounts {
@@ -1958,7 +1979,8 @@ final class SwitcherStore: ObservableObject {
                             + "\n仅预览，尚未导入或停用旧后台。"
                     }
                     if args.starts(with: ["account", "prune-cli"]) {
-                        pruneCLIMessage = message
+                        let targetProduct: MonitoredProduct = args.contains("chatgpt") ? .openAI : .claude
+                        pruneCLIMessages[targetProduct] = message
                     }
                     // A preview that cannot be read as a plan must not report
                     // success with an empty action list: the review sheet would
@@ -2063,10 +2085,10 @@ final class SwitcherStore: ObservableObject {
            let encoded = try? JSONSerialization.data(withJSONObject: object),
            let decoded = try? JSONDecoder().decode(AIVersionsReceipt.self, from: encoded) {
             aiVersions = decoded
-            if claudeVersion.isEmpty { claudeVersion = decoded.claude_desktop.selected_version }
-            if claudeBuild.isEmpty { claudeBuild = decoded.claude_desktop.selected_build }
-            if chatgptVersion.isEmpty { chatgptVersion = decoded.chatgpt_desktop.selected_version }
-            if chatgptBuild.isEmpty { chatgptBuild = decoded.chatgpt_desktop.selected_build }
+            if claudeVersion.isEmpty { claudeVersion = decoded.claude.desktop.selected_version }
+            if claudeBuild.isEmpty { claudeBuild = decoded.claude.desktop.selected_build }
+            if chatgptVersion.isEmpty { chatgptVersion = decoded.chatgpt.desktop.selected_version }
+            if chatgptBuild.isEmpty { chatgptBuild = decoded.chatgpt.desktop.selected_build }
         } else {
             aiVersions = nil
         }
@@ -2195,34 +2217,71 @@ final class SwitcherStore: ObservableObject {
             "chatgpt_version": "26.1117.31558",
             "chatgpt_build": "29513",
             "ai_versions": [
-                "claude_desktop": [
-                    "selected_version": "fixture", "selected_build": "fixture",
-                    "selected_path": "/Applications/Claude.app", "selected_bundle_id": "com.anthropic.claudefordesktop",
-                    "seatbelt_incompatible": false,
-                    "installs": [[
-                        "path": "/Applications/Claude.app", "bundle_id": "com.anthropic.claudefordesktop",
-                        "version": "fixture", "build_version": "fixture",
-                        "selected": true, "seatbelt_incompatible": false
-                    ]],
-                    "multiple_versions": false
+                "claude": [
+                    "product": "claude",
+                    "desktop": [
+                        "selected_version": "fixture", "selected_build": "fixture",
+                        "selected_path": "/Applications/Claude.app", "selected_bundle_id": "com.anthropic.claudefordesktop",
+                        "sandbox_compat_mode": false,
+                        "installs": [[
+                            "path": "/Applications/Claude.app", "bundle_id": "com.anthropic.claudefordesktop",
+                            "version": "fixture", "build_version": "fixture",
+                            "selected": true, "sandbox_compat_mode": false
+                        ]],
+                        "multiple_versions": false
+                    ],
+                    "embedded_cli": [
+                        "present": true, "latest": "2.1.328",
+                        "path": "/Users/fixture/Library/Application Support/Claude/claude-code/2.1.328/claude.app/Contents/MacOS/claude",
+                        "source_label": "Claude 桌面端内置目录",
+                        "bundled_in_app": false,
+                        "versions": ["2.1.328"],
+                        "redundant_versions": [], "redundant_bytes": 0, "legacy_redundant_versions": []
+                    ],
+                    "standalone_cli": [
+                        "selected_version": "", "selected_path": "", "selected_source_label": "",
+                        "installs": [], "multiple_versions": false,
+                        "redundant_versions": [], "redundant_bytes": 0
+                    ],
+                    "prunable_versions": [], "prunable_bytes": 0, "has_warnings": false
                 ],
-                "chatgpt_desktop": [
-                    "selected_version": "26.1117.31558", "selected_build": "29513",
-                    "selected_path": "/Applications/ChatGPT.app", "selected_bundle_id": "com.openai.codex",
-                    "seatbelt_incompatible": false,
-                    "installs": [[
-                        "path": "/Applications/ChatGPT.app", "bundle_id": "com.openai.codex",
-                        "version": "26.1117.31558", "build_version": "29513",
-                        "selected": true, "seatbelt_incompatible": false
-                    ]],
-                    "multiple_versions": false
+                "chatgpt": [
+                    "product": "chatgpt",
+                    "desktop": [
+                        "selected_version": "26.1117.31558", "selected_build": "29513",
+                        "selected_path": "/Applications/ChatGPT.app", "selected_bundle_id": "com.openai.codex",
+                        "sandbox_compat_mode": true,
+                        "installs": [[
+                            "path": "/Applications/ChatGPT.app", "bundle_id": "com.openai.codex",
+                            "version": "26.1117.31558", "build_version": "29513",
+                            "selected": true, "sandbox_compat_mode": true
+                        ]],
+                        "multiple_versions": false
+                    ],
+                    "embedded_cli": [
+                        "present": true, "latest": "26.1117.31558",
+                        "path": "/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex",
+                        "source_label": "ChatGPT.app 随包内置",
+                        "bundled_in_app": true,
+                        "versions": ["26.1117.31558"],
+                        "redundant_versions": [], "redundant_bytes": 0, "legacy_redundant_versions": []
+                    ],
+                    "standalone_cli": [
+                        "selected_version": "0.170.0",
+                        "selected_path": "/opt/homebrew/Caskroom/codex/0.170.0/bin/codex",
+                        "selected_source_label": "Homebrew Cask",
+                        "installs": [[
+                            "path": "/opt/homebrew/Caskroom/codex/0.170.0/bin/codex",
+                            "source_kind": "daemon_path",
+                            "source_label": "Homebrew Cask",
+                            "version": "0.170.0",
+                            "selected": true
+                        ]],
+                        "multiple_versions": false,
+                        "redundant_versions": [], "redundant_bytes": 0
+                    ],
+                    "prunable_versions": [], "prunable_bytes": 0, "has_warnings": false
                 ],
-                "claude_embedded_cli": [
-                    "latest": "2.1.328", "versions": ["2.1.328"],
-                    "redundant_versions": [], "redundant_bytes": 0, "legacy_redundant_versions": []
-                ],
-                "claude_cli": ["selected_version": "", "selected_path": "", "installs": [], "multiple_versions": false],
-                "codex_cli": ["selected_version": "", "selected_path": "", "installs": [], "multiple_versions": false],
                 "has_multi_version_warnings": false
             ]
         ]

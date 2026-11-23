@@ -124,22 +124,40 @@ fn observed_identity(identity: &claude_watch_system::ProcessKernelIdentity) -> V
         "start_seconds":identity.start_seconds,"start_microseconds":identity.start_microseconds,"audit_token":identity.audit_token})
 }
 
-fn guard_process_candidate(row: &Value, uid: u32, backend: &std::path::Path) -> bool {
+fn guard_process_candidate(
+    pid: u32,
+    row: &Value,
+    uid: u32,
+    backend: &std::path::Path,
+    backend_owner_pid: Option<u32>,
+) -> bool {
     let executable = row["executable"].as_str().unwrap_or("");
     ((row["uid"] == 0 || row["uid"] == uid) && proxy_mode(executable).is_some())
-        || Some(executable) == backend.to_str()
+        || (Some(executable) == backend.to_str() && backend_owner_pid.is_none_or(|owner| pid == owner))
 }
 
 /// Compare only the proxy/backend set from an in-flight round with a newer
 /// primary observation. Missing or stale input is never an unchanged context.
 pub fn guard_round_matches(current: &ProcessRound, newer: &ProcessRound, backend: &std::path::Path) -> bool {
+    guard_round_matches_for_owner(current, newer, backend, None)
+}
+
+/// Same comparison as `guard_round_matches`, scoped to the single active daemon
+/// owner PID when matching `backend` so transient same-binary subprocesses
+/// (`--channel-audit-worker`, CLI queries) never look like daemon turnover.
+pub fn guard_round_matches_for_owner(
+    current: &ProcessRound,
+    newer: &ProcessRound,
+    backend: &std::path::Path,
+    backend_owner_pid: Option<u32>,
+) -> bool {
     let context = |round: &ProcessRound| -> Option<Value> {
         let observation = round.system_processes.as_ref()?;
         let now = native::now();
         if ![round.observed_at, observation.observed_at].iter()
             .all(|at| (0.0..=crate::process_disposition::INTENT_TTL).contains(&(now - at))) { return None; }
         let processes = observation.processes.as_ref().ok()?.iter()
-            .filter(|(_, row)| guard_process_candidate(row, round.uid, backend))
+            .filter(|(pid, row)| guard_process_candidate(**pid, row, round.uid, backend, backend_owner_pid))
             .map(|(pid, row)| json!({"pid":pid,"uid":row["uid"],"executable":row["executable"],"stamp":row["stamp"],
                 "birth":if row["uid"] == 0 { observation.root_starts.get(pid).map(|start| json!(start)) }
                     else { round.identities.get(pid).map(|identity| json!((identity.start_seconds,identity.start_microseconds))) }}))
@@ -745,12 +763,41 @@ impl<R: ReadRunner, T: Transport, M: Mutator> Macos<R, T, M> {
         }
         Ok(out)
     }
+    fn guard_daemon_owner_pid(&self) -> Option<u32> {
+        let now = native::now();
+        if let Ok(pulse) = crate::services::read_guard_heartbeat(&self.storage) {
+            if let Some((pid, stamp)) = pulse["pid"]
+                .as_u64()
+                .and_then(|pid| u32::try_from(pid).ok())
+                .zip(pulse["start_stamp"].as_str().filter(|stamp| !stamp.is_empty()))
+            {
+                if guard_service_pulse(&pulse, pid, stamp, false, now) {
+                    return Some(pid);
+                }
+            }
+        }
+        self.storage
+            .read_bytes(&self.storage.paths.watch().join("state/heartbeat"), 4096)
+            .ok()
+            .flatten()
+            .and_then(|raw| std::str::from_utf8(&raw).ok().map(str::to_owned))
+            .and_then(|text| {
+                let fields: Vec<_> = text.trim().split('|').collect();
+                (fields.len() == 5 && matches!(fields[3], "ok" | "error"))
+                    .then(|| fields[0].parse::<u32>().ok())
+                    .flatten()
+            })
+    }
     fn guard_process_identities(
         &self, round: &ProcessRound, table: &BTreeMap<u32, Value>, sampler: &Sampler<&R>,
     ) -> Result<Vec<Value>> {
         let changed = || CoreError::new("process_identity_changed", "本轮代理或后台进程身份已经变化或无法复核");
         let backend = self.storage.paths.watch().join("runtime/watch-engine");
-        let candidates = table.iter().filter(|(_, row)| guard_process_candidate(row, round.uid, &backend)).collect::<Vec<_>>();
+        let owner_pid = self.guard_daemon_owner_pid();
+        let candidates = table
+            .iter()
+            .filter(|(pid, row)| guard_process_candidate(**pid, row, round.uid, &backend, owner_pid))
+            .collect::<Vec<_>>();
         let root_pids = candidates.iter().filter_map(|(pid, row)| (row["uid"] == 0).then_some(**pid)).collect::<Vec<_>>();
         // A root helper normally cannot expose a Mach task token to this UID.
         // Keep its existing ps path/UID proof, bound on both sides to the

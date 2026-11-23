@@ -146,7 +146,11 @@ fn main() -> ExitCode {
         }
     };
 
-    let capabilities = match network_policy::capabilities(gw_addr, &extra_deny_ports) {
+    let capabilities = match network_policy::capabilities_with_denied_paths(
+        gw_addr,
+        &extra_deny_ports,
+        &req.extra_deny_read_write_paths,
+    ) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("invalid_nono_policy: {e}");
@@ -161,6 +165,8 @@ fn main() -> ExitCode {
         "network_mode": format!("{:?}", capabilities.network_mode()),
         "dns_enabled": capabilities.dns_enabled(),
         "platform_rules": capabilities.platform_rules(),
+        "desktop_sandbox_compat_no_sandbox": req.desktop_sandbox_compat_no_sandbox,
+        "extra_deny_read_write_paths": req.extra_deny_read_write_paths,
     })) {
         Ok(value) => value,
         Err(error) => {
@@ -236,6 +242,9 @@ fn main() -> ExitCode {
     if req.proxy_adaptation == ProxyAdaptationKind::EnvAndElectronSwitches {
         cmd.arg(format!("--proxy-server={proxy_url}"))
             .arg("--proxy-bypass-list=<-loopback>");
+    }
+    if req.desktop_sandbox_compat_no_sandbox {
+        cmd.arg("--no-sandbox");
     }
 
     let err = cmd.exec();

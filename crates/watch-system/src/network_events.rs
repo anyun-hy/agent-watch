@@ -16,6 +16,7 @@ use std::{
 pub enum NetworkEventKind {
     DarwinNotification(String),
     WatchedFileChanged(PathBuf),
+    WatchedProcessExited(u32),
     WakeSignal,
     ClockDiscontinuity,
     Timeout,
@@ -261,10 +262,117 @@ impl FileEvents {
     }
 }
 
+#[cfg(target_os = "macos")]
+#[derive(Default)]
+struct ProcessEvents {
+    queue: Option<std::os::fd::OwnedFd>,
+    watched: std::collections::BTreeSet<u32>,
+    pending_exited: Vec<u32>,
+}
+
+#[cfg(target_os = "macos")]
+impl ProcessEvents {
+    fn bind(&mut self, pids: &[u32]) {
+        use std::os::fd::FromRawFd;
+        let desired: std::collections::BTreeSet<u32> = pids.iter().copied().filter(|&pid| pid > 1).collect();
+        if desired == self.watched {
+            return;
+        }
+        if desired.is_empty() {
+            if let Some(queue) = &self.queue {
+                let fd = queue.as_raw_fd();
+                for pid in std::mem::take(&mut self.watched) {
+                    let change = libc::kevent {
+                        ident: pid as _,
+                        filter: libc::EVFILT_PROC,
+                        flags: libc::EV_DELETE,
+                        fflags: 0,
+                        data: 0,
+                        udata: std::ptr::null_mut(),
+                    };
+                    let _ = unsafe { libc::kevent(fd, &change, 1, std::ptr::null_mut(), 0, std::ptr::null()) };
+                }
+            } else {
+                self.watched.clear();
+            }
+            return;
+        }
+        if self.queue.is_none() {
+            let fd = unsafe { libc::kqueue() };
+            if fd < 0 { return; }
+            let queue = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
+            if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } < 0 { return; }
+            self.queue = Some(queue);
+        }
+        let queue_fd = self.queue.as_ref().unwrap().as_raw_fd();
+        let removed: Vec<u32> = self.watched.difference(&desired).copied().collect();
+        for pid in removed {
+            let change = libc::kevent {
+                ident: pid as _,
+                filter: libc::EVFILT_PROC,
+                flags: libc::EV_DELETE,
+                fflags: 0,
+                data: 0,
+                udata: std::ptr::null_mut(),
+            };
+            let _ = unsafe { libc::kevent(queue_fd, &change, 1, std::ptr::null_mut(), 0, std::ptr::null()) };
+            self.watched.remove(&pid);
+        }
+        for pid in desired {
+            if self.watched.contains(&pid) {
+                continue;
+            }
+            let change = libc::kevent {
+                ident: pid as _,
+                filter: libc::EVFILT_PROC,
+                flags: libc::EV_ADD | libc::EV_ONESHOT,
+                fflags: libc::NOTE_EXIT,
+                data: 0,
+                udata: std::ptr::null_mut(),
+            };
+            if unsafe { libc::kevent(queue_fd, &change, 1, std::ptr::null_mut(), 0, std::ptr::null()) } == 0 {
+                self.watched.insert(pid);
+            } else if std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+                if !self.pending_exited.contains(&pid) {
+                    self.pending_exited.push(pid);
+                }
+            }
+        }
+    }
+
+    fn take_pending_exited(&mut self) -> Vec<u32> {
+        std::mem::take(&mut self.pending_exited)
+    }
+
+    fn drain(&mut self) -> Vec<u32> {
+        let mut exited = Vec::new();
+        if let Some(queue) = &self.queue {
+            let mut batch = [unsafe { std::mem::zeroed::<libc::kevent>() }; 32];
+            let immediate = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+            let count = unsafe {
+                libc::kevent(queue.as_raw_fd(), std::ptr::null(), 0, batch.as_mut_ptr(), batch.len() as _, &immediate)
+            };
+            if count > 0 {
+                for ev in &batch[..count as usize] {
+                    if let Ok(pid) = u32::try_from(ev.ident) {
+                        self.watched.remove(&pid);
+                        if !exited.contains(&pid) {
+                            exited.push(pid);
+                        }
+                    }
+                }
+            }
+        }
+        exited
+    }
+}
+
 pub struct NetworkEventWatcher {
     registrations: Vec<NotifyRegistration>,
     #[cfg(target_os = "macos")]
     files: FileEvents,
+    #[cfg(target_os = "macos")]
+    processes: ProcessEvents,
     watched_files: BTreeMap<PathBuf, FileFingerprint>,
     check_after_bind: bool,
     retry_binding_at: Option<std::time::Instant>,
@@ -297,6 +405,8 @@ impl NetworkEventWatcher {
             registrations,
             #[cfg(target_os = "macos")]
             files: FileEvents::default(),
+            #[cfg(target_os = "macos")]
+            processes: ProcessEvents::default(),
             watched_files: BTreeMap::new(),
             check_after_bind: false,
             retry_binding_at: None,
@@ -304,6 +414,13 @@ impl NetworkEventWatcher {
             last_wall_clock: Some(std::time::SystemTime::now()),
             last_mono_clock: Some(std::time::Instant::now()),
         }
+    }
+
+    pub fn set_watched_pids(&mut self, pids: &[u32]) {
+        #[cfg(target_os = "macos")]
+        self.processes.bind(pids);
+        #[cfg(not(target_os = "macos"))]
+        let _ = pids;
     }
 
     pub fn watch_file(&mut self, path: impl Into<PathBuf>) {
@@ -385,6 +502,8 @@ impl NetworkEventWatcher {
         if std::mem::take(&mut self.check_after_bind) {
             events.extend(self.poll_file_changes().into_iter().map(NetworkEventKind::WatchedFileChanged));
         }
+        #[cfg(target_os = "macos")]
+        events.extend(self.processes.take_pending_exited().into_iter().map(NetworkEventKind::WatchedProcessExited));
 
         let now_wall = std::time::SystemTime::now();
         let now_mono = std::time::Instant::now();
@@ -413,6 +532,12 @@ impl NetworkEventWatcher {
             pollfds.push(libc::pollfd { fd: fd.as_raw_fd(), events: libc::POLLIN, revents: 0 });
             index
         });
+        #[cfg(target_os = "macos")]
+        let proc_queue_index = self.processes.queue.as_ref().map(|fd| {
+            let index = pollfds.len();
+            pollfds.push(libc::pollfd { fd: fd.as_raw_fd(), events: libc::POLLIN, revents: 0 });
+            index
+        });
         let mut reader_ready = None;
         #[allow(unused_mut)]
         let mut file_event = false;
@@ -424,6 +549,10 @@ impl NetworkEventWatcher {
             if queue_index.is_some_and(|index| pollfds[index].revents != 0) {
                 self.files.drain();
                 file_event = true;
+            }
+            #[cfg(target_os = "macos")]
+            if proc_queue_index.is_some_and(|index| pollfds[index].revents != 0) {
+                events.extend(self.processes.drain().into_iter().map(NetworkEventKind::WatchedProcessExited));
             }
             for (idx, pfd) in pollfds[..readers_start].iter().enumerate() {
                 if pfd.revents & libc::POLLIN != 0 && self.registrations[idx].drain() {
@@ -634,6 +763,35 @@ mod tests {
             .any(|e| e == &NetworkEventKind::WatchedFileChanged(file.clone())));
         drop(watcher);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn watched_process_exit_wakes_immediately() {
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("10")
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id();
+        let mut watcher = NetworkEventWatcher::new(&[]);
+        watcher.set_watched_pids(&[pid]);
+        assert_eq!(watcher.wait(Duration::ZERO), [NetworkEventKind::Timeout]);
+        let killer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(40));
+            let _ = child.kill();
+            let _ = child.wait();
+        });
+        let started = std::time::Instant::now();
+        let events = watcher.wait(Duration::from_secs(3));
+        killer.join().unwrap();
+        assert!(
+            events.contains(&NetworkEventKind::WatchedProcessExited(pid)),
+            "expected WatchedProcessExited({pid}), got {events:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "process exit event must wake promptly"
+        );
     }
 }
 

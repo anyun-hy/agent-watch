@@ -16,8 +16,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 
-pub const DEFAULT_PERMIT_TTL: f64 = 10.0;
-pub const MAX_ENFORCEMENT_RECEIPT_AGE: f64 = 10.0;
+pub const DEFAULT_PERMIT_TTL: f64 = 60.0;
+pub const MAX_ENFORCEMENT_RECEIPT_AGE: f64 = 60.0;
 pub const CLOCK_ROLLBACK_TOLERANCE_SECONDS: f64 = 0.05;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -325,6 +325,20 @@ impl BoundProcessToken {
 
     pub fn has_verified_audit_token(&self) -> bool {
         self.has_valid_identity() && self.audit_token.is_some()
+    }
+
+    /// Strict kernel-identity equality across verified tokens, independent of
+    /// classification labels such as `ProcessRole::DesktopHelper` vs `ProcessRole::Child`.
+    pub fn same_verified_kernel_identity(&self, other: &Self) -> bool {
+        self.has_verified_audit_token()
+            && other.has_verified_audit_token()
+            && self.matches_process(
+                other.pid,
+                other.uid,
+                other.start_seconds,
+                other.start_microseconds,
+                other.audit_token.as_ref(),
+            )
     }
 
     pub fn matches_process(
@@ -1435,14 +1449,15 @@ mod tests {
                 status_label_zh: "执行失败".into(),
             }
         );
-        // Delayed receipt evaluated at receiver_now = 1012.0 (age = 10.0s >= MAX_ENFORCEMENT_RECEIPT_AGE 10.0s)
+        // Delayed receipt evaluated at receiver_now = observed_at + MAX_ENFORCEMENT_RECEIPT_AGE
+        let expired_at = receipt.observed_at + MAX_ENFORCEMENT_RECEIPT_AGE;
         assert_eq!(
             evaluate_channel_supervision_with_boot_id(
                 &permit,
                 Some(&receipt),
                 &v1,
                 Some("boot-1"),
-                1012.0,
+                expired_at,
             ),
             ChannelSupervisionVerdict::EnforcementFailed {
                 code: "enforcement_receipt_expired".into(),
@@ -1450,7 +1465,7 @@ mod tests {
             }
         );
         let expired = evaluate_channel_supervision_with_boot_id(
-            &permit, Some(&receipt), &v1, Some("boot-1"), 1012.0,
+            &permit, Some(&receipt), &v1, Some("boot-1"), expired_at,
         );
         assert_eq!(expired.display_state(), ChannelMonitorDisplayState::PendingVerification);
         let wrong_executor = evaluate_channel_supervision_with_boot_id(
@@ -1540,6 +1555,32 @@ mod tests {
                 &raw, Some("s1"), &version, "ctx-1", 3, 6, 1006.0, 10.0).unwrap_err().code,
                 "legacy_network_backend_removed");
         }
+    }
+
+    #[test]
+    fn verified_kernel_identity_matches_desktop_helper_and_child_roles_strictly() {
+        let helper = BoundProcessToken::with_system_identity(29266, 501, 1_795_417_299, 799_646, ProcessRole::DesktopHelper)
+            .with_audit_token([501, 501, 20, 501, 20, 29266, 100016, 141_272_659]);
+        let child = BoundProcessToken::with_system_identity(29266, 501, 1_795_417_299, 799_646, ProcessRole::Child)
+            .with_audit_token([501, 501, 20, 501, 20, 29266, 100016, 141_272_659]);
+        assert_ne!(helper, child, "struct equality still distinguishes roles");
+        assert!(helper.same_verified_kernel_identity(&child));
+        assert!(child.same_verified_kernel_identity(&helper));
+
+        let mut reexec = child.clone();
+        reexec.audit_token.as_mut().unwrap()[7] += 1;
+        assert!(!helper.same_verified_kernel_identity(&reexec));
+
+        let unverified = BoundProcessToken::with_system_identity(29266, 501, 1_795_417_299, 799_646, ProcessRole::Child);
+        assert!(!helper.same_verified_kernel_identity(&unverified));
+
+        let role = crate::processes::classify_role(
+            &["/Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/158.0.8127.37/Helpers/browser_crashpad_handler".into()],
+            "/Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/158.0.8127.37/Helpers/browser_crashpad_handler",
+            &[],
+            |_| None,
+        );
+        assert_eq!(role.as_ref().map(|r| r.runtime_role.as_str()), Some("chromium_crashpad"));
     }
 
 }

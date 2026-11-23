@@ -299,8 +299,7 @@ impl<R: ReadRunner> SnapshotPublisher<R> {
             && matches!(
                 self.last_activity["state"].as_str(),
                 Some("ok" | "no_targets")
-            )
-            && (processes.targets.is_empty() || self.last_activity["bytes"]["state"] != "empty");
+            );
         let registration = registration(&self.store, &self.sampler.runner, self.producer.uid)
             .unwrap_or_else(|_| registration_unknown());
         let mut snapshot = monitor_snapshot::with_registration(
@@ -771,7 +770,7 @@ mod tests {
         let next = publisher.poll("", "", true).unwrap();
         assert_eq!(next["proxy"]["connectionObservation"]["collectorState"], "empty");
         assert_eq!(next["samplingDiagnostics"]["bytes_state"], "empty");
-        assert_eq!(next["health"]["state"], "degraded");
+        assert_eq!(next["health"]["state"], "running");
         let network_deadline = publisher.next_network_review().unwrap();
         std::thread::sleep(Duration::from_millis(10));
         let proxy_file = store.paths.watch().join("state/proxy-snapshot.json");
