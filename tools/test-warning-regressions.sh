@@ -13,12 +13,8 @@ command -v cargo >/dev/null || { echo 'cargo is required; no tests have run.' >&
 cargo check --locked -p claude-watch-runtime -p claude-watch-engine
 cargo test --locked -p claude-watch-core --test probe_independence_regressions -- --nocapture
 cargo test --locked -p claude-watch-core --test probe_drift_contracts -- --nocapture
-cargo test --locked -p claude-watch-runtime --lib controlled::warning_regressions -- --nocapture
-cargo test --locked -p claude-watch-runtime --lib controlled::guard_regressions -- --nocapture
-# Exact selection: all three use Fake::default with no owned child or signal.
-for test_name in \
-  invalid_configuration_reports_without_authorising_a_stop \
-  warn_configured_drift_resumes_supervision_once_recovered \
-  the_openai_family_is_supervised_and_closed_on_confirmed_drift; do
-  cargo test --locked -p claude-watch-runtime --test controlled_contracts "$test_name" -- --exact --nocapture
-done
+bash tools/run-exact-runtime-tests.sh controlled_contracts \
+  invalid_config_guard_reports_unknown_and_preserves_session
+bash tools/run-exact-runtime-tests.sh channel_pipeline_contracts \
+  independent_current_risks_keep_their_configured_action_and_warn_recovers_without_rebasing \
+  managed_multi_main_membership_preserves_continuity_and_fast_risk_across_join_exit_and_pid_reuse

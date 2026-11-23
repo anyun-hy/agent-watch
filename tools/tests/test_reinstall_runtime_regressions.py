@@ -1,11 +1,14 @@
 """Exercise build entry points and the collector parent using private fixtures."""
+import contextlib
 import hashlib
 import json
 import os
 from pathlib import Path
 import platform
+import select
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -137,7 +140,75 @@ for name in ("watch-native-observer", "watch-process-control", "watch-sandbox-la
 
 @unittest.skipUnless(sys.platform == "darwin", "native zsh supervisor")
 class ListenerSupervisorRegression(unittest.TestCase):
-    def fixture(self, root, *, immediate_exit=False, trap_delay=False):
+    @contextlib.contextmanager
+    def native_collector(self):
+        with tempfile.TemporaryDirectory(prefix="cw-collector-events-", dir="/private/tmp") as private:
+            path = Path(private) / "input"
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
+                listener.bind(str(path))
+                listener.listen(1)
+                listener.settimeout(5)
+                script = ROOT / "monitor/Resources/watch-native-collector.zsh"
+                proc = subprocess.Popen(
+                    ["/bin/zsh", "-f", str(script), "--collect", str(os.getpid())],
+                    env=dict(os.environ, CW_NATIVE_LISTENER_SOCKET=str(path)),
+                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                )
+                try:
+                    peer, _ = listener.accept()
+                    with peer:
+                        peer.settimeout(5)
+                        yield proc, peer, path.parent / "sample"
+                finally:
+                    if proc.poll() is None:
+                        proc.terminate()
+                    try:
+                        proc.communicate(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        proc.communicate()
+                        raise
+
+    def read_native_frame(self, stream, collector_pid, sequence):
+        fields = stream.readline(256).split()
+        self.assertEqual(len(fields), 13)
+        self.assertEqual(fields[0], b"CWLISTENER1")
+        self.assertEqual(list(map(int, fields[1:4])), [os.getpid(), collector_pid, sequence])
+        self.assertLessEqual(float(fields[4]), float(fields[5]))
+        sizes = list(map(int, fields[9:13]))
+        self.assertTrue(all(0 <= size <= 4000 * 512 for size in sizes))
+        remaining = sum(sizes)
+        while remaining:
+            data = stream.read(min(65536, remaining))
+            self.assertTrue(data, "incomplete native sample")
+            remaining -= len(data)
+        self.assertEqual(stream.read(1), b"\n")
+
+    def test_collector_samples_only_on_request_and_stops_on_eof(self):
+        with self.native_collector() as (proc, peer, sample):
+            with peer.makefile("rb", buffering=0) as stream:
+                self.assertFalse(select.select([peer], [], [], 0.2)[0], "unsolicited bootstrap frame")
+                self.assertFalse((sample / "before").exists(), "sample started before bootstrap request")
+                peer.sendall(b"S")
+                self.read_native_frame(stream, proc.pid, 1)
+                initial_stamp = (sample / "before").stat().st_mtime_ns
+                self.assertFalse(select.select([peer], [], [], 2.6)[0], "unsolicited periodic frame")
+                self.assertEqual((sample / "before").stat().st_mtime_ns, initial_stamp, "idle input was sampled")
+                peer.sendall(b"S")
+                self.read_native_frame(stream, proc.pid, 2)
+                peer.shutdown(socket.SHUT_WR)
+                self.assertEqual(stream.read(1), b"", "request EOF must close output")
+                self.assertEqual(proc.wait(timeout=3), 0)
+                self.assertFalse(sample.exists(), "collector must clean up its private evidence")
+
+    def test_collector_rejects_unknown_request_without_sampling(self):
+        with self.native_collector() as (proc, peer, sample):
+            peer.sendall(b"X")
+            self.assertNotEqual(proc.wait(timeout=3), 0)
+            self.assertEqual(peer.recv(1), b"", "invalid request produced native evidence")
+            self.assertFalse(sample.exists())
+
+    def fixture(self, root, *, immediate_exit=False, trap_delay=False, stalled_collector=False):
         collector = root / "watch-native-collector.zsh"
         shutil.copy2(ROOT / "monitor/Resources/watch-native-collector.zsh", collector)
         if trap_delay:
@@ -147,6 +218,15 @@ class ListenerSupervisorRegression(unittest.TestCase):
             needle = "trap 'stop_supervised_worker' HUP INT TERM"
             self.assertEqual(source.count(needle), 1)
             collector.write_text(source.replace(needle, "trap 'stop_supervised_worker; /bin/sleep 0.15' HUP INT TERM"))
+        if stalled_collector:
+            needle = "  local seq=0"
+            source = collector.read_text()
+            self.assertEqual(source.count(needle), 1)
+            collector.write_text(source.replace(needle, """
+  zmodload zsh/zselect || exit 75
+  print -r -- "$CW_NATIVE_LISTENER_SOCKET" > "$TMPDIR/connected"
+  zselect -t 1500
+""" + needle))
         collector.chmod(0o700)
         engine = root / "watch-engine"
         engine.write_text(f"#!{sys.executable}\n" + ("raise SystemExit(23)\n" if immediate_exit else r'''
@@ -165,6 +245,16 @@ while not stopping and time.monotonic() < until:
 if stopping:
     (root / "stopped").write_text(str(os.getpid()))
 '''))
+        if stalled_collector:
+            engine.write_text(f"#!{sys.executable}\n" + """
+from pathlib import Path
+import time
+marker = Path(__file__).parent / 'connected'
+until = time.monotonic() + 3
+while not marker.exists() and time.monotonic() < until:
+    time.sleep(0.01)
+raise SystemExit(23 if marker.exists() else 75)
+""")
         engine.chmod(0o700)
         env = dict(os.environ, TMPDIR=str(root))
         return subprocess.Popen(["/bin/zsh", "-f", str(collector), "daemon", "--apply"],
@@ -194,6 +284,20 @@ if stopping:
                 ordinary.terminate()
                 ordinary.wait(timeout=2)
 
+    def test_independent_worker_exit_reaps_stalled_collector_and_endpoint(self):
+        with tempfile.TemporaryDirectory(prefix="cw-collector-stalled-") as directory:
+            root = Path(directory).resolve()
+            parent = self.fixture(root, stalled_collector=True)
+            try:
+                stdout, stderr = parent.communicate(timeout=5)
+                self.assertEqual(parent.returncode, 23, (stdout, stderr))
+                socket = Path((root / "connected").read_text().strip())
+                self.assertFalse(socket.parent.exists())
+            finally:
+                if parent.poll() is None:
+                    parent.terminate()
+                    parent.communicate(timeout=5)
+
     def test_normal_worker_exit_status_is_preserved(self):
         with tempfile.TemporaryDirectory(prefix="cw-collector-exit-") as directory:
             parent = self.fixture(Path(directory).resolve(), immediate_exit=True)
@@ -203,28 +307,101 @@ if stopping:
 
 @unittest.skipUnless(sys.platform == "darwin", "native macOS observation helpers")
 class NativeDaemonStartupRegression(unittest.TestCase):
-    def test_private_daemon_keeps_publishing_during_partial_discovery_and_stops_its_original_worker(self):
+    def native_runtime(self, root):
         engine = Path(os.environ.get("CW_REINSTALL_TEST_ENGINE", ROOT / "target/debug/claude-watch-engine"))
         if not engine.is_file():
             self.skipTest("build claude-watch-engine first; unified runner supplies this prerequisite")
         paths = subprocess.run([str(engine), "--component-paths"], capture_output=True, text=True, timeout=5)
         self.assertEqual(paths.returncode, 0, paths.stderr)
         components = json.loads(paths.stdout)
+        runtime, home = root / "runtime", root / "home"
+        runtime.mkdir(); home.mkdir()
+        runtime_artifacts = {}
+        for name, source in [("watch-engine", engine), ("watch-native-observer", Path(components["native_observer"])),
+                             ("watch-process-control", Path(components["process_control"])),
+                             ("watch-native-collector.zsh", ROOT / "monitor/Resources/watch-native-collector.zsh")]:
+            shutil.copy2(source, runtime / name)
+            (runtime / name).chmod(0o700)
+            actual_hash = hashlib.sha256((runtime / name).read_bytes()).hexdigest()
+            source_hash = hashlib.sha256(source.read_bytes()).hexdigest()
+            self.assertEqual(actual_hash, source_hash)
+            runtime_artifacts[name] = {"path":str(runtime / name), "sha256":actual_hash,
+                                       "source_path":str(source), "source_sha256":source_hash}
+        return runtime, home, runtime_artifacts
+
+    def test_collector_disconnect_replaces_only_verified_child(self):
+        with tempfile.TemporaryDirectory(prefix="cw-native-reconnect-", dir="/private/tmp") as directory:
+            runtime, home, _ = self.native_runtime(Path(directory))
+            env = {k: v for k, v in os.environ.items() if not k.startswith(("CW_", "WATCH_"))}
+            env.update(HOME=str(home), TMPDIR=directory)
+            parent = subprocess.Popen(["/bin/zsh", "-f", str(runtime / "watch-native-collector.zsh"),
+                                       "--home", str(home), "daemon", "--apply", "--observe-only"],
+                                      stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+            cache = home / "Library/Application Support/ClaudeWatch/state/native-listener.json"
+            def wait_for(predicate):
+                until = time.monotonic() + 12
+                record = {}
+                while time.monotonic() < until and parent.poll() is None:
+                    if cache.exists():
+                        record = json.loads(cache.read_bytes())
+                        if predicate(record):
+                            return record
+                    time.sleep(0.025)
+                self.fail(f"private worker stopped or failed to publish, status={parent.poll()}, cache error={record.get('error')}")
+            def completed_sample(record):
+                # A non-launchd test parent can receive the macOS header-only
+                # netstat view. This code requires a complete authenticated
+                # frame and intentionally leaves the VPN closed.
+                return record.get("listener") or (record.get("error") or {}).get("code") == "native_listener_empty"
+            def collector_identity(record):
+                if record.get("listener"):
+                    return record["listener"]["proof"]["collector"]
+                response = subprocess.run([str(runtime / "watch-native-observer"), "inventory"], capture_output=True,
+                                          text=True, timeout=12, check=True, env=env)
+                children = [row for row in json.loads(response.stdout)["processes"]
+                            if row["parent"] == parent.pid and row["executable"] == "/bin/zsh"]
+                self.assertEqual(len(children), 1)
+                return children[0]
+            try:
+                before = wait_for(completed_sample)
+                actor = before["actor"]
+                self.assertEqual(actor["supervisor"]["pid"], parent.pid)
+                # Hold only this test's supervisor so its replacement cannot
+                # overtake observation of the input's actual disconnect.
+                parent.send_signal(signal.SIGSTOP)
+                collector = collector_identity(before)
+                self.assertEqual((collector["parent"], collector["executable"]), (parent.pid, "/bin/zsh"))
+                check = subprocess.run([str(runtime / "watch-native-observer"), "arguments"],
+                                       input=json.dumps({"schema":1, "round_id":"owned-collector-stop", "targets":[collector]}),
+                                       text=True, capture_output=True, timeout=3, check=True, env=env)
+                argument = json.loads(check.stdout)["argument_prefixes"][0]
+                self.assertEqual(argument.get("identity"), collector)
+                self.assertEqual(argument.get("arguments"), ["/bin/zsh", "-f", str(runtime / "watch-native-collector.zsh"),
+                                                           "--collect", str(parent.pid)])
+                os.kill(collector["pid"], signal.SIGTERM)
+                failed = wait_for(lambda r: (r.get("error") or {}).get("code") == "native_listener_closed")
+                self.assertIsNone(failed["listener"])
+                self.assertEqual(failed["actor"], actor)
+                parent.send_signal(signal.SIGCONT)
+                after = wait_for(completed_sample)
+                self.assertNotEqual(collector_identity(after), collector)
+                self.assertEqual(after["actor"], actor)
+                self.assertGreater(after["published_at"], failed["published_at"])
+                if before.get("listener"):
+                    self.assertTrue(after.get("listener"))
+                    self.assertGreater(after["listener"]["evidence"]["finished"], before["listener"]["evidence"]["finished"])
+                print("private native collector reconnect: original worker and supervisor retained, post-reconnect sample =",
+                      "listener" if after.get("listener") else after["error"]["code"])
+            finally:
+                if parent.poll() is None:
+                    parent.send_signal(signal.SIGCONT)
+                    parent.terminate()
+                parent.communicate(timeout=6)
+
+    def test_private_daemon_keeps_publishing_during_partial_discovery_and_stops_its_original_worker(self):
         with tempfile.TemporaryDirectory(prefix="cw-native-startup-", dir="/private/tmp") as directory:
             root = Path(directory)
-            runtime, home = root / "runtime", root / "home"
-            runtime.mkdir(); home.mkdir()
-            runtime_artifacts = {}
-            for name, source in [("watch-engine", engine), ("watch-native-observer", Path(components["native_observer"])),
-                                 ("watch-process-control", Path(components["process_control"])),
-                                 ("watch-native-collector.zsh", ROOT / "monitor/Resources/watch-native-collector.zsh")]:
-                shutil.copy2(source, runtime / name)
-                (runtime / name).chmod(0o700)
-                actual_hash = hashlib.sha256((runtime / name).read_bytes()).hexdigest()
-                source_hash = hashlib.sha256(source.read_bytes()).hexdigest()
-                self.assertEqual(actual_hash, source_hash)
-                runtime_artifacts[name] = {"path":str(runtime / name), "sha256":actual_hash,
-                                           "source_path":str(source), "source_sha256":source_hash}
+            runtime, home, runtime_artifacts = self.native_runtime(root)
             for index in range(24):
                 bundle = home / f"Applications/Private {index:02}.app/Contents"
                 (bundle / "MacOS").mkdir(parents=True)
@@ -302,6 +479,7 @@ class NativeDaemonStartupRegression(unittest.TestCase):
                 self.assertEqual(readback.returncode, 0, readback.stderr)
                 self.assertEqual(json.loads(readback.stdout)["health"]["state"], "unavailable", "unregistered private publisher must fail the normal launchd verifier")
                 captures, proxy_samples, ages = set(), set(), []
+                sampling_rounds = []
                 sustained_started = time.monotonic()
                 until = sustained_started + 16
                 next_children = sustained_started
@@ -310,6 +488,15 @@ class NativeDaemonStartupRegression(unittest.TestCase):
                     self.assertEqual(current["producer"], producer)
                     view = current["snapshot"]
                     capture = view["capturedAt"]
+                    if capture not in captures:
+                        diag = view.get("samplingDiagnostics") or {}
+                        network_at = diag.get("network_sampled_at")
+                        sampling_rounds.append({
+                            "since_bootstrap": round(capture - snapshot["capturedAt"], 2),
+                            "network_since_bootstrap": round(network_at - snapshot["capturedAt"], 2) if network_at is not None else None,
+                            "reused": diag.get("network_reused"),
+                            "error": diag.get("publisher_error_code"),
+                        })
                     captures.add(capture)
                     ages.append(time.time() - capture)
                     proxy = view.get("proxy") or {}
@@ -322,7 +509,7 @@ class NativeDaemonStartupRegression(unittest.TestCase):
                     time.sleep(0.1)
                 self.assertIsNone(parent.poll(), "private daemon must remain alive throughout observation")
                 self.assertGreaterEqual(len(captures), 6, "need sustained fresh rounds, not just the bootstrap heartbeat")
-                self.assertGreaterEqual(len(proxy_samples), 2, "need two actual proxy observations, not rereads stamped fresh")
+                self.assertGreaterEqual(len(proxy_samples), 2, f"need two actual proxy observations, not rereads stamped fresh; rounds={sampling_rounds}")
                 sustained_seconds = time.monotonic() - sustained_started
                 owned_rows()
                 stopped = time.monotonic()
@@ -333,9 +520,8 @@ class NativeDaemonStartupRegression(unittest.TestCase):
                 ended = identity()
                 self.assertEqual((ended["state"], ended["code"]), ("unknown", "process_exited"))
                 remaining = owned_rows()
-                # The collector owns a two-second sampling interval and exits
-                # after its reader closes. Include that actual descendant
-                # cleanup in the existing five-second shutdown budget.
+                # The collector may be waiting for a request or finishing one.
+                # Include actual descendant exit in the five-second stop budget.
                 while remaining and time.monotonic() - stopped < 5:
                     time.sleep(0.05)
                     remaining = owned_rows()

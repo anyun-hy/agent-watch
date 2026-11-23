@@ -12,9 +12,8 @@ use claude_watch_core::{
 };
 use claude_watch_runtime::{
     managed_entry::{
-        build_claude_code_process_wrapper_plan, classify_process_protection_state,
-        execute_cli_via_sandbox_launcher_with_stdin, is_script_file, prepare_desktop_managed_launch,
-        resolve_real_cli_skipping_shim, resolve_script_launcher_context, snapshot_running_processes,
+        classify_process_protection_state, is_script_file, prepare_desktop_managed_launch,
+        resolve_script_launcher_context, snapshot_running_processes,
         stage_cli_entry_shim, stage_desktop_entry_bundle, DesktopEntryPreparation,
         DesktopManagedEntrySpec,
     },
@@ -26,7 +25,6 @@ use claude_watch_runtime::{
 };
 use claude_watch_system::{effective_uid, sha256_file_hex, SandboxPeerVerifier};
 use std::{
-    collections::BTreeMap,
     fs,
     net::{SocketAddr, TcpListener, TcpStream},
     os::unix::fs::PermissionsExt,
@@ -60,6 +58,65 @@ fn test_policy_version() -> PolicyVersion {
         policy_digest: "policy-entry-v1".into(),
         guard_policy_digest: "guard-entry-v1".into(),
     }
+}
+
+/// Read only the supplied installed build. No application or helper is executed.
+#[test]
+#[ignore = "requires a read-only path to the observed ChatGPT build 28661"]
+fn chatgpt_28661_installed_components_block_both_desktop_aliases() {
+    use claude_watch_core::processes::Kind;
+    use claude_watch_runtime::{commands::SystemRunner, desktop_native::NativeDesktop, macos::Authority,
+        target_discovery::DiscoveryHandle};
+    use claude_watch_runtime::managed_entry_activation::{EntrySource, ManagedEntryActivationManager};
+    let installed = std::env::var_os("CW_COMPATIBILITY_TEST_BUNDLE").expect("set the installed bundle path");
+    let (tmp, storage) = make_temp_store("cw-aperitif-preflight");
+    let helper = tmp.0.join("watch-process-control");
+    fs::write(&helper, []).unwrap();
+    let mut desktop = NativeDesktop::new(SystemRunner::development().unwrap(), helper, Authority::ExplicitPermit).unwrap();
+    desktop.set_discovery(DiscoveryHandle::for_home(&storage.paths.home));
+    let manager = ManagedEntryActivationManager::new(storage, "/unused".into(), "/unused".into(), None);
+    for target in [LaunchTarget::ChatgptDesktop, LaunchTarget::CodexDesktop] {
+        desktop.select_target_source(target, Path::new(&installed)).unwrap();
+        let spec = desktop.build_managed_entry_spec().unwrap();
+        let error = spec.check_seatbelt_compatibility().unwrap_err();
+        assert_eq!(error.code, "desktop_sandbox_incompatible");
+        let refused = desktop.open_via_sandbox_launcher(
+            &tmp.0.join("absent-launcher"), &tmp.0.join("absent-socket"), "127.0.0.1:1", "fixture",
+            test_policy_version(), None, None,
+        ).unwrap_err();
+        assert_eq!(refused.code, error.code);
+        let source = EntrySource::Desktop { spec: spec.clone(), kind: Kind::OpenaiMain };
+        let preview = manager.preview(target, &source).unwrap();
+        assert!(preview.conflict_detected && preview.conflict_reason == Some(error.message));
+        assert_eq!(manager.activate(target, &source, &Default::default()).unwrap_err().code, "desktop_sandbox_incompatible");
+        assert!(!preview.destination_path.exists());
+        let mut changed = spec;
+        changed.target_fingerprint = "f".repeat(64);
+        assert!(changed.check_seatbelt_compatibility().is_ok());
+    }
+}
+
+#[test]
+fn chatgpt_known_main_with_changed_aperitif_components_is_unverified() {
+    let (tmp, _) = make_temp_store("cw-aperitif-update");
+    let framework = tmp.0.join("Contents/Frameworks/Codex Framework.framework/Versions/Current");
+    let helper = framework.join("Helpers/Codex (Aperitif).app/Contents/MacOS/Codex (Aperitif)");
+    let library = framework.join("Libraries/libaperitif.dylib");
+    let mut spec = DesktopManagedEntrySpec {
+        entry_bundle_id: DesktopManagedEntrySpec::entry_bundle_id_for(LaunchTarget::ChatgptDesktop).into(),
+        target: LaunchTarget::ChatgptDesktop, target_bundle_id: "com.openai.codex".into(),
+        target_bundle_path: fs::canonicalize(&tmp.0).unwrap(), target_executable: tmp.0.join("unused"),
+        target_fingerprint: "00305cecf34970bd6fffcd108812bb88888fbb89447ffb7d3bf966a43319a13f".into(),
+        proxy_adaptation: ProxyAdaptationKind::EnvAndElectronSwitches,
+    };
+    assert_eq!(spec.check_seatbelt_compatibility().unwrap_err().code, "desktop_compatibility_unverified");
+    for (path, size) in [(helper, 51_568), (library, 85_456)] {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, vec![0; size]).unwrap();
+    }
+    assert_eq!(spec.check_seatbelt_compatibility().unwrap_err().code, "desktop_compatibility_unverified");
+    spec.target_fingerprint = "f".repeat(64);
+    assert!(spec.check_seatbelt_compatibility().is_ok());
 }
 
 #[test]
@@ -360,142 +417,38 @@ fn d03_and_d04_direct_child_inherits_protection_while_out_of_tree_launchd_proces
 }
 
 #[test]
-fn c01_cli_shim_skips_self_in_path_streams_stdin_stdout_stderr_and_executes_via_watch_sandbox_launcher() {
-    let (tmp, store) = make_temp_store("cw-entry-c01");
-    let shim_dir = tmp.0.join("shim-bin");
-    let real_dir = tmp.0.join("real-bin");
-    let work_dir = tmp.0.join("workspace");
-    fs::create_dir_all(&shim_dir).unwrap();
-    fs::create_dir_all(&real_dir).unwrap();
-    fs::create_dir_all(&work_dir).unwrap();
-
-    // Stage production CLI shim at `shim_dir/claude`
-    let fake_watch = tmp.0.join("claude-watch");
-    fs::write(&fake_watch, b"#!/bin/sh\nexit 0\n").unwrap();
-    fs::set_permissions(&fake_watch, fs::Permissions::from_mode(0o755)).unwrap();
-    let shim_claude =
-        stage_cli_entry_shim(&shim_dir, LaunchTarget::ClaudeCli, &fake_watch).expect("stage shim");
-
-    // This transport contract uses an owned native CLI. Arbitrary shell scripts
-    // intentionally require a supported, discovered script source proof; they
-    // are not a valid positive fixture for the native launch API.
-    let real_claude = real_dir.join("claude");
-    let native_source = tmp.0.join("owned_cli.c");
-    fs::write(
-        &native_source,
-        r#"#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <unistd.h>
-int main(int argc, char **argv) {
-    char input[256], cwd[4096];
-    if (!fgets(input, sizeof(input), stdin) || !getcwd(cwd, sizeof(cwd))) return 70;
-    input[strcspn(input, "\n")] = 0;
-    printf("STDIN=%s\nARGS=", input);
-    for (int i = 1; i < argc; i++) printf("%s%s", i > 1 ? " " : "", argv[i]);
-    printf("\nCWD=%s\nCUSTOM=%s\nPROXY=%s\nSANDBOX=%s\n", cwd,
-        getenv("CW_CUSTOM_VAR") ?: "", getenv("HTTP_PROXY") ?: "", getenv("CW_CONTROLLED_SANDBOX") ?: "");
-    fputs("STDERR_DIAG=ok\n", stderr);
-    return 42;
-}
-"#,
-    )
-    .unwrap();
-    let compiled = Command::new("/usr/bin/clang")
-        .args(["-Wall", "-Wextra"])
-        .arg(&native_source)
-        .arg("-o")
-        .arg(&real_claude)
-        .output()
-        .unwrap();
-    assert!(
-        compiled.status.success(),
-        "native CLI fixture compile: {}",
-        String::from_utf8_lossy(&compiled.stderr)
-    );
-
-    let search_paths = vec![shim_dir.clone(), real_dir.clone()];
-    let (resolved, resolved_sha) =
-        resolve_real_cli_skipping_shim("claude", &shim_claude, &search_paths)
-            .expect("resolve real claude skipping shim");
-    assert_eq!(resolved, fs::canonicalize(&real_claude).unwrap());
-
-    // Locate the built `watch-sandbox-launcher` binary next to current test binary's deps parent
-    let current_exe = std::env::current_exe().unwrap();
-    let debug_dir = current_exe.parent().unwrap().parent().unwrap();
-    let launcher_bin = hardened_helper::copy_signed(&debug_dir.join("watch-sandbox-launcher"), &tmp.0.join("watch-sandbox-launcher"));
-    assert!(
-        launcher_bin.is_file(),
-        "expected watch-sandbox-launcher binary at {}",
-        launcher_bin.display()
-    );
-
-    let verifier = build_helper_verifier_for_path(&launcher_bin).expect("helper verifier");
-    let pv = test_policy_version();
-    let boot_id = "boot-c01";
-    let registry = Arc::new(SandboxLaunchRegistry::new(
-        boot_id,
-        pv.clone(),
-        verifier,
-        Some(store),
-    ));
-    registry.approve_target_executable(resolved.to_string_lossy(), &resolved_sha);
-
-    let reg_sock = tmp.0.join("reg-c01.sock");
-    let stop = Arc::new(AtomicBool::new(false));
-    let reg_handle = registry
-        .start_registration_listener(&reg_sock, Arc::clone(&stop))
-        .unwrap();
-
-    let gw: SocketAddr = "127.0.0.1:18955".parse().unwrap();
-    let args = vec!["--print".to_string(), "hello-world".to_string()];
-    let mut extra_env = BTreeMap::new();
-    extra_env.insert("CW_CUSTOM_VAR".to_string(), "preserve-env-ok".to_string());
-    let (res, stdout, stderr) = execute_cli_via_sandbox_launcher_with_stdin(
-        &launcher_bin,
-        Some(&reg_sock),
-        LaunchTarget::ClaudeCli,
-        &shim_claude,
-        &search_paths,
-        &args,
-        Some(&work_dir),
-        &extra_env,
-        Some(b"streamed-stdin-payload\n"),
-        gw,
-        boot_id,
-        pv,
-        Some(VpnEpoch::new("vpn-c01", 1)),
-        &[7890],
-    )
-    .expect("execute cli via sandbox launcher with stdin");
-
-    let out_str = String::from_utf8_lossy(&stdout);
-    let err_str = String::from_utf8_lossy(&stderr);
-    assert_eq!(
-        res.exit_code, 42,
-        "expected child exit code 42, stdout={out_str}, stderr={err_str}"
-    );
-    assert!(out_str.contains("STDIN=streamed-stdin-payload"));
-    assert!(out_str.contains("ARGS=--print hello-world"));
-    assert!(out_str.contains(&format!(
-        "CWD={}",
-        fs::canonicalize(&work_dir).unwrap().display()
-    )));
-    assert!(out_str.contains("CUSTOM=preserve-env-ok"));
-    assert!(out_str.contains("PROXY=http://127.0.0.1:18955"));
-    assert!(out_str.contains("SANDBOX=1"));
-    assert!(err_str.contains("STDERR_DIAG=ok"));
-
-    // Verify helper registered the sandboxed instance in SandboxLaunchRegistry
-    let instances = registry.instances();
-    assert_eq!(instances.len(), 1);
-    assert_eq!(instances[0].state, ManagedInstanceState::SandboxApplied);
-
-    let wrapper_plan = build_claude_code_process_wrapper_plan(&launcher_bin, gw).unwrap();
-    assert_eq!(wrapper_plan.proxy_url, "http://127.0.0.1:18955");
-
-    stop.store(true, Ordering::Release);
-    let _ = reg_handle.join();
+fn staged_cli_shims_preserve_the_callers_arguments_stdio_and_environment() {
+    use std::io::Write;
+    let (tmp, _) = make_temp_store("cw-entry-cli");
+    let work = fs::canonicalize(&tmp.0).unwrap();
+    let engine = tmp.0.join("engine fixture");
+    fs::write(&engine, br#"#!/bin/sh
+printf '%s\0' "$PWD" "$CW_FIXTURE_MARKER" "$CW_SHIM_EXECUTABLE" "$@"
+cat >&2
+exit 42
+"#).unwrap();
+    fs::set_permissions(&engine, fs::Permissions::from_mode(0o700)).unwrap();
+    for (target, name) in [(LaunchTarget::ClaudeCli, "claude-cli"), (LaunchTarget::CodexCli, "codex-cli")] {
+        let shim = stage_cli_entry_shim(&tmp.0.join("shims"), target, &engine).unwrap();
+        let literal = "two words\n$(literal)";
+        let mut child = Command::new(&shim)
+            .args(["--home", literal, ""])
+            .current_dir(&work)
+            .env("CW_FIXTURE_MARKER", "inherited")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn().unwrap();
+        child.stdin.take().unwrap().write_all(b"fixture stdin\n").unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert_eq!(output.status.code(), Some(42));
+        assert_eq!(output.stderr, b"fixture stdin\n");
+        let expected = [
+            work.to_str().unwrap(), "inherited", shim.to_str().unwrap(),
+            "launch", "--target", name, "--apply", "--", "--home", literal, "",
+        ].join("\0") + "\0";
+        assert_eq!(output.stdout, expected.as_bytes());
+    }
 }
 
 #[test]
@@ -543,10 +496,51 @@ extension ControlledEntryDelegate {
         precondition(empty.files.isEmpty && empty.urls.isEmpty && empty.incomingReplies.isEmpty)
         print("BATCH_REPLY_OWNERSHIP_OK")
     }
+
+    static func assertLaunchReceiptWakesWaiter() async throws {
+        let files = FileManager.default
+        let root = files.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try files.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? files.removeItem(at: root) }
+        let executable = root.appendingPathComponent("owned-sleeper")
+        try files.copyItem(at: URL(fileURLWithPath: "/bin/sleep"), to: executable)
+        let process = Process()
+        process.executableURL = executable
+        process.arguments = ["10"]
+        try process.run()
+        defer { if process.isRunning { process.terminate() }; process.waitUntilExit() }
+
+        let entry = ControlledEntryDelegate()
+        entry.targetBundleId = "example.fixture." + UUID().uuidString
+        entry.targetExecutable = executable.path
+        entry.watchStateDir = root.path
+        let pid = process.processIdentifier
+        let identity = entry.inspectKernelProcessIdentity(pid: pid)!
+        let runtime = root.appendingPathComponent("seatbelt-runtime.json")
+        let records = root.appendingPathComponent("managed-launch-instances.json")
+        try JSONSerialization.data(withJSONObject: ["executor_boot_id":"current"]).write(to: runtime, options: .atomic)
+        func publish(_ boot: String) throws {
+            let record: [String: Any] = ["instance_id":"owned", "entry_id":"fixture", "target":entry.target,
+                "pid":pid, "uid":identity.uid, "start_seconds":identity.startSec,
+                "start_microseconds":identity.startUsec, "expected_executable":executable.path,
+                "state":"exec_verified", "executor_boot_id":boot]
+            try JSONSerialization.data(withJSONObject: [record]).write(to: records, options: .atomic)
+        }
+        try publish("previous")
+        let waiter = Task { await entry.waitForVerifiedInstance() }
+        try await Task.sleep(for: .milliseconds(150))
+        try publish("current")
+        let verified = await waiter.value
+        precondition(verified?.pid == pid && verified?.instanceId == "owned")
+        try publish("previous")
+        let unavailable = await entry.waitForVerifiedInstance()
+        precondition(unavailable == nil, "unchanged stale registration must time out")
+    }
 }
 @main struct ControlledEntryBatchRegression {
-    @MainActor static func main() async {
+    @MainActor static func main() async throws {
         await ControlledEntryDelegate.assertIndependentBatches()
+        try await ControlledEntryDelegate.assertLaunchReceiptWakesWaiter()
     }
 }
 "#);
@@ -558,6 +552,7 @@ extension ControlledEntryDelegate {
     let compile = Command::new("xcrun").args(["swiftc", "-swift-version", "5", "-parse-as-library",
         "-module-cache-path", cache.to_str().unwrap(), source_path.to_str().unwrap(),
         concat!(env!("CARGO_MANIFEST_DIR"), "/../../monitor/Sources/BoundedDiagnosticLog.swift"),
+        concat!(env!("CARGO_MANIFEST_DIR"), "/../../monitor/Sources/MonitorPublicationObserver.swift"),
         "-framework", "AppKit", "-framework", "Foundation", "-o", binary.to_str().unwrap()])
         .output().expect("compile actual entry batch state");
     assert!(compile.status.success(), "{}", String::from_utf8_lossy(&compile.stderr));
@@ -614,6 +609,7 @@ fn run_controlled_entry_appkit_fixture(require_file_completion: bool) {
             "-parse-as-library",
             &swift_src.to_string_lossy(),
             concat!(env!("CARGO_MANIFEST_DIR"), "/../../monitor/Sources/BoundedDiagnosticLog.swift"),
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../../monitor/Sources/MonitorPublicationObserver.swift"),
             "-o",
             &controlled_entry_bin.to_string_lossy(),
             "-framework",

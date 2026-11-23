@@ -4,7 +4,7 @@ private struct ForceWire: Decodable {
     let now: Double
     let awaiting: ChannelMonitorSnapshot
     let snapshot: ChannelMonitorSnapshot
-    let events: [ChannelMonitorEvent]
+    let events: [ChannelHistoryEvent]
     let verified_target_exits: [UInt32]
 }
 private struct CutoffWire: Decodable {
@@ -17,7 +17,7 @@ private struct DesktopEntryWire: Decodable {
 private struct DeliveryWire: Decodable {
     let policy_first: Bool
     let snapshot: ChannelMonitorSnapshot
-    let events: [ChannelMonitorEvent]
+    let events: [ChannelHistoryEvent]
     let now: Double
     let first: UInt32
     let second: UInt32
@@ -77,11 +77,6 @@ struct ProcessDispositionWireTests {
         require(failureState.display_state == .failed && !failureState.isConfirmedFlowBlocked, "process exit hid failed network enforcement")
         require(failureState.processDispositionLabel(now: failed.now).contains("已核验目标退出"), "network failure hid real exit")
 
-        let script = try decode(CutoffWire.self, 4)
-        let scriptState = script.snapshot.families["claude"]!
-        require(scriptState.isConfirmedFlowBlocked && scriptState.process_disposition_receipt == nil
-                && scriptState.processDispositionLabel(now: scriptState.updated_at) == "进程保留", "script cutoff was shown as process exit")
-
         let entry = try decode(DesktopEntryWire.self, 5)
         let args = ControlledEntryLaunchBinding.arguments(target: entry.plist["CWTarget"]!,
             bundlePath: entry.plist["CWTargetBundlePath"]!, home: entry.plist["CWWatchHomePath"])
@@ -118,6 +113,13 @@ struct ProcessDispositionWireTests {
         require(expired.process_disposition_receipt?.target_results.first?.statusLabel == "已发信号，退出未确认"
                 && !expired.processDispositionLabel(now: expired.updated_at).contains("已核验目标退出"),
                 "deadline result was shown as an exit")
+        let script = try decode(CutoffWire.self, 4)
+        let scriptState = script.snapshot.families["claude"]!
+        let scope = scriptState.coverage_scope
+        let scriptEvidence = "gateway verified=\(scope?.hasVerifiedEndpoint == true), managed members=\(scriptState.managedMemberCount), "
+            + "network=\(scriptState.display_state.rawValue)/\(scriptState.policy_sync_state.rawValue), label=\(scriptState.processDispositionLabel(now: scriptState.updated_at))"
+        require(scriptState.isConfirmedFlowBlocked && scriptState.process_disposition_receipt == nil
+                && scriptState.processDispositionLabel(now: scriptState.updated_at) == "进程保留", "script cutoff: \(scriptEvidence)")
         print("ProcessDispositionWireTests: current force, both historical delivery orders, deadline, network failure, script cutoff and entry payloads passed")
     }
 }

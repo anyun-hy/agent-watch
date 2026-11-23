@@ -26,8 +26,9 @@ bash -n monitor/build.sh monitor/package-dmg.sh tools/build-rust-components.sh
 echo '===== RUST COMPILE AND SAFE REGRESSIONS ====='
 command -v cargo >/dev/null || { echo 'cargo required' >&2; exit 1; }
 cargo check --locked -p claude-watch-core -p claude-watch-runtime -p claude-watch-engine -p claude-watch-installer
-# Exact no-signal adapter test: does not start a real application or child.
-cargo test --locked -p claude-watch-runtime --test controlled_contracts fake_family_switches_target_even_without_a_running_member -- --exact
+# Check the controller's OpenAI observation scope with a fake desktop.
+bash tools/run-exact-runtime-tests.sh controlled_contracts \
+  observed_desktop_uses_shared_fresh_gate_and_only_creates_identity_leases
 bash tools/test-force-migration-regressions.sh
 bash tools/test-storage-regressions.sh
 

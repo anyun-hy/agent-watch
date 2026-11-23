@@ -5,15 +5,120 @@ private enum GraphNodeID: String {
     case code, desktop, managed, gateway, tag, node, service
 }
 
+/// Observe the entry controller itself: MonitorStore does not forward its changes.
+private struct ManagedEntryPanel: View {
+    @ObservedObject var control: ManagedEntryControl
+    let product: MonitoredProduct
+    let p: Palette
+    @State private var showingConfirmation = false
+    @State private var refreshID = UUID()
+    @State private var mutation: Task<Void, Never>?
+
+    private var state: ManagedEntryControl.State { control.state(for: product) }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 10) {
+                Image(systemName: state.report?.entry_generated == true ? "shield.checkered" : "shield")
+                    .foregroundStyle(state.report?.entry_generated == true ? p.mint : p.secondary)
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack(spacing: 6) {
+                        Text("受控桌面入口 (Opt-in)").font(WatchTypography.caption.weight(.medium))
+                        if let report = state.report {
+                            Badge(text: report.entry_generated ? "已生成" : "未生成",
+                                  color: report.entry_generated ? p.mint : p.secondary)
+                        } else {
+                            Badge(text: state.busy ? "等待回执" : "状态未知", color: p.secondary)
+                        }
+                    }
+                    Text(state.errorMessage ?? state.report?.status_label ?? "尚未确认当前应用的入口状态。")
+                        .font(WatchTypography.small).foregroundStyle(state.errorMessage == nil ? p.secondary : p.amber)
+                }
+                Spacer(minLength: 12)
+                if state.busy {
+                    ProgressView().controlSize(.small)
+                } else if let report = state.report {
+                    Toggle("受控桌面入口", isOn: Binding(
+                        get: { report.activation_configured },
+                        set: { enable in
+                            if enable { showingConfirmation = true } else { apply(false) }
+                        }
+                    )).toggleStyle(.switch).controlSize(.small).labelsHidden()
+                } else {
+                    Button("重新读取") { refreshID = UUID() }.controlSize(.small)
+                }
+            }
+            .padding(.horizontal, 23).padding(.vertical, 6)
+            .background(p.elevated.opacity(0.25))
+            if state.candidateSources.count > 1 { multipleSourcesBanner }
+        }
+        .task(id: refreshID) { await control.refresh(for: product) }
+        .onDisappear { mutation?.cancel() }
+        .confirmationDialog("启用 \(product.graphDesktopTitle) 受控桌面入口？",
+                            isPresented: $showingConfirmation, titleVisibility: .visible) {
+            Button("确认启用") { apply(true) }
+            Button("取消", role: .cancel) {}
+        } message: {
+            Text("将在 ~/Applications 请求生成独立入口。实际启动和保护状态需另行核验。")
+        }
+    }
+
+    private func apply(_ enable: Bool) {
+        mutation = Task { _ = await control.setEnabled(enable, for: product) }
+    }
+
+    private var multipleSourcesBanner: some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundStyle(p.amber)
+                .font(.system(size: 14))
+                .padding(.top, 2)
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 6) {
+                    Text("检测到系统中存在多个 \(product.graphDesktopTitle) 安装来源")
+                        .font(WatchTypography.caption.weight(.semibold))
+                        .foregroundStyle(p.amber)
+                    Badge(text: "共 \(state.candidateSources.count) 个安装", color: p.amber)
+                }
+                Text("以下为发现的候选路径，不代表已选用。实际启动来源由后台核验。")
+                    .font(WatchTypography.small)
+                    .foregroundStyle(p.secondary)
+                VStack(alignment: .leading, spacing: 2) {
+                    ForEach(state.candidateSources, id: \.self) { path in
+                        HStack(spacing: 6) {
+                            Text("•")
+                                .font(WatchTypography.small.weight(.medium))
+                                .foregroundStyle(p.secondary)
+                            Text(path)
+                                .font(WatchTypography.small)
+                                .foregroundStyle(p.text)
+                                .textSelection(.enabled)
+                        }
+                    }
+                }
+                .padding(.top, 2)
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 8)
+        .background(p.amber.opacity(0.12))
+        .clipShape(RoundedRectangle(cornerRadius: 10))
+        .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(p.amber.opacity(0.3), lineWidth: 1))
+        .padding(.horizontal, 23)
+        .padding(.vertical, 4)
+    }
+
+}
+
 /// The illustration is a native projection of one existing sample.
 struct ConnectionGraphView: View {
     @ObservedObject var store: MonitorStore
     let p: Palette
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var selectedNode: GraphNodeID = .gateway
+    @State private var compactToolbar = true
     @State private var expandedNode: GraphNodeID?
-    @State private var showingEntryConfirm = false
-    @State private var showingEntryError = false
 
     private var selectedProduct: MonitoredProduct { store.networkSelection.product }
     private var display: GraphDisplayState { store.graphDisplay(for: selectedProduct) }
@@ -98,36 +203,8 @@ struct ConnectionGraphView: View {
                     Spacer()
                     Badge(text: display.title, color: statusColor)
                 }
-                HStack(spacing: 12) {
-                    Picker("应用", selection: $store.networkSelection.product) {
-                        ForEach(MonitoredProduct.allCases) { product in Text(product.title).tag(product) }
-                    }.labelsHidden().pickerStyle(.segmented).frame(width: 252)
-                        .onChange(of: selectedProduct) {
-                            store.synchronizeNetworkSelection(); expandedNode = nil
-                            if selectedNode == .managed && selectedProduct != .openAI { selectedNode = .gateway }
-                        }
-                    let platform = serviceGroups.filter { $0.purpose == .platform }
-                    if display.countsAvailable, !platform.isEmpty {
-                        Menu {
-                            ForEach(platform) { group in
-                                Button(group.name) { store.selectNetworkFlow(group.representative, product: selectedProduct) }
-                            }
-                        } label: {
-                            Text("平台服务 \(platform.count) 项").font(WatchTypography.caption)
-                        }.menuStyle(.borderlessButton).frame(maxWidth: 148)
-                    }
-                    Spacer(minLength: 0)
-                    if store.switcher.busy {
-                        launchProgressView
-                    }
-                    HStack(spacing: 8) {
-                        GraphLaunchButton(product: selectedProduct, monitor: store, switcher: store.switcher,
-                                          processControl: store.processControl, p: p)
-                        AIProcessCloseButton(product: selectedProduct, store: store, control: store.processControl,
-                                             switcher: store.switcher, p: p)
-                            .id(selectedProduct)
-                    }
-                }
+                graphToolbar
+                if store.switcher.busy { launchProgressView.frame(maxWidth: .infinity, alignment: .trailing) }
                 HStack(spacing: 10) {
                     Text(display.detail)
                         .foregroundStyle(needsAttention ? p.amber : p.secondary)
@@ -144,10 +221,6 @@ struct ConnectionGraphView: View {
             }.padding(.horizontal, 23).padding(.top, 17).padding(.bottom, 7)
 
             protectionSummary
-            managedEntryRow
-            if store.managedEntryControl.hasMultipleSources {
-                multipleSourcesBanner
-            }
 
             ViewThatFits(in: .horizontal) {
                 wideScene.frame(minWidth: 900)
@@ -182,6 +255,9 @@ struct ConnectionGraphView: View {
             if let archived = display.archivedSample {
                 archivedPath(archived)
             }
+            Divider()
+            ManagedEntryPanel(control: store.managedEntryControl, product: selectedProduct, p: p)
+                .id(selectedProduct)
         }
         .background {
             ZStack {
@@ -192,29 +268,43 @@ struct ConnectionGraphView: View {
         }
         .clipShape(RoundedRectangle(cornerRadius: 20))
         .overlay(RoundedRectangle(cornerRadius: 20).strokeBorder(p.border, lineWidth: 1))
-        .onAppear {
-            store.synchronizeNetworkSelection()
-            Task { await store.managedEntryControl.refresh(for: selectedProduct) }
-        }
-        .onChange(of: selectedProduct) {
-            Task { await store.managedEntryControl.refresh(for: selectedProduct) }
-        }
-        .confirmationDialog("启用 \(selectedProduct.title) 受控桌面入口？", isPresented: $showingEntryConfirm, titleVisibility: .visible) {
-            Button("确认启用") {
-                Task {
-                    let ok = await store.managedEntryControl.setEnabled(true, for: selectedProduct)
-                    if !ok { showingEntryError = true }
+        .onAppear { store.synchronizeNetworkSelection() }
+    }
+
+    private var graphToolbar: some View {
+        let layout = compactToolbar ? AnyLayout(VStackLayout(alignment: .leading, spacing: 7))
+                                    : AnyLayout(HStackLayout(spacing: 12))
+        return layout {
+            HStack(spacing: 12) {
+                Picker("应用", selection: $store.networkSelection.product) {
+                    ForEach(MonitoredProduct.allCases) { product in Text(product.title).tag(product) }
+                }.labelsHidden().pickerStyle(.segmented).frame(width: 252)
+                    .onChange(of: selectedProduct) {
+                        store.synchronizeNetworkSelection(); expandedNode = nil
+                        if selectedNode == .managed && selectedProduct != .openAI { selectedNode = .gateway }
+                    }
+                let platform = serviceGroups.filter { $0.purpose == .platform }
+                if display.countsAvailable, !platform.isEmpty {
+                    Menu {
+                        ForEach(platform) { group in
+                            Button(group.name) { store.selectNetworkFlow(group.representative, product: selectedProduct) }
+                        }
+                    } label: {
+                        Text("平台服务 \(platform.count) 项").font(WatchTypography.caption)
+                    }.menuStyle(.borderlessButton).frame(maxWidth: 148)
                 }
+                Spacer(minLength: 0)
             }
-            Button("取消", role: .cancel) {}
-        } message: {
-            Text("将在您的个人目录 ~/Applications 生成受控入口包装。\n原版 /Applications 中的应用绝对零篡改；关闭此开关即可毫秒级清理零残留。是否继续？")
+            HStack(spacing: 8) {
+                if compactToolbar { Spacer(minLength: 0) }
+                GraphLaunchButton(product: selectedProduct, monitor: store, switcher: store.switcher,
+                                  processControl: store.processControl, p: p).fixedSize()
+                AIProcessCloseButton(product: selectedProduct, store: store, control: store.processControl,
+                                     switcher: store.switcher, p: p)
+                    .id(selectedProduct).fixedSize()
+            }.fixedSize(horizontal: !compactToolbar, vertical: false)
         }
-        .alert("受控入口配置未完成", isPresented: $showingEntryError) {
-            Button("知道了", role: .cancel) {}
-        } message: {
-            Text(store.managedEntryControl.errorMessage ?? "操作未能完成，请查看系统日志或重试。")
-        }
+        .onGeometryChange(for: Bool.self) { $0.size.width < 800 } action: { compactToolbar = $0 }
     }
 
     private var protectionSummary: some View {
@@ -226,11 +316,7 @@ struct ConnectionGraphView: View {
             let disposition = channelState.managedMemberCount > 0 || channelState.process_disposition_action == "force"
                 ? "（\(channelState.processDispositionLabel(now: now))）" : ""
             let previous = channelState.previousProcessDispositionLabel(now: now).map { "\n\($0)" } ?? ""
-            if channelState.managedMemberCount == 0 && !channelState.unmanagedPids.isEmpty {
-                text = "检测到外部运行实例（走系统代理隧道出海，未接入受控网关沙箱）\(disposition)\n受控网关活动连接 0\(previous)"
-            } else {
-                text = "\(channelState.protectionScopeLabel)\(disposition) · \(channelState.scopeSummary)\n\(channelState.gatewayCountsLabel)\(previous)"
-            }
+            text = "\(channelState.protectionScopeLabel)\(disposition) · \(channelState.scopeSummary)\n\(channelState.gatewayCountsLabel)\(previous)"
             switch channelState.scopedDisplayState {
             case .forwarding:
                 symbol = "checkmark.shield.fill"; tint = p.mint
@@ -310,53 +396,6 @@ struct ConnectionGraphView: View {
         return p.secondary
     }
 
-    private var managedEntryRow: some View {
-        HStack(spacing: 10) {
-            Image(systemName: store.managedEntryControl.isGenerated ? "shield.checkered" : "shield.slash")
-                .foregroundStyle(store.managedEntryControl.isGenerated ? p.mint : p.secondary)
-                .font(.system(size: 13))
-            VStack(alignment: .leading, spacing: 2) {
-                HStack(spacing: 6) {
-                    Text("受控桌面入口 (Opt-in)")
-                        .font(WatchTypography.caption.weight(.medium))
-                        .foregroundStyle(p.text)
-                    Badge(text: store.managedEntryControl.isGenerated ? "已部署" : "未启用（原版直通）",
-                          color: store.managedEntryControl.isGenerated ? p.mint : p.secondary)
-                }
-                Text(store.managedEntryControl.isGenerated
-                     ? "在 ~/Applications 部署了独立受控入口，直接点击即受控启动；原版应用零篡改。"
-                     : "原版 /Applications/\(selectedProduct.title).app 零篡改；开启后在个人目录生成独立受控入口。")
-                    .font(WatchTypography.small)
-                    .foregroundStyle(p.secondary)
-                    .lineLimit(1)
-            }
-            Spacer(minLength: 12)
-            if store.managedEntryControl.busy {
-                ProgressView().controlSize(.small)
-            } else {
-                Toggle("", isOn: Binding(
-                    get: { store.managedEntryControl.isGenerated },
-                    set: { willEnable in
-                        if willEnable {
-                            showingEntryConfirm = true
-                        } else {
-                            Task {
-                                let ok = await store.managedEntryControl.setEnabled(false, for: selectedProduct)
-                                if !ok { showingEntryError = true }
-                            }
-                        }
-                    }
-                ))
-                .toggleStyle(.switch)
-                .controlSize(.small)
-                .labelsHidden()
-            }
-        }
-        .padding(.horizontal, 23)
-        .padding(.vertical, 6)
-        .background(p.elevated.opacity(0.25))
-    }
-
     private var launchProgressView: some View {
         VStack(alignment: .trailing, spacing: 3) {
             HStack(spacing: 6) {
@@ -376,48 +415,6 @@ struct ConnectionGraphView: View {
             }
         }
         .accessibilityLabel("启动检查进度")
-    }
-
-    private var multipleSourcesBanner: some View {
-        HStack(alignment: .top, spacing: 10) {
-            Image(systemName: "exclamationmark.triangle.fill")
-                .foregroundStyle(p.amber)
-                .font(.system(size: 14))
-                .padding(.top, 2)
-            VStack(alignment: .leading, spacing: 4) {
-                HStack(spacing: 6) {
-                    Text("检测到系统中存在多个 \(selectedProduct.title) 安装版本，需要处理")
-                        .font(WatchTypography.caption.weight(.semibold))
-                        .foregroundStyle(p.amber)
-                    Badge(text: "共 \(store.managedEntryControl.candidateSources.count) 个安装", color: p.amber)
-                }
-                Text("已优先选用系统标准安装：/Applications/\(selectedProduct.title).app。为避免启动歧义与配置冲突，建议清理多余残留版本：")
-                    .font(WatchTypography.small)
-                    .foregroundStyle(p.secondary)
-                VStack(alignment: .leading, spacing: 2) {
-                    ForEach(store.managedEntryControl.candidateSources, id: \.self) { path in
-                        HStack(spacing: 6) {
-                            Text(path.hasPrefix("/Applications/") ? "• [推荐使用]" : "• [建议清理]")
-                                .font(WatchTypography.small.weight(.medium))
-                                .foregroundStyle(path.hasPrefix("/Applications/") ? p.mint : p.amber)
-                            Text(path)
-                                .font(WatchTypography.small)
-                                .foregroundStyle(p.text)
-                                .textSelection(.enabled)
-                        }
-                    }
-                }
-                .padding(.top, 2)
-            }
-            Spacer(minLength: 0)
-        }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 8)
-        .background(p.amber.opacity(0.12))
-        .clipShape(RoundedRectangle(cornerRadius: 10))
-        .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(p.amber.opacity(0.3), lineWidth: 1))
-        .padding(.horizontal, 23)
-        .padding(.vertical, 4)
     }
 
     private func archivedPath(_ sample: GraphPathSample) -> some View {
@@ -634,7 +631,7 @@ struct ConnectionGraphView: View {
                       state: graph.gatewayState)
                 VStack(alignment: .leading, spacing: 5) {
                     Text(historicalTitle(gatewayNodeTitle))
-                        .font(WatchTypography.bodyStrong).foregroundStyle(p.text).lineLimit(1)
+                        .font(WatchTypography.bodyStrong).foregroundStyle(p.text).lineLimit(1).minimumScaleFactor(0.78)
                     Text(graph.gatewayEndpoint.replacingOccurrences(of: "http://", with: ""))
                         .font(WatchTypography.small).foregroundStyle(p.secondary)
                         .lineLimit(2).truncationMode(.middle).fixedSize(horizontal: false, vertical: true)

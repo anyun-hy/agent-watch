@@ -35,6 +35,7 @@ struct AIProbeState {
     var verdict = LeakVerdict(state: .idle, title: "未检测", detail: "点击开始后检测当前代理诊断路径。")
 }
 enum AIProbePolicy {
+    static let maximumAge: TimeInterval = 300
     static func evaluate(_ result: AIProbeResult, service: AIService, now: Double) -> LeakVerdict {
         func incomplete(_ message: String) -> LeakVerdict { .init(state: .incomplete, title: "检测未完成", detail: message) }
         guard result.service == service.rawValue, result.startedAt.isFinite, result.finishedAt.isFinite,
@@ -42,7 +43,7 @@ enum AIProbePolicy {
               result.finishedAt <= now + 5, result.endpoints.count <= 8, result.errors.count <= 16 else {
             return incomplete("诊断结果无效，不能用于当前判断。")
         }
-        guard now - result.finishedAt <= 300 else { return .init(state: .incomplete, title: "结果已过期", detail: "这次诊断已超过 5 分钟，请重新检测。") }
+        guard now - result.finishedAt <= maximumAge else { return .init(state: .incomplete, title: "结果已过期", detail: "这次诊断已超过 5 分钟，请重新检测。") }
         let limited = result.endpoints.filter { $0.status == "responded" && ($0.httpStatus == 403 || $0.httpStatus == 429 || ($0.httpStatus ?? 0) >= 500) }
         if !limited.isEmpty {
             return .init(state: .difference, title: "入口返回限制或异常", detail: "已收到 HTTP 响应，请查看入口状态；这不能直接判断账号是否可用或被封禁。")

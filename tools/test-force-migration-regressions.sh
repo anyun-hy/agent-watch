@@ -17,8 +17,7 @@ cargo test --locked -p claude-watch-core --lib config::protection_tests
 cargo test --locked -p claude-watch-runtime --test force_migration_regressions
 cargo test --locked -p claude-watch-runtime --lib config_store::cli_settings_contracts::default_policy_digest_is_pinned_so_a_field_reorder_cannot_break_heartbeats
 python3 tools/test-force-confirmation-routing.py
-# Re-run the exact 87 previously passing no-signal guard/evidence contracts
-# because their explicit Force fixtures now carry per-key authorization.
+# Exercise per-key Force authorization alongside warning and multi-desktop coverage.
 bash tools/test-multi-desktop-regressions.sh
 # Existing stream/Swift syntax checks for the modified SwitcherStore.
 bash tools/test-lifecycle-regressions.sh swift

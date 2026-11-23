@@ -639,25 +639,12 @@ struct ChannelMonitorSnapshot: Codable, Equatable, Sendable {
     var executor_boot_id: String? = nil
 }
 
-struct ChannelMonitorEvent: Codable, Equatable, Sendable {
-    var producer_boot_id: String = ""
-    let event_seq: UInt64
-    let family_state: FamilyChannelMonitorState
-}
-
-enum ChannelSubscriptionApplyOutcome: Equatable, Sendable {
-    case applied
-    case ignoredStaleEvent
-    case gapDetectedResyncRequired(expectedSeq: UInt64, receivedSeq: UInt64)
-}
-
 struct ChannelMonitorSubscriptionStore: Sendable {
-    private(set) var producerBootId: String? = nil
-    private(set) var lastEventSeq: UInt64 = 0
+    private var producerBootId: String? = nil
+    private var lastSnapshotSeq: UInt64 = 0
     private var lastCapturedAt: Double?
-    private(set) var needsResync: Bool = true
-    private(set) var savedPolicyVersion: ChannelPolicyVersionModel? = nil
-    private(set) var families: [String: FamilyChannelMonitorState] = [:]
+    private var needsResync: Bool = true
+    private var families: [String: FamilyChannelMonitorState] = [:]
 
     mutating func markReconnected() {
         needsResync = true
@@ -670,61 +657,15 @@ struct ChannelMonitorSubscriptionStore: Sendable {
             && !producerBootId!.isEmpty
             && producerBootId != snapshot.producer_boot_id
         if !bootIdChanged, let lastCapturedAt, snapshot.captured_at < lastCapturedAt { return false }
-        if snapshot.snapshot_seq < lastEventSeq && !needsResync && !bootIdChanged { return false }
+        if snapshot.snapshot_seq < lastSnapshotSeq && !needsResync && !bootIdChanged { return false }
         lastCapturedAt = snapshot.captured_at
         if !snapshot.producer_boot_id.isEmpty {
             producerBootId = snapshot.producer_boot_id
         }
-        lastEventSeq = snapshot.snapshot_seq
-        savedPolicyVersion = snapshot.saved_policy_version
+        lastSnapshotSeq = snapshot.snapshot_seq
         families = snapshot.families
         needsResync = false
         return true
-    }
-
-    mutating func applyEvent(_ event: ChannelMonitorEvent) -> ChannelSubscriptionApplyOutcome {
-        let eventBootId = !event.producer_boot_id.isEmpty
-            ? event.producer_boot_id
-            : event.family_state.producer_boot_id
-        if !eventBootId.isEmpty
-            && producerBootId != nil
-            && !producerBootId!.isEmpty
-            && producerBootId != eventBootId
-        {
-            needsResync = true
-            return .gapDetectedResyncRequired(
-                expectedSeq: lastEventSeq + 1,
-                receivedSeq: event.event_seq
-            )
-        }
-        if needsResync {
-            return .gapDetectedResyncRequired(
-                expectedSeq: lastEventSeq + 1,
-                receivedSeq: event.event_seq
-            )
-        }
-        if event.event_seq <= lastEventSeq {
-            return .ignoredStaleEvent
-        }
-        if event.event_seq > lastEventSeq + 1 {
-            needsResync = true
-            return .gapDetectedResyncRequired(
-                expectedSeq: lastEventSeq + 1,
-                receivedSeq: event.event_seq
-            )
-        }
-        if let existing = families[event.family_state.family] {
-            if event.family_state.permit_generation < existing.permit_generation
-                || (event.family_state.permit_generation == existing.permit_generation
-                    && event.family_state.command_seq < existing.command_seq)
-            {
-                return .ignoredStaleEvent
-            }
-        }
-        lastEventSeq = event.event_seq
-        savedPolicyVersion = event.family_state.saved_policy_version
-        families[event.family_state.family] = event.family_state
-        return .applied
     }
 
     /// Returns the effective display state for `family`, degrading to
@@ -909,7 +850,6 @@ struct MonitorSnapshot: Decodable, Sendable {
     let proxy: ProxySnapshot?
     let proxyError: String?
     var channelSupervision: ChannelMonitorSnapshot? = nil
-    var channelEvents: [ChannelMonitorEvent]? = nil
     var vpnSupervision: VpnSupervisionSnapshotModel? = nil
     var targetDiscovery: TargetDiscoveryStatusModel? = nil
     let logPath: String

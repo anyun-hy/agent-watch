@@ -95,6 +95,147 @@ fn file(path: &Path, text: &str) {
     fs::write(path, text).unwrap()
 }
 
+struct ObservedDesktop {
+    start: u64,
+    crash_at: Option<&'static str>,
+    replace_source_at: Option<&'static str>,
+    edit_when_staged: Option<PathBuf>,
+}
+impl AccountOs for ObservedDesktop {
+    fn current_desktop(&mut self) -> Result<claude_watch_core::processes::Identity> {
+        Ok(claude_watch_core::processes::Identity {
+            executable: "/Applications/Claude.app/Contents/MacOS/Claude".into(), pid: 40,
+            start_seconds: self.start, start_microseconds: 47, uid: 501, parent: 1, start_stamp: String::new(),
+        })
+    }
+    fn claude_version(&mut self) -> Result<Option<String>> { unreachable!() }
+    fn quit_claude(&mut self) -> Result<()> { panic!("manual save must not quit the desktop") }
+    fn claude_running(&mut self) -> Result<bool> { Ok(true) }
+    fn launch_claude(&mut self) -> Result<()> { panic!("manual save must not launch the desktop") }
+    fn preflight(&mut self) -> Result<()> { unreachable!() }
+    fn checkpoint(&mut self, stage: &str) -> Result<()> {
+        if stage == "save_staged" {
+            if let Some(path) = self.edit_when_staged.take() { fs::write(path, "changed during save").unwrap(); }
+        }
+        if Some(stage) == self.replace_source_at { self.start += 1; }
+        if Some(stage) == self.crash_at { panic!("simulated writer interruption at {stage}"); }
+        Ok(())
+    }
+}
+fn observed_store(f: &Fixture) -> AccountStore<ObservedDesktop> {
+    AccountStore::new(f.storage(), ObservedDesktop { start: 70, crash_at: None, replace_source_at: None, edit_when_staged: None })
+}
+fn read_current(store: &mut AccountStore<ObservedDesktop>, label: &str) -> claude_watch_runtime::accounts::SaveCurrentAccount {
+    let read = store.current_source().unwrap();
+    assert_eq!(read["process_id"], 40);
+    claude_watch_runtime::accounts::SaveCurrentAccount {
+        source_token: read["source_token"].as_str().unwrap().to_owned(), account_label: label.into(),
+    }
+}
+
+#[test]
+fn manual_save_first_to_either_slot_and_keep_both_public_labels() {
+    for (first, second) in [("A", "B"), ("B", "A")] {
+        let fixture = Fixture::new();
+        let mut store = observed_store(&fixture);
+        let active = store.storage.paths.active().join("state");
+        file(&active, "first");
+        let read = read_current(&mut store, "First account");
+        assert!(store.current_source().unwrap()["slot"].is_null());
+        assert_eq!(store.save_current(first, &read).unwrap()["saved"], true);
+        assert_eq!(store.current_source().unwrap()["slot"], first);
+        assert_eq!(store.status().unwrap().current.as_deref(), Some(first));
+        let first_profile = store.profile_path(first).unwrap().join("state");
+        assert_eq!(fs::read_to_string(&first_profile).unwrap(), "first");
+        assert!(!store.profile_path(second).unwrap().exists());
+        file(&active, "second");
+        let read = read_current(&mut store, "Second account");
+        store.save_current(second, &read).unwrap();
+        let read = read_current(&mut store, "Second updated");
+        assert_eq!(store.save_current(first, &read).unwrap_err().code, "account_slot_occupied");
+        store.save_current(second, &read).unwrap();
+        let status = store.status().unwrap();
+        assert_eq!(status.current.as_deref(), Some(second));
+        for entry in status.accounts {
+            let label = if entry.id == first { "First account" } else { "Second updated" };
+            assert_eq!(entry.account_label.as_deref(), Some(label));
+        }
+        assert_eq!(fs::read_to_string(first_profile).unwrap(), "first");
+        assert_eq!(fs::read_to_string(store.profile_path(second).unwrap().join("state")).unwrap(), "second");
+        assert_eq!(fs::read_to_string(&active).unwrap(), "second");
+        let mut switcher = AccountStore::new(fixture.storage(), Fake {
+            running: true, launch_fails: false, clones: 0, fail_preflight: false, fail_stage: None, quits: 0,
+        });
+        for (target, data) in [(first, "first"), (second, "second")] {
+            switcher.switch(target, &config(), false).unwrap();
+            assert_eq!(fs::read_to_string(&active).unwrap(), data);
+            for entry in switcher.status().unwrap().accounts {
+                let expected = if entry.id == first { "First account" } else { "Second updated" };
+                assert_eq!(entry.account_label.as_deref(), Some(expected));
+            }
+        }
+    }
+}
+
+#[test]
+fn manual_save_rejects_reused_pid_at_read_or_publication() {
+    let fixture = Fixture::new();
+    let mut store = observed_store(&fixture);
+    file(&store.storage.paths.active().join("state"), "one");
+    let read = read_current(&mut store, "First account");
+    store.os.start += 1;
+    assert_eq!(store.save_current("A", &read).unwrap_err().code, "account_source_changed");
+    for phase in ["save_staged", "save_published"] {
+        let read = read_current(&mut store, "First account");
+        store.os.replace_source_at = Some(phase);
+        assert_eq!(store.save_current("A", &read).unwrap_err().code, "account_source_changed");
+        assert!(store.status().unwrap().accounts.iter().all(|s| !s.stored && !s.current));
+        assert!(!store.storage.paths.journal().exists());
+    }
+}
+
+#[test]
+fn manual_save_discards_an_unstable_profile_and_preserves_both_live_and_archived_data() {
+    let fixture = Fixture::new();
+    let mut store = observed_store(&fixture);
+    let active = store.storage.paths.active().join("state");
+    file(&active, "saved");
+    let read = read_current(&mut store, "First account");
+    store.save_current("A", &read).unwrap();
+    let read = read_current(&mut store, "New account");
+    store.os.edit_when_staged = Some(active.clone());
+    assert_eq!(store.save_current("B", &read).unwrap_err().code, "account_source_changed");
+    assert_eq!(fs::read_to_string(active).unwrap(), "changed during save");
+    assert_eq!(fs::read_to_string(store.profile_path("A").unwrap().join("state")).unwrap(), "saved");
+    assert!(!store.profile_path("B").unwrap().exists());
+    assert_eq!(store.status().unwrap().current.as_deref(), Some("A"));
+}
+
+#[test]
+fn manual_save_interruption_restores_only_archives_or_finishes_published_marker() {
+    for phase in ["save_staged", "save_published", "save_marked"] {
+        let fixture = Fixture::new();
+        let mut store = observed_store(&fixture);
+        let active = store.storage.paths.active().join("state");
+        file(&active, "old");
+        let read = read_current(&mut store, "Old label");
+        store.save_current("B", &read).unwrap();
+        file(&active, "new");
+        let read = read_current(&mut store, "New label");
+        store.os.crash_at = Some(phase);
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| store.save_current("B", &read))).is_err());
+        assert!(store.storage.paths.journal().exists());
+        store.os.crash_at = None;
+        store.recover().unwrap();
+        let committed = phase == "save_marked";
+        let status = store.status().unwrap();
+        assert_eq!(status.accounts[1].account_label.as_deref(), Some(if committed { "New label" } else { "Old label" }));
+        assert_eq!(fs::read_to_string(store.profile_path("B").unwrap().join("state")).unwrap(), if committed { "new" } else { "old" });
+        assert_eq!(fs::read_to_string(active).unwrap(), "new");
+        assert!(!status.recovery_required);
+    }
+}
+
 #[test]
 fn legacy_import_first_save_switch_and_status_are_isolated() {
     let f = Fixture::new();

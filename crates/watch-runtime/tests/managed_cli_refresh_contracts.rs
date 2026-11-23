@@ -6,6 +6,9 @@ mod fixture_inventory;
 #[path = "support/hardened_helper.rs"]
 mod hardened_helper;
 
+#[path = "support/published_events.rs"]
+mod published_events;
+
 use claude_watch_core::{channel::{BoundProcessToken, ChannelPermitState, PolicyVersion},
     controlled_launch::{ControlledLaunchRequest, ProxyAdaptationKind}, processes::LaunchTarget};
 use claude_watch_runtime::{channel_enforcer::{LocalTunnelEnforcer, TunnelStream},
@@ -42,10 +45,17 @@ struct Fixture {
     root: PathBuf, store: StateStore, registry: Arc<SandboxLaunchRegistry>, enforcer: Arc<LocalTunnelEnforcer>,
     supervisor: Option<ChannelSupervisor>, policy: PolicyVersion, helper: PathBuf, alias: PathBuf, a: PathBuf, b: PathBuf,
     gateway: SocketAddr, upstream: SocketAddr, stop: Arc<AtomicBool>, workers: Vec<thread::JoinHandle<()>>, now: f64,
+    listeners: Vec<claude_watch_system::ListenerWorker>,
     upstream_eof: Receiver<()>,
 }
 impl Drop for Fixture {
-    fn drop(&mut self) { self.stop.store(true, Ordering::Release); for worker in self.workers.drain(..) { let _ = worker.join(); } let _ = fs::remove_dir_all(&self.root); }
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        drop(self.supervisor.take());
+        for listener in self.listeners.drain(..) { let _ = listener.join(); }
+        for worker in self.workers.drain(..) { let _ = worker.join(); }
+        let _ = fs::remove_dir_all(&self.root);
+    }
 }
 impl Fixture {
     fn new() -> Self {
@@ -115,7 +125,7 @@ impl Fixture {
         let (gateway, proxy_worker) = enforcer.start_local_proxy_listener("127.0.0.1:0", stop.clone(), now).unwrap();
         let registration_worker = registry.start_registration_listener(&root.join("reg.sock"), stop.clone()).unwrap();
         let mut fixture = Self { root, store, registry, enforcer, supervisor:None, policy, helper, alias, a, b, gateway, upstream, stop,
-            workers:vec![echo_worker, proxy_worker, registration_worker], now, upstream_eof };
+            workers:vec![echo_worker], listeners:vec![proxy_worker, registration_worker], now, upstream_eof };
         assert!(fixture.manifest(false).is_empty()); fixture.registry.refresh_executable_verifications();
         fixture
     }
@@ -434,10 +444,10 @@ fn v1_supervisor_force_reaps_real_owned_main_and_fork_and_projects_receipt() {
     }
     assert!(!target.child.wait().unwrap().success());
     assert!(claude_watch_system::bound_lifetime_exited(&child.0));
-    let events = supervisor.drain_emitted_events();
+    let events = published_events::after(&supervisor.storage, 0);
     assert!(events.iter().any(|e| e.family_state.process_disposition_receipt.as_ref() == Some(outcome)));
-    supervisor.handle_event(duplicate).unwrap();
-    assert!(supervisor.drain_emitted_events().is_empty(), "duplicate cannot publish or execute again");
+    let replay = supervisor.handle_event(duplicate).unwrap();
+    assert_eq!(replay.snapshot_seq, result.snapshot_seq, "duplicate cannot publish or execute again");
     assert!(ordinary_process.0.try_wait().unwrap().is_none());
     fixture.ordinary_control();
     export_case("process-disposition-wire.json", json!({"now":native::now(),"awaiting":awaiting,"snapshot":result,
@@ -678,11 +688,29 @@ fn v3_node_esm_discovery_sandbox_gateway_fork_and_current_source_cutoff() {
         && p.start_seconds == orphan.0.start_seconds && p.audit_token == orphan.0.audit_token));
     fixture.now = native::now();
     fixture.enforcer.set_clock(native::now).unwrap();
+    fixture.registry.set_gateway_endpoint_protection(fixture.enforcer.gateway_endpoint_protection().unwrap());
     let live = fixture.tokens();
     assert!(live.iter().any(|t| t.pid == main.identity.pid), "main must match the loaded interpreter and exact approved script: {:?}", fixture.registry.instances());
     assert!(live.iter().any(|t| t.pid == forked), "fork-only instance descendant must be verified");
     assert!(!live.iter().any(|t| t.pid == execed));
     fixture.activate();
+    // Capture the registry evidence from this inventory before invalidating the
+    // script source. Revocation cannot reconstruct the old set of bound members.
+    let report = fixture.registry.identity_report(true, true, true);
+    let mut protected_pids: Vec<_> = live.iter().map(|member| member.pid).collect();
+    protected_pids.sort_unstable();
+    protected_pids.dedup();
+    let scope = claude_watch_core::channel::BackendCoverageScope {
+        backend: claude_watch_core::channel::NetworkBackendKind::Seatbelt,
+        configured_entries: vec![request.entry_id.clone()],
+        protected_pids,
+        unprotected_pids: vec![execed],
+        uncovered_boundaries: vec!["direct_launch_outside_controlled_entry".into()],
+        server_identity_verified: report.gateway_server_identity_verified,
+        gateway_endpoint_protection_verified: report.gateway_endpoint_protection_verified,
+        gateway_endpoint_protection_method: report.gateway_endpoint_protection_method,
+    };
+    fixture.supervisor.as_mut().unwrap().set_family_coverage_scope("claude", Some(scope.clone()), fixture.now);
     main.command("OTHER_DENIED", "OTHER_DENIED");
     let mut independent = Command::new(&node).arg(fixture.root.join("other.cjs"))
         .arg(fixture.gateway.port().to_string()).arg(fixture.upstream.port().to_string())
@@ -708,6 +736,7 @@ fn v3_node_esm_discovery_sandbox_gateway_fork_and_current_source_cutoff() {
         claude_watch_core::channel::ChannelMonitorDisplayState::Disconnecting
         | claude_watch_core::channel::ChannelMonitorDisplayState::Blocked));
     assert_eq!(cutoff.families["claude"].policy_sync_state, claude_watch_core::channel::PolicySyncState::Applied);
+    assert_eq!(cutoff.families["claude"].coverage_scope, scope);
     assert_eq!(main.command("EOF", "EOF"), "EOF 1");
     fork_channel.command(b'E', "EOF 1");
     orphan_channel.command(b'E', "EOF 1");

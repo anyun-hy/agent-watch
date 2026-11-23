@@ -57,6 +57,7 @@ def production_models() -> str:
         (COFFEE, "CoffeeJSON"),
         (COFFEE, "JSONEncoder"),
         (COFFEE, "CoffeeReceipt"),
+        (SWITCHER, "HistoryEntry"),
         (SWITCHER, "EnvironmentCheckRow"),
         (SWITCHER, "EnvironmentSourceNotice"),
         (SWITCHER, "EgressReference"),
@@ -106,8 +107,6 @@ def production_models() -> str:
         (MODELS, "ProcessDispositionReceiptModel"),
         (MODELS, "FamilyChannelMonitorState"),
         (MODELS, "ChannelMonitorSnapshot"),
-        (MODELS, "ChannelMonitorEvent"),
-        (MODELS, "ChannelSubscriptionApplyOutcome"),
         (MODELS, "ChannelMonitorSubscriptionStore"),
         (MODELS, "VpnFieldDiffModel"),
         (MODELS, "VpnExpectationModel"),
@@ -212,32 +211,30 @@ struct RustSwiftReceiptContract {
             sandbox_ready: true
         )
         var subStore = ChannelMonitorSubscriptionStore()
-        let snap1 = ChannelMonitorSnapshot(
-            producer_boot_id: "boot-1",
-            snapshot_seq: 10,
-            captured_at: 1000.0,
-            saved_policy_version: pv2,
-            families: ["claude": famState1]
-        )
-        require(subStore.applySnapshot(snap1), "U01: initial snapshot apply failed")
-        require(subStore.families["claude"]?.saved_policy_version == pv2, "U01: saved_policy_version mismatch")
-        require(subStore.families["claude"]?.applied_policy_version == pv1, "U01: applied_policy_version mismatch")
-        require(subStore.families["claude"]?.hasUnmanagedMembers == true, "U01: unmanaged members must be visible")
-
-        // Stale event (seq <= 10) must be ignored
-        let staleEvent = ChannelMonitorEvent(producer_boot_id: "boot-1", event_seq: 9, family_state: famState1)
-        require(subStore.applyEvent(staleEvent) == .ignoredStaleEvent, "U01: stale event seq must be ignored")
-
-        // Gap event (seq == 12 when expecting 11) must trigger resync and degrade effectiveState to pendingVerification
-        let gapEvent = ChannelMonitorEvent(producer_boot_id: "boot-1", event_seq: 12, family_state: famState1)
-        if case .gapDetectedResyncRequired(let exp, let rec) = subStore.applyEvent(gapEvent) {
-            require(exp == 11 && rec == 12, "U01: unexpected gap seq numbers")
-        } else {
-            fail("U01: expected gapDetectedResyncRequired")
+        func channelSnapshot(_ seq: UInt64, _ time: Double) -> ChannelMonitorSnapshot {
+            ChannelMonitorSnapshot(producer_boot_id: "boot-1", snapshot_seq: seq, captured_at: time,
+                                   saved_policy_version: pv2, families: ["claude": famState1])
         }
+        let snap1 = channelSnapshot(10, 1000)
+        require(subStore.applySnapshot(snap1), "U01: initial snapshot apply failed")
+        let current = subStore.effectiveState(for: "claude", now: 1000, live: true)
+        require(current?.saved_policy_version == pv2, "U01: saved_policy_version mismatch")
+        require(current?.applied_policy_version == pv1, "U01: applied_policy_version mismatch")
+        require(current?.hasUnmanagedMembers == true, "U01: unmanaged members must be visible")
+        require(!subStore.applySnapshot(channelSnapshot(9, 1001)), "U01: lower snapshot sequence accepted")
+        require(!subStore.applySnapshot(channelSnapshot(11, 999)), "U01: older snapshot time accepted")
+        require(subStore.applySnapshot(channelSnapshot(12, 1002)), "U01: full snapshot after skipped sequence rejected")
+        subStore.markReconnected()
         let degraded = subStore.effectiveState(for: "claude", now: 1005.0, live: true)
         require(degraded?.display_state == .pendingVerification, "U01: resync-required store must degrade to pendingVerification, never false success")
         require(degraded?.unmanaged_member_pids == [2002], "U01: degraded state must preserve unmanaged_member_pids visibility")
+        require(!subStore.applySnapshot(snap1), "U01: reconnect accepted an older capture")
+        require(subStore.applySnapshot(channelSnapshot(12, 1005)), "U01: reconnect rejected a fresh capture")
+        require(subStore.effectiveState(for: "claude", now: 1005, live: true) == famState1, "U01: fresh snapshot did not restore the display")
+        let restarted = ChannelMonitorSnapshot(producer_boot_id: "boot-2", snapshot_seq: 1, captured_at: 1006,
+                                              saved_policy_version: pv2, families: [:])
+        require(subStore.applySnapshot(restarted), "U01: new producer could not start a new sequence")
+        require(subStore.effectiveState(for: "claude", now: 1006, live: true) == nil, "U01: producer restart retained obsolete family")
         require(famState1.isConfirmedFlowBlocked == false, "U01: pendingApply / forwarding must never report isConfirmedFlowBlocked")
 
         // Verify isConfirmedFlowBlocked requires both display_state == .blocked and policy_sync_state == .applied with 0 active flows

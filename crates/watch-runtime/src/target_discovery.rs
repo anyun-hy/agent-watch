@@ -99,6 +99,22 @@ pub struct DiscoverySnapshot {
     pub preferred_sources: BTreeMap<String, String>,
 }
 impl DiscoverySnapshot {
+    pub fn chatgpt_account_source(&self) -> Result<PathBuf> {
+        let target = LaunchTarget::ChatgptDesktop;
+        let mut catalog = self.clone();
+        catalog.targets.retain(|entry| entry.kind() == Some(Kind::OpenaiMain));
+        if !catalog.targets.iter().any(|entry| entry.valid()) {
+            return Err(CoreError::new("unsupported_chatgpt_profile", "未找到支持 A/B 账号的新版 ChatGPT 桌面应用"));
+        }
+        // A separately installed Classic client has a different profile format.
+        if let Some(id) = catalog.preferred_sources.get(target.as_str()) {
+            if !catalog.targets.iter().any(|entry| &entry.source_id == id) {
+                catalog.preferred_sources.remove(target.as_str());
+            }
+        }
+        Ok(catalog.select(target, None)?.entry_path.clone())
+    }
+
     pub fn select(&self, target: LaunchTarget, source: Option<&str>) -> Result<&DiscoveredTarget> {
         let accepts =
             |record: &&DiscoveredTarget| record.kind().is_some_and(|kind| target.accepts(kind));

@@ -670,7 +670,7 @@ impl<R: ReadRunner, T: Transport, M: Mutator> Macos<R, T, M> {
             && tag["entry"]["state"] == "verified"
             && (tag["api"]["covers_7890"] == true || tag["api"]["covers_7897"] == true)
         {
-            let endpoint = tag["entry"]["endpoint"].as_str().unwrap_or(crate::network_client::default_proxy_url());
+            let endpoint = tag["entry"]["endpoint"].as_str().unwrap_or_else(|| crate::network_client::default_proxy_url());
             json!(endpoint)
         } else {
             Value::Null
@@ -1086,6 +1086,19 @@ fn network_identity(environment: &Value) -> Value {
         "service_id":environment.pointer("/network/service_id")})
 }
 impl<R: ReadRunner, T: Transport, M: Mutator> AuditSystem for Macos<R, T, M> {
+    fn check_preview_compatibility(&self, target: claude_watch_core::processes::LaunchTarget) -> Result<()> {
+        use claude_watch_core::processes::LaunchTarget;
+        if !matches!(target, LaunchTarget::ChatgptDesktop | LaunchTarget::CodexDesktop) { return Ok(()); }
+        let discovery = crate::target_discovery::DiscoveryHandle::for_home(&self.storage.paths.home);
+        let snapshot = discovery.refresh(&self.runner, native::now());
+        let record = snapshot.select(target, None)?;
+        if record.executable.as_ref().is_some_and(|path|
+            crate::managed_entry::DesktopManagedEntrySpec::may_match_seatbelt_conflict(record.bundle_id.as_deref().unwrap_or(""), path)
+        ) {
+            discovery.managed_spec(&snapshot, record, target)?.check_seatbelt_compatibility()?;
+        }
+        Ok(())
+    }
     fn now(&self) -> f64 {
         native::now()
     }

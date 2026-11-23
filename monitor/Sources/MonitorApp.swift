@@ -9,7 +9,7 @@ struct MonitorView: View {
     let refreshAction: (() -> Void)?
     @AppStorage("darkAppearance") private var dark = false
     @AppStorage("selectedPage") private var savedPage = Page.environment.rawValue
-    @Environment(\.controlActiveState) private var controlActiveState
+    @FocusState private var focusedPage: Page?
     @State private var sidebarVisibility: NavigationSplitViewVisibility = .all
     @State private var showProxyDetails = false
 
@@ -21,14 +21,6 @@ struct MonitorView: View {
     }
 
     private var p: Palette { Palette(dark: dark) }
-    private var sidebarIconTint: Color { Color(red: 0, green: 149.0 / 255, blue: 1) }
-    private func sidebarForeground(selected: Bool, icon: Bool = false) -> Color {
-        if selected && controlActiveState == .key { return .white }
-        return icon ? sidebarIconTint : p.text
-    }
-    private var selection: Binding<Page?> {
-        Binding(get: { store.page }, set: { if let page = $0 { store.page = page } })
-    }
     private var statusTint: Color { store.error != nil ? p.amber : !store.automatic ? p.secondary : store.live ? p.mint : p.amber }
     private var statusTitle: String {
         if store.error != nil { return "本次同步未完成" }
@@ -71,10 +63,13 @@ struct MonitorView: View {
                         case .switcher: taskPage(.accounts)
                         case .protection: taskPage(.protection)
                         }
+                        if store.page.isLeakCheck || store.page == .ipScore {
+                            PageLink(title: "返回环境状态", p: p) { store.page = .environment }
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
                     }.frame(maxWidth: 1280).frame(maxWidth: .infinity)
                         .padding(.horizontal, 20).padding(.bottom, 20)
                 }
-                if store.page.isPrimary { SwitcherFeedbackRegion(store: store.switcher, p: p) }
                 footer
             }.background(p.background)
         }
@@ -87,6 +82,8 @@ struct MonitorView: View {
             }
         }
         .foregroundStyle(p.text)
+        .font(WatchTypography.body)
+        .fontDesign(.monospaced)
         .preferredColorScheme(dark ? .dark : .light)
         .onChange(of: dark) { _, value in
             // Keep window chrome, sheets and alerts in step with the palette;
@@ -109,25 +106,41 @@ struct MonitorView: View {
     }
 
     private func taskPage(_ section: SwitcherSection) -> some View {
-        SwitcherPage(store: store.switcher, p: p, section: section, navigate: { target in
+        SwitcherPage(store: store.switcher, p: p, desktopPresence: store.desktopPresence,
+                     section: section, navigate: { target in
             store.page = target == .environment ? .environment : target == .accounts ? .switcher : .protection
-        }, openLeakCheck: { kind in store.page = kind == .dns ? .dns : .webrtc }, leakChecks: store.leakChecks, netCoffee: store.netCoffee, finished: { store.page = .environment })
+        }, openLeakCheck: { kind in store.page = kind == .dns ? .dns : .webrtc },
+        openNetwork: store.showConnections, openIPScore: { ip in
+            store.netCoffee.selectedForPage(ip)
+            store.netCoffee.query = ip
+            store.page = .ipScore
+        }, channelState: store.channelState(for:), leakChecks: store.leakChecks,
+        netCoffee: store.netCoffee, finished: { store.page = .environment })
     }
 
     private func navRow(_ page: Page) -> some View {
         let selected = store.page == page
-        return HStack(spacing: 8) {
-            Image(systemName: page.symbol)
-                .font(.system(size: 14, weight: .regular))
-                .foregroundStyle(sidebarForeground(selected: selected, icon: true))
-                .frame(width: 18, height: 18)
-            Text(page.rawValue)
+        return Button { store.page = page } label: {
+            HStack(spacing: 8) {
+                Group {
+                    if page == .claudeAI || page == .gptAI {
+                        BrandLogo(brand: page == .claudeAI ? .claude : .chatgpt, size: 14)
+                    } else {
+                        Image(systemName: page.symbol)
+                            .font(.system(size: 14, weight: .medium)).foregroundStyle(p.blue)
+                    }
+                }.frame(width: 18, height: 18).accessibilityHidden(true)
+                Text(page.rawValue).font(selected ? WatchTypography.bodyStrong : WatchTypography.body)
+                    .lineLimit(1).minimumScaleFactor(0.85)
+            }
+            .foregroundStyle(p.text)
+            .padding(.horizontal, 6).frame(maxWidth: .infinity, minHeight: 31, alignment: .leading)
+            .background(selected ? p.color(0x3D5164, 0xE8EFF5) : .clear, in: RoundedRectangle(cornerRadius: 7))
+            .contentShape(Rectangle())
         }
-        .font(WatchTypography.body)
-        .fontWeight(selected ? .semibold : .regular)
-        .foregroundStyle(sidebarForeground(selected: selected))
-        .padding(.vertical, 4)
-        .tag(page)
+        .buttonStyle(.plain).focused($focusedPage, equals: page)
+        .accessibilityAddTraits(selected ? .isSelected : [])
+        .listRowInsets(EdgeInsets(top: 0, leading: 0, bottom: 0, trailing: 0))
     }
 
     private var sidebar: some View {
@@ -135,12 +148,12 @@ struct MonitorView: View {
             VStack(alignment: .leading, spacing: 7) {
                 HStack(spacing: 8) {
                     Image(systemName: "shield.lefthalf.filled").font(.system(size: 19)).foregroundStyle(p.mint)
-                    Text("Claude Watch").font(.system(size: 14, weight: .semibold)).lineLimit(1)
+                    Text("Claude Watch").font(WatchTypography.section).lineLimit(1)
                     Spacer(minLength: 0)
                 }
-                Text("Claude · ChatGPT / Codex").font(WatchTypography.small).foregroundStyle(p.secondary).lineLimit(1)
+                Text("Claude · ChatGPT / Codex").font(WatchTypography.small).foregroundStyle(p.secondary).lineLimit(1).minimumScaleFactor(0.82)
             }.padding(.horizontal, 15).padding(.top, 16).padding(.bottom, 15)
-            List(selection: selection) {
+            List {
                 Section {
                     ForEach(Page.primaryPages, id: \.self) { page in navRow(page) }
                 } header: {
@@ -152,29 +165,25 @@ struct MonitorView: View {
                     Text("监控与记录").foregroundStyle(p.secondary)
                 }
                 Section {
-                    ForEach(Page.diagnosticPages, id: \.self) { page in
-                        let selected = store.page == page
-                        HStack(spacing: 8) {
-                            Group {
-                                if page == .claudeAI || page == .gptAI { BrandLogo(brand:page == .claudeAI ? .claude : .chatgpt,size:14) }
-                                else { InspectorIcon(name:page.symbol,color: sidebarForeground(selected: selected, icon: true)) }
-                            }.frame(width:18,height:18)
-                            Text(page.rawValue)
-                        }
-                        .font(WatchTypography.body)
-                        .fontWeight(selected ? .semibold : .regular)
-                        .foregroundStyle(sidebarForeground(selected: selected))
-                        .padding(.vertical, 4).tag(page)
-                    }
+                    ForEach(Page.diagnosticPages, id: \.self) { page in navRow(page) }
                 } header: {
                     Text("网络检测").foregroundStyle(p.secondary)
                 }
             }.listStyle(.sidebar).scrollContentBackground(.hidden)
+            .onMoveCommand { direction in
+                let pages = Page.orderedPages
+                guard direction == .up || direction == .down,
+                      let index = pages.firstIndex(of: focusedPage ?? store.page) else { return }
+                let next = index + (direction == .down ? 1 : -1)
+                guard pages.indices.contains(next) else { return }
+                focusedPage = pages[next]
+                store.page = pages[next]
+            }
             VStack(alignment: .leading, spacing: 12) {
                 Divider()
                 HStack(spacing: 7) {
-                    Circle().fill(statusTint).frame(width: 6, height: 6)
-                    Text(store.error != nil ? "后台数据读取未完成" : !store.automatic ? "界面刷新已暂停" : store.live ? "采集后台心跳正常" : "等待后台数据")
+                    Circle().fill(store.live ? p.mint : p.amber).frame(width: 6, height: 6)
+                    Text(store.live ? (store.automatic ? "采集后台心跳正常" : "上次后台心跳正常") : store.snapshot == nil ? "等待后台心跳" : "后台心跳待核对")
                         .font(WatchTypography.caption).foregroundStyle(p.secondary)
                 }
                 HStack {
@@ -197,9 +206,6 @@ struct MonitorView: View {
                 Text(pageCaption).font(WatchTypography.body).foregroundStyle(p.secondary)
             }
             Spacer(minLength: 12)
-            Text(store.page.isManualCheck ? "手动检测" : store.page == .network ? "连接管理" : "只读监控").font(WatchTypography.small).foregroundStyle(p.secondary)
-                .padding(.horizontal, 9).padding(.vertical, 5)
-                .background(p.elevated, in: Capsule())
         }.padding(.horizontal, 22).padding(.top, 20).padding(.bottom, 18)
     }
     private var pageCaption: String {
@@ -220,28 +226,50 @@ struct MonitorView: View {
     }
     private var footer: some View {
         HStack(spacing: 7) {
-            Circle().fill(statusTint).frame(width: 5, height: 5)
-            Text(store.error != nil ? "本次同步未完成" : !store.automatic ? "界面同步已暂停" : store.live ? "后台数据自动同步" : "等待有效状态")
+            if store.error != nil {
+                Label("本次同步未完成", systemImage: "exclamationmark.triangle").foregroundStyle(p.amber)
+            } else if !store.automatic {
+                Label("自动检测与刷新已暂停", systemImage: "pause.circle")
+            }
             Spacer()
-            Text(pageSampleTime)
-                .monospacedDigit()
+            pageSampleTime.monospacedDigit()
         }.font(WatchTypography.small).foregroundStyle(p.secondary)
             .padding(.horizontal, 20).frame(height: 31)
             .background(p.surface.opacity(0.5))
             .overlay(alignment: .top) { Rectangle().fill(p.border.opacity(0.55)).frame(height: 1) }
     }
-    private var pageSampleTime: String {
-        if store.page == .environment { return store.switcher.currentEnvironment.map { "环境采样于 " + timeText($0.observed_at) } ?? "环境尚未采样" }
-        if store.page == .switcher { return store.switcher.currentPolicyEvaluation.map { "同轮检测于 " + timeText($0.observed_at) } ?? "等待当前启动要求检测" }
-        if store.page == .protection { return store.switcher.background.map { "状态读取于 " + timeText($0.observed_at) } ?? "后台状态尚未读取" }
-        return store.snapshot.map { "后台数据采样于 " + timeText($0.capturedAt) } ?? "等待首次读取"
+    @ViewBuilder private var pageSampleTime: some View {
+        switch store.page {
+        case .environment:
+            SampleTimestamp(source: store.switcher, label: "环境采样") { $0.currentEnvironment?.observed_at }
+        case .switcher:
+            SampleTimestamp(source: store.switcher, label: "启动条件采样") { $0.currentPolicyEvaluation?.observed_at }
+        case .protection:
+            SampleTimestamp(source: store.switcher, label: "后台状态读取") { $0.background?.observed_at }
+        case .claudeAI, .gptAI:
+            let service: AIService = store.page == .claudeAI ? .claude : .gpt
+            SampleTimestamp(source: store.aiChecks, label: "服务检测") { $0.state(service).result?.finishedAt }
+        case .dns, .webrtc:
+            let dns = store.page == .dns
+            SampleTimestamp(source: store.leakChecks, label: "最近检测") { (dns ? $0.dns : $0.rtc).result?.finishedAt }
+        case .ipScore:
+            SampleTimestamp(source: store.netCoffee, label: "IP 资料查询") { $0.report($0.selectedIP)?.queriedAt }
+        case .network:
+            let display = store.graphDisplay(for: store.networkSelection.product)
+            Text(display.sample.map { (display.isHistorical ? "历史连接采样于 " : "连接采样于 ") + timeText($0.observedAt) } ?? "等待连接采样")
+        case .processes, .events, .overview:
+            Text(store.snapshot.map { "后台快照 " + timeText($0.capturedAt) } ?? "等待后台快照")
+        }
     }
 
     private var overview: some View {
-        Group {
+        let baseline = SessionBaselinePresentation.make(evidence: store.switcher.sessionDisplayEvidence,
+                                                        now: store.now.timeIntervalSince1970)
+        let baselineNeedsAttention = ["danger", "warning"].contains(baseline.tone)
+        return Group {
             Surface(p, padding: 18) {
                 HStack(spacing: 15) {
-                    Image(systemName: "gearshape.2")
+                    Image(systemName: "server.rack")
                         .font(.system(size: 26, weight: .regular)).foregroundStyle(statusTint)
                         .frame(width: 48, height: 48).background(statusTint.opacity(0.08), in: RoundedRectangle(cornerRadius: 13))
                     VStack(alignment: .leading, spacing: 6) {
@@ -252,30 +280,12 @@ struct MonitorView: View {
                     Spacer(minLength: 16)
                     VStack(alignment: .trailing, spacing: 7) {
                         Badge(text: store.error != nil ? "读取失败" : !store.automatic ? "界面刷新暂停" : store.live ? "心跳正常" : "待核对", color: statusTint)
-                        Text(verbatim: store.snapshot?.health.pid.map { "服务 PID \($0)" } ?? "读取服务信息")
-                            .font(WatchTypography.mono).foregroundStyle(p.secondary)
+                        PageLink(title: "查看后台保护", p: p) { store.page = .protection }
                     }
                 }
-            }
-            HStack(spacing: 12) {
-                metric("AI 应用进程", value: store.snapshot.map { String($0.processes.count) } ?? "—",
-                       detail: store.snapshot == nil ? "等待首次采样" : "最近采样的进程数量", symbol: "waveform.path", tint: p.blue)
-                metric("本机代理入口", value: store.entryTitle,
-                       detail: store.proxy?.endpoint.replacingOccurrences(of: "http://", with: "") ?? "等待代理快照",
-                       symbol: "cable.connector", tint: store.proxy?.entryState == "verified" ? p.mint : p.amber)
-                metric("实际代理链", value: store.chainTitle,
-                       detail: store.proxy?.flows.isEmpty == false ? "以选中连接的证据为准" : "使用受监控应用后产生连接样本",
-                       symbol: "point.3.connected.trianglepath.dotted", tint: store.chainTitle == "样本匹配" ? p.mint : p.blue)
-            }
-            HStack(alignment: .top, spacing: 16) {
-                Surface(p) {
-                    SectionHeading(title: "检测提示", p: p).padding(.bottom, 13)
-                    VStack(spacing: 9) {
-                        if let error = store.error {
-                            InlineNotice(title: "本次同步未完成", detail: error, symbol: "exclamationmark.triangle", tint: p.amber, p: p)
-                        } else if !store.automatic {
-                            InlineNotice(title: "界面同步已暂停", detail: "可点击刷新读取最新结果。", symbol: "pause.circle", tint: p.secondary, p: p)
-                        } else if store.proxy == nil {
+                VStack(alignment: .leading, spacing: 7) {
+                    if store.error == nil && store.automatic {
+                        if store.proxy == nil {
                             InlineNotice(title: "代理快照尚未就绪", detail: store.proxyError ?? "等待后台提供有效采样。",
                                          symbol: "clock", tint: p.amber, p: p)
                         } else if store.proxy?.selectionDiffers == true {
@@ -285,25 +295,12 @@ struct MonitorView: View {
                             InlineNotice(title: "入口与控制器尚未关联", detail: "当前控制器数据不能证明该入口的流量路径。",
                                          symbol: "link", tint: p.amber, p: p)
                         }
-                        let baseline = SessionBaselinePresentation.make(evidence: store.switcher.sessionDisplayEvidence,
-                                                                       now: store.now.timeIntervalSince1970)
-                        InlineNotice(title: baseline.title, detail: baseline.detail, symbol: baseline.symbol,
-                                     tint: baseline.tone == "danger" ? p.red : baseline.tone == "warning" ? p.amber : baseline.tone == "success" ? p.mint : p.blue, p: p)
-                        if store.snapshot?.monitoredApps?.isEmpty == false && !multiProductCoverageDeclared {
-                            InlineNotice(title: "Codex 与 ChatGPT 需要更新后台", detail: "当前后台没有声明 Codex 与 ChatGPT 的采集能力；界面不会把未采样到的 0 个进程显示为已覆盖。",
-                                         symbol: "arrow.down.app", tint: p.amber, p: p)
-                        }
                     }
-                    Button { store.page = .network } label: { Label("查看连接证据", systemImage: "arrow.right") }
-                        .buttonStyle(.borderless).font(WatchTypography.caption).foregroundStyle(p.blue).padding(.top, 13)
-                }
-                Surface(p) {
-                    SectionHeading(title: "服务信息", p: p).padding(.bottom, 10)
-                    DetailRow(title: "最近心跳", value: heartbeatValue, p: p, monospaced: true)
-                    DetailRow(title: "登录自启", value: store.snapshot.map { $0.autoStart ? "已配置" : "未配置" } ?? "读取中", p: p)
-                    DetailRow(title: "异常退出恢复", value: store.snapshot.map { $0.keepAlive ? "已配置" : "未配置" } ?? "读取中", p: p)
-                    DetailRow(title: "系统提醒", value: WatchNotificationAccess.summary(mode: store.snapshot?.health.alerts, access: store.notificationAccess), p: p,
-                              tint: store.notificationAccess.notice == nil ? nil : p.amber)
+                    if baselineNeedsAttention { baselineNotice(baseline) }
+                    if store.snapshot?.monitoredApps?.isEmpty == false && !multiProductCoverageDeclared {
+                        InlineNotice(title: "Codex 与 ChatGPT 需要更新后台", detail: "当前后台没有声明 Codex 与 ChatGPT 的采集能力；界面不会把未采样到的 0 个进程显示为已覆盖。",
+                                     symbol: "arrow.down.app", tint: p.amber, p: p)
+                    }
                     if let notice = store.notificationAccess.notice {
                         HStack(alignment: .top, spacing: 8) {
                             Text(notice).font(WatchTypography.caption).foregroundStyle(p.amber)
@@ -312,10 +309,21 @@ struct MonitorView: View {
                             }.buttonStyle(.borderless).font(WatchTypography.caption)
                         }
                     }
-                    Text("关闭窗口后，已安装的后台服务继续运行。")
-                        .font(WatchTypography.caption).foregroundStyle(p.secondary).lineSpacing(3).padding(.top, 11)
-                    Button("查看保镖与任务实际状态") { store.page = .protection }.buttonStyle(.borderless).font(WatchTypography.caption).padding(.top, 8)
                 }
+            }
+            Surface(p, padding: 12) {
+                HStack(spacing: 12) {
+                    metric("AI 应用进程", value: store.snapshot.map { String($0.processes.count) } ?? "—",
+                           detail: store.snapshot == nil ? "等待首次采样" : "最近采样的进程数量", symbol: Page.processes.symbol, tint: p.blue, destination: .processes)
+                    Divider()
+                    metric("本机代理入口", value: store.entryTitle,
+                           detail: store.proxy?.endpoint.replacingOccurrences(of: "http://", with: "") ?? "等待代理快照",
+                           symbol: "cable.connector", tint: store.proxy?.entryState == "verified" ? p.mint : p.amber, destination: .network)
+                    Divider()
+                    metric("实际代理链", value: store.chainTitle,
+                           detail: store.proxy?.flows.isEmpty == false ? "以选中连接的证据为准" : "使用受监控应用后产生连接样本",
+                           symbol: Page.network.symbol, tint: store.chainTitle == "样本匹配" ? p.mint : p.blue, destination: .network)
+                }.fixedSize(horizontal: false, vertical: true)
             }
             Surface(p) {
                 HStack {
@@ -334,7 +342,48 @@ struct MonitorView: View {
                         .font(WatchTypography.body).foregroundStyle(p.secondary).padding(.vertical, 16)
                 }
             }
+            Surface(p) {
+                SectionHeading(title: "应用与会话", p: p)
+                ForEach(MonitoredProduct.allCases) { product in
+                    let count = store.snapshot?.processes.filter { $0.product == product }.count
+                    Button { store.showConnections(product) } label: {
+                        HStack(spacing: 9) {
+                            BrandLogo(brand: product == .claude ? .claude : .chatgpt, size: 17)
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text(product.title).font(WatchTypography.bodyStrong)
+                                Text(store.channelState(for: product)?.protectionScopeLabel ?? "通道回执待读取")
+                                    .font(WatchTypography.small).foregroundStyle(p.secondary)
+                            }
+                            Spacer(minLength: 4)
+                            Text(count.map { "采样 \($0) 个进程" } ?? "等待采样")
+                                .font(WatchTypography.small).foregroundStyle(p.secondary)
+                            Image(systemName: "chevron.right").imageScale(.small).foregroundStyle(p.blue)
+                        }.padding(.vertical, 9).contentShape(Rectangle())
+                    }.buttonStyle(.plain)
+                    Divider()
+                }
+                if !baselineNeedsAttention { baselineNotice(baseline) }
+                Button { store.page = .network } label: { Label("查看连接证据", systemImage: "arrow.right") }
+                    .buttonStyle(.borderless).font(WatchTypography.caption).foregroundStyle(p.blue).padding(.top, 13)
+            }
+            Surface(p) {
+                DisclosureGroup("服务详情") {
+                    VStack(alignment: .leading, spacing: 6) {
+                        DetailRow(title: "服务 PID", value: store.snapshot?.health.pid.map(String.init) ?? "待确认", p: p, monospaced: true)
+                        DetailRow(title: "最近心跳", value: heartbeatValue, p: p, monospaced: true)
+                        DetailRow(title: "登录自启", value: store.snapshot.map { $0.autoStart ? "已配置" : "未配置" } ?? "读取中", p: p)
+                        DetailRow(title: "异常退出恢复", value: store.snapshot.map { $0.keepAlive ? "已配置" : "未配置" } ?? "读取中", p: p)
+                        DetailRow(title: "系统提醒", value: WatchNotificationAccess.summary(mode: store.snapshot?.health.alerts, access: store.notificationAccess), p: p,
+                                  tint: store.notificationAccess.notice == nil ? nil : p.amber)
+                    }.padding(.top, 8)
+                }.disclosureGroupStyle(FullWidthDisclosureStyle(p: p))
+            }
         }
+    }
+
+    private func baselineNotice(_ value: SessionBaselinePresentation) -> some View {
+        InlineNotice(title: value.title, detail: value.detail, symbol: value.symbol,
+                     tint: value.tone == "danger" ? p.red : value.tone == "warning" ? p.amber : value.tone == "success" ? p.mint : p.blue, p: p)
     }
 
     private var heartbeatValue: String {
@@ -345,18 +394,15 @@ struct MonitorView: View {
         let apps = Set(store.snapshot?.monitoredApps ?? [])
         return apps.contains("codex") && apps.contains("chatgpt")
     }
-    private func metric(_ title: String, value: String, detail: String, symbol: String, tint: Color) -> some View {
-        Surface(p, padding: 15) {
-            VStack(alignment: .leading, spacing: 9) {
-                HStack {
-                    Text(title).font(WatchTypography.caption).foregroundStyle(p.secondary)
-                    Spacer()
-                    Image(systemName: symbol).font(.system(size: 15)).foregroundStyle(tint)
-                }
-                Text(value).font(.system(size: 21, weight: .semibold, design: .rounded)).monospacedDigit()
-                Text(detail).font(WatchTypography.caption).foregroundStyle(p.secondary).lineLimit(2)
-            }.frame(minHeight: 83, alignment: .topLeading)
-        }
+    private func metric(_ title: String, value: String, detail: String, symbol: String, tint: Color, destination: Page) -> some View {
+        Button { store.page = destination } label: {
+            VStack(alignment: .leading, spacing: 5) {
+                Label(title, systemImage: symbol).font(WatchTypography.captionStrong).foregroundStyle(tint)
+                Text(value).font(WatchTypography.title)
+                Text(detail).font(WatchTypography.small).foregroundStyle(p.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }.frame(maxWidth: .infinity, alignment: .topLeading).contentShape(Rectangle())
+        }.buttonStyle(.plain).help("查看" + destination.rawValue)
     }
 
     private var network: some View {
@@ -402,6 +448,16 @@ func modeName(_ mode: String) -> String {
     case "rule": return "规则模式"
     case "direct": return "直连模式"
     default: return "待确认"
+    }
+}
+
+private struct SampleTimestamp<Source: ObservableObject>: View {
+    @ObservedObject var source: Source
+    let label: String
+    let timestamp: (Source) -> Double?
+
+    var body: some View {
+        Text(timestamp(source).flatMap { $0.isFinite && $0 > 0 ? label + " " + timeText($0) : nil } ?? "等待" + label)
     }
 }
 

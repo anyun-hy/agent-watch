@@ -494,6 +494,10 @@ final class MonitorStore: ObservableObject {
     private func refreshEnvironmentQuality(_ result: CurrentEnvironmentReceipt) {
         if let receipt = result.netcoffee_lookup { netCoffee.ingest(receipt) }
     }
+    func showConnections(_ product: MonitoredProduct) {
+        networkSelection.product = product
+        page = .network
+    }
     func synchronizeNetworkSelection() {
         var selection = networkSelection
         selection.reconcile(proxy: proxy, processes: snapshot?.processes ?? [],

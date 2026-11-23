@@ -79,9 +79,9 @@ impl Request {
                 &["confirm-force"],
             ),
             "account" => (
-                &["status", "switch", "recover", "import"],
+                &["status", "current", "identity", "save", "switch", "recover", "import"],
                 &["apply", "ack-unverified-version"],
-                &[],
+                &["product"],
             ),
             "repair" | "fix" | "set-region" => (&[], &["apply"], &["plan-id", "allow-country"]),
             "restore-settings" => (&[], &["apply"], &[]),
@@ -194,12 +194,26 @@ impl Request {
             positionals.remove(0);
         }
         if command == "account" {
+            let action = request.action.as_deref();
+            let product = request.value("product").unwrap_or("claude");
+            match (product, action) {
+                ("claude", Some("status" | "current" | "save" | "switch" | "recover" | "import")) |
+                ("chatgpt", Some("status" | "identity" | "save" | "switch")) => {}
+                _ => return Err(invalid()),
+            }
             if let Some(target) = positionals.first() {
                 if !["A", "B"].contains(&target.as_str()) {
                     return Err(invalid());
                 }
                 request.target = Some(target.clone());
                 positionals.remove(0);
+            }
+            if (action == Some("save") && request.target.is_none())
+                || (matches!(action, Some("identity" | "current")) && request.target.is_some())
+                || (request.value("product") == Some("chatgpt")
+                    && matches!(action, Some("status" | "switch"))
+                    && (action == Some("switch")) != request.target.is_some()) {
+                return Err(invalid());
             }
         }
         if command == "coffee" {
@@ -332,7 +346,10 @@ impl Request {
             value["action"] = json!(action)
         }
         if self.command == "account" {
-            value["target"] = json!(self.target)
+            value["target"] = json!(self.target);
+            if let Some(product) = self.value("product") {
+                value["product"] = json!(product);
+            }
         }
         if let Some(id) = &self.receipt_id {
             value["receipt_id"] = json!(id)
@@ -378,6 +395,48 @@ impl Request {
 #[cfg(test)]
 mod cli_target_contracts {
     use super::*;
+    #[test]
+    fn chatgpt_account_accepts_verified_reads_and_explicit_a_b_writes() {
+        let parse = |args: &[&str]| Request::parse(&args.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        let switch = parse(&["account", "switch", "B", "--product", "chatgpt", "--apply"]).unwrap();
+        assert_eq!(switch.target.as_deref(), Some("B"));
+        switch.require_apply().unwrap();
+        assert_eq!(switch.namespace()["product"], "chatgpt");
+        let preview = parse(&["account", "switch", "A", "--product", "chatgpt"]).unwrap();
+        assert_eq!(preview.require_apply().unwrap_err().code, "explicit_apply_required");
+        assert!(parse(&["account", "status", "--product", "chatgpt"]).is_ok());
+        assert!(parse(&["account", "identity", "--product", "chatgpt"]).is_ok());
+        assert!(parse(&["account", "current", "--product", "claude"]).is_ok());
+        for product in ["chatgpt", "claude"] {
+            let save = parse(&["account", "save", "B", "--product", product, "--apply"]).unwrap();
+            assert_eq!(save.target.as_deref(), Some("B"));
+            save.require_apply().unwrap();
+            assert!(parse(&["account", "save", "--product", product]).is_err());
+        }
+        for args in [&["account","recover","--product","chatgpt"][..],
+                     &["account","identity","B","--product","chatgpt"],
+                     &["account","identity","--product","claude"],
+                     &["account","current","--product","chatgpt"],
+                     &["account","switch","--product","chatgpt"],
+                     &["account","switch","C","--product","chatgpt"],
+                     &["account","switch","B","--product","other"]] {
+            assert!(parse(args).is_err());
+        }
+    }
+    #[test]
+    fn snapshot_history_is_included_unless_explicitly_omitted() {
+        for (args, omit_events) in [
+            (vec!["snapshot"], false),
+            (vec!["snapshot", "--full"], false),
+            (vec!["snapshot", "--without-channel-events"], true),
+        ] {
+            let request = Request::parse(&args.into_iter().map(str::to_owned).collect::<Vec<_>>()).unwrap();
+            assert_eq!(request.flag("without-channel-events"), omit_events);
+        }
+        let conflicting = ["snapshot", "--full", "--without-channel-events"].map(str::to_owned);
+        assert!(Request::parse(&conflicting).is_err());
+    }
+
     #[test]
     fn process_exit_requires_explicit_apply_and_has_no_force_fallback() {
         let prepare = Request::parse(&["process-exit", "prepare", "--family", "claude"].map(str::to_owned)).unwrap();

@@ -27,6 +27,8 @@ final class LeakCheckStore: ObservableObject {
     private var requests: [LeakKind: String] = [:]
     private var replies: [LeakKind: (context: String, item: LeakEvidenceItem)] = [:]
 
+    var evidenceDeadlines: [Double] { replies.values.compactMap { $0.item.valid_until?.nextUp } }
+
     init(isFixture: Bool = false) {
         #if UI_REVIEW
         self.isFixture = true

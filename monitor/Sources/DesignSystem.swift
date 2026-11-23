@@ -1,15 +1,15 @@
 import SwiftUI
 
 enum WatchTypography {
-    static let pageTitle = Font.system(size: 22, weight: .semibold)
-    static let title = Font.system(size: 17, weight: .semibold)
-    static let section = Font.system(size: 14, weight: .semibold)
-    static let body = Font.system(size: 13)
-    static let bodyStrong = Font.system(size: 13, weight: .medium)
-    static let caption = Font.system(size: 12)
-    static let captionStrong = Font.system(size: 12, weight: .medium)
-    static let small = Font.system(size: 11)
-    static let mono = Font.system(size: 12, design: .monospaced)
+    static let pageTitle = Font.system(size: 22, weight: .semibold, design: .monospaced)
+    static let title = Font.system(size: 17, weight: .semibold, design: .monospaced)
+    static let section = Font.system(size: 14, weight: .semibold, design: .monospaced)
+    static let body = Font.system(size: 13, design: .monospaced)
+    static let bodyStrong = Font.system(size: 13, weight: .medium, design: .monospaced)
+    static let caption = Font.system(size: 12, design: .monospaced)
+    static let captionStrong = Font.system(size: 12, weight: .medium, design: .monospaced)
+    static let small = Font.system(size: 11, design: .monospaced)
+    static let mono = caption
 }
 
 struct Palette {
@@ -46,7 +46,7 @@ struct Surface<Content: View>: View {
         VStack(alignment: .leading, spacing: 0) { content }
             .padding(padding).frame(maxWidth: .infinity, alignment: .leading)
             .background(p.surface, in: RoundedRectangle(cornerRadius: 12))
-            .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(p.border.opacity(0.85), lineWidth: 1))
+            .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(p.border.opacity(0.65), lineWidth: 1))
     }
 }
 
@@ -56,7 +56,7 @@ struct Badge: View {
     var body: some View {
         HStack(spacing: 5) {
             Circle().fill(color).frame(width: 5, height: 5)
-            Text(text).font(.system(size: 11, weight: .medium)).lineLimit(1)
+            Text(text).font(WatchTypography.small.weight(.medium)).lineLimit(1)
         }.padding(.horizontal, 8).padding(.vertical, 4)
             .foregroundStyle(color).background(color.opacity(0.1), in: Capsule())
             .accessibilityElement(children: .combine)
@@ -69,12 +69,28 @@ struct SectionHeading: View {
     let p: Palette
     var body: some View {
         VStack(alignment: .leading, spacing: 5) {
-            Text(title).font(WatchTypography.section).foregroundStyle(p.text)
+            Text(title).font(WatchTypography.section).foregroundStyle(p.text).accessibilityAddTraits(.isHeader)
             if let caption {
                 Text(caption).font(WatchTypography.caption).foregroundStyle(p.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
         }
+    }
+}
+
+struct PageLink: View {
+    let title: String
+    let p: Palette
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 5) {
+                Text(title)
+                Image(systemName: "chevron.right").imageScale(.small)
+            }
+        }
+        .buttonStyle(.borderless).font(WatchTypography.captionStrong).foregroundStyle(p.blue)
     }
 }
 
@@ -194,8 +210,12 @@ struct BackgroundRefreshControl: View {
     let refreshing: Bool
     let action: () -> Void
     var body: some View {
-        Button(action: action) { RefreshActionLabel(title: "刷新后台数据", loading: refreshing) }
-            .buttonStyle(.bordered).disabled(refreshing)
+        Button(action: action) {
+            ZStack {
+                Image(systemName: "arrow.clockwise").opacity(refreshing ? 0 : 1)
+                if refreshing { ProgressView().controlSize(.small) }
+            }.frame(width: 22, height: 22)
+        }.disabled(refreshing).accessibilityLabel(refreshing ? "正在刷新后台数据" : "刷新后台数据")
     }
 }
 struct EnvironmentDetectionControl: View {
@@ -203,8 +223,8 @@ struct EnvironmentDetectionControl: View {
     let disabled: Bool
     let action: () -> Void
     var body: some View {
-        Button(action: action) { RefreshActionLabel(title: reading ? "取消检测" : "重新检测", loading: reading) }
-            .disabled(disabled).accessibilityLabel(reading ? "取消检测" : "重新检测")
+        Button(action: action) { RefreshActionLabel(title: reading ? "取消检测" : "检测环境", loading: reading) }
+            .disabled(disabled).accessibilityLabel(reading ? "取消环境检测" : "检测环境")
     }
 }
 
@@ -221,7 +241,7 @@ struct MonitorRefreshToolbar: ToolbarContent {
         ToolbarItem(placement: .primaryAction) {
             BackgroundRefreshControl(refreshing: refreshing, action: action)
                 .keyboardShortcut("r", modifiers: .command)
-                .help("读取最新后台数据，自动同步不会改变按钮状态")
+                .help("刷新后台数据（⌘R）")
         }
     }
 }

@@ -391,6 +391,7 @@ mod tests {
     #[test]
     fn mapped_trace_ip_uses_python_ipv4_canonical_form() {
         assert_eq!(trace_ip("ip=::ffff:8.8.8.8\n"), Some("8.8.8.8".into()));
+        assert_eq!(trace_ip("xip=1.1.1.1\n"), None);
     }
     #[test]
     fn invalid_geo_is_discarded() {

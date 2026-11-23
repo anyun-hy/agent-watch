@@ -11,8 +11,8 @@
 //!   Unix domain socket network relays are blocked by `(deny network*)` (`D05`),
 //!   and any out-of-tree `NSWorkspace`/`LaunchServices` process not registered in
 //!   `SandboxLaunchRegistry` is surfaced as `RunningUnprotected` (`D04`).
-//! - CLI shim resolution skips the shim's own directory/executable in `PATH` to
-//!   prevent self-recursion (`C01`), preserving arguments, `cwd`, stdio, and exit code.
+//! - A staged CLI shim forwards the original arguments to the engine's controlled
+//!   launch command and supplies its own path for target discovery to exclude.
 
 use crate::sandbox_launch::SandboxLaunchRegistry;
 use claude_watch_core::{
@@ -27,13 +27,11 @@ use claude_watch_core::{
 use claude_watch_system::sha256_file_hex;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeMap,
     fs,
     io::Read,
     net::SocketAddr,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
 };
 use uuid::Uuid;
 
@@ -49,6 +47,38 @@ pub struct DesktopManagedEntrySpec {
 }
 
 impl DesktopManagedEntrySpec {
+    pub(crate) fn may_match_seatbelt_conflict(bundle_id: &str, executable: &Path) -> bool {
+        // Preview should not hash an unrelated large Codex executable. A missing
+        // file still goes through managed_spec and reports its identity error.
+        bundle_id == "com.openai.codex" && fs::metadata(executable).map_or(true, |m| m.len() == 71_008)
+    }
+
+    /// The build 28661 crash reports identify this main executable and the
+    /// Aperitif helper that reapplies Seatbelt during initialization.
+    pub fn check_seatbelt_compatibility(&self) -> Result<()> {
+        const MAIN: &str = "00305cecf34970bd6fffcd108812bb88888fbb89447ffb7d3bf966a43319a13f";
+        const HELPER: &str = "564867489d1ebcb6aec6965face332478ae9d73d6fc1f2af8c9fbc496751c53d";
+        const LIBRARY: &str = "16aa60f1543a10bac31341548349ae7af5e4b7ce637e20a103dc66f4147b43f5";
+        if self.target_bundle_id != "com.openai.codex" || self.target_fingerprint != MAIN {
+            return Ok(());
+        }
+        let framework = self.target_bundle_path.join("Contents/Frameworks/Codex Framework.framework/Versions/Current");
+        let verify = |relative: &str, size: u64, sha: &str| {
+            let path = fs::canonicalize(framework.join(relative)).ok()?;
+            if !path.starts_with(&self.target_bundle_path) { return None; }
+            if fs::metadata(&path).ok()?.len() != size { return Some(false); }
+            crate::executable_verification::VerificationKey::new_regular(path.to_str()?, sha)?.verify()
+        };
+        let helper = verify("Helpers/Codex (Aperitif).app/Contents/MacOS/Codex (Aperitif)", 51_568, HELPER);
+        let library = verify("Libraries/libaperitif.dylib", 85_456, LIBRARY);
+        match (helper, library) {
+            (Some(true), Some(true)) => Err(CoreError::new("desktop_sandbox_incompatible",
+                "此 ChatGPT 构建（28661）的 Aperitif 辅助进程与当前 Seatbelt 启动方式冲突，已阻止启动。")),
+            _ => Err(CoreError::new("desktop_compatibility_unverified",
+                "此 ChatGPT 主程序与已知构建相同，Aperitif 组件的身份未能确认，请核对应用更新是否已完成。")),
+        }
+    }
+
     pub fn entry_bundle_id_for(target: LaunchTarget) -> &'static str {
         match target {
             LaunchTarget::ClaudeDesktop => "io.local.watchpanel.entry.claude-desktop",
@@ -283,69 +313,6 @@ pub fn classify_process_protection_state(
     ManagedInstanceState::RunningUnprotected
 }
 
-/// Resolves the real CLI executable from `search_paths` (e.g. `PATH`), explicitly
-/// skipping `shim_executable` and `shim_dir` so a managed CLI shim placed early in
-/// `PATH` never invokes itself recursively (`C01`).
-pub fn resolve_real_cli_skipping_shim(
-    cli_name: &str,
-    shim_executable: &Path,
-    search_paths: &[PathBuf],
-) -> Result<(PathBuf, String)> {
-    resolve_real_cli_with_source(cli_name, shim_executable, search_paths)
-        .map(|resolved| (resolved.executable, resolved.fingerprint))
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ResolvedCliEntry {
-    pub entry_path: PathBuf,
-    pub executable: PathBuf,
-    pub fingerprint: String,
-}
-
-pub fn resolve_real_cli_with_source(
-    cli_name: &str,
-    shim_executable: &Path,
-    search_paths: &[PathBuf],
-) -> Result<ResolvedCliEntry> {
-    let canon_shim = fs::canonicalize(shim_executable).ok();
-    let shim_dir = canon_shim
-        .as_ref()
-        .and_then(|p| p.parent().map(Path::to_path_buf))
-        .or_else(|| shim_executable.parent().map(Path::to_path_buf));
-
-    for dir in search_paths {
-        if let Ok(canon_dir) = fs::canonicalize(dir) {
-            if shim_dir.as_ref() == Some(&canon_dir) {
-                continue;
-            }
-        } else if shim_dir.as_deref() == Some(dir.as_path()) {
-            continue;
-        }
-        let candidate = dir.join(cli_name);
-        let Ok(canon_cand) = fs::canonicalize(&candidate) else {
-            continue;
-        };
-        if canon_shim.as_ref() == Some(&canon_cand) {
-            continue;
-        }
-        let Ok(meta) = fs::metadata(&canon_cand) else {
-            continue;
-        };
-        if !meta.is_file() || (meta.permissions().mode() & 0o111 == 0) {
-            continue;
-        }
-        let Some(sha) = sha256_file_hex(&canon_cand) else {
-            continue;
-        };
-        return Ok(ResolvedCliEntry { entry_path: candidate, executable: canon_cand, fingerprint: sha });
-    }
-
-    Err(CoreError::new(
-        "real_cli_not_found",
-        &format!("在排除受控 shim 目录后未找到真实的 {cli_name} 可执行文件"),
-    ))
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedScriptContext {
     pub target_executable: String,
@@ -480,299 +447,6 @@ pub fn resolve_script_launcher_context(
         script_fingerprint: Some(real_sha.to_string()),
         interpreter: Some(interp_path.to_string_lossy().into_owned()),
         interpreter_fingerprint: Some(interp_sha),
-    })
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CliShimExecutionResult {
-    pub exit_code: i32,
-    pub resolved_executable: PathBuf,
-    pub resolved_fingerprint: String,
-    pub launch_request: ControlledLaunchRequest,
-}
-
-/// Executes a CLI target through `watch-sandbox-launcher`, preserving
-/// `args`, `cwd`, `env`, `stdin`/`stdout`/`stderr`, and exit status (`C01`).
-fn clear_helper_loader_environment(cmd: &mut Command) {
-    for (key, _) in std::env::vars_os() {
-        if key.to_str().is_some_and(claude_watch_core::controlled_launch::loader_startup_input) {
-            cmd.env_remove(key);
-        }
-    }
-}
-
-pub fn execute_cli_via_sandbox_launcher(
-    launcher_binary: &Path,
-    registration_socket: Option<&Path>,
-    target: LaunchTarget,
-    shim_executable: &Path,
-    search_paths: &[PathBuf],
-    args: &[String],
-    cwd: Option<&Path>,
-    extra_env: &BTreeMap<String, String>,
-    gateway_addr: SocketAddr,
-    executor_boot_id: &str,
-    policy_version: PolicyVersion,
-    vpn_epoch: Option<VpnEpoch>,
-    extra_deny_ports: &[u16],
-) -> Result<(CliShimExecutionResult, Vec<u8>, Vec<u8>)> {
-    execute_cli_via_sandbox_launcher_with_stdin(
-        launcher_binary,
-        registration_socket,
-        target,
-        shim_executable,
-        search_paths,
-        args,
-        cwd,
-        extra_env,
-        None,
-        gateway_addr,
-        executor_boot_id,
-        policy_version,
-        vpn_epoch,
-        extra_deny_ports,
-    )
-}
-
-/// Executes a CLI target through `watch-sandbox-launcher` with optional piped `stdin_input`
-/// and concurrent streaming readers for `stdout`/`stderr` (never forcing `Stdio::null()`
-/// when `stdin_input` is provided, and never blocking streaming output before child exit).
-#[allow(clippy::too_many_arguments)]
-pub fn execute_cli_via_sandbox_launcher_with_stdin(
-    launcher_binary: &Path,
-    registration_socket: Option<&Path>,
-    target: LaunchTarget,
-    shim_executable: &Path,
-    search_paths: &[PathBuf],
-    args: &[String],
-    cwd: Option<&Path>,
-    extra_env: &BTreeMap<String, String>,
-    stdin_input: Option<&[u8]>,
-    gateway_addr: SocketAddr,
-    executor_boot_id: &str,
-    policy_version: PolicyVersion,
-    vpn_epoch: Option<VpnEpoch>,
-    extra_deny_ports: &[u16],
-) -> Result<(CliShimExecutionResult, Vec<u8>, Vec<u8>)> {
-    use std::io::{Read, Write};
-
-    let cli_name = match target {
-        LaunchTarget::ClaudeCli => "claude",
-        LaunchTarget::CodexCli => "codex",
-        _ => {
-            return Err(CoreError::new(
-                "invalid_cli_target",
-                "受控 CLI shim 仅支持 claude-cli 或 codex-cli",
-            ))
-        }
-    };
-    let (real_exe, real_sha) =
-        resolve_real_cli_skipping_shim(cli_name, shim_executable, search_paths)?;
-    if is_script_file(&real_exe) {
-        return Err(CoreError::new("script_source_proof_required", "脚本启动必须走已核验的产品发现入口"));
-    }
-    let req = ControlledLaunchRequest {
-        entry_id: DesktopManagedEntrySpec::entry_bundle_id_for(target).to_string(),
-        target,
-        target_executable: real_exe.to_string_lossy().into_owned(),
-        target_fingerprint: real_sha.clone(),
-        args: args.to_vec(),
-        cwd: cwd.map(|p| p.to_string_lossy().into_owned()),
-        proxy_adaptation: ProxyAdaptationKind::EnvOnly,
-        gateway_endpoint: gateway_addr.to_string(),
-        policy_version,
-        vpn_epoch,
-        launch_nonce: format!("cli-nonce-{}", Uuid::new_v4()),
-        executor_boot_id: executor_boot_id.to_string(),
-        script_entry: None,
-        script_fingerprint: None,
-        interpreter: None,
-        interpreter_fingerprint: None,
-        script_source: None,
-    };
-    req.validate()?;
-    let req_json = serde_json::to_string(&req)
-        .map_err(|_| CoreError::new("serialize_launch_request_failed", "序列化受控启动请求失败"))?;
-
-    let mut cmd = Command::new(launcher_binary);
-    cmd.arg("--launch-json").arg(&req_json);
-    if let Some(sock) = registration_socket {
-        cmd.arg("--registration-socket").arg(sock);
-    }
-    for port in extra_deny_ports {
-        cmd.arg("--deny-port").arg(port.to_string());
-    }
-    if let Some(dir) = cwd {
-        cmd.current_dir(dir);
-    }
-    for (k, v) in extra_env {
-        if !claude_watch_core::controlled_launch::loader_startup_input(k) {
-            cmd.env(k, v);
-        }
-    }
-    clear_helper_loader_environment(&mut cmd);
-    cmd.stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-
-    let mut child = cmd.spawn().map_err(|_| {
-        CoreError::new(
-            "sandbox_launcher_spawn_failed",
-            "无法启动 watch-sandbox-launcher",
-        )
-    })?;
-
-    if let Some(mut child_stdin) = child.stdin.take() {
-        if let Some(bytes) = stdin_input {
-            let payload = bytes.to_vec();
-            std::thread::spawn(move || {
-                let _ = child_stdin.write_all(&payload);
-                let _ = child_stdin.flush();
-            });
-        } else {
-            drop(child_stdin);
-        }
-    }
-
-    let stdout_pipe = child.stdout.take();
-    let stderr_pipe = child.stderr.take();
-    let stdout_handle = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        if let Some(mut out) = stdout_pipe {
-            let mut chunk = [0u8; 4096];
-            while let Ok(n) = out.read(&mut chunk) {
-                if n == 0 {
-                    break;
-                }
-                buf.extend_from_slice(&chunk[..n]);
-            }
-        }
-        buf
-    });
-    let stderr_handle = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        if let Some(mut err) = stderr_pipe {
-            let mut chunk = [0u8; 4096];
-            while let Ok(n) = err.read(&mut chunk) {
-                if n == 0 {
-                    break;
-                }
-                buf.extend_from_slice(&chunk[..n]);
-            }
-        }
-        buf
-    });
-
-    let status = child.wait().map_err(|_| {
-        CoreError::new(
-            "sandbox_launcher_wait_failed",
-            "等待受控 CLI 子进程退出失败",
-        )
-    })?;
-    let stdout_bytes = stdout_handle.join().unwrap_or_default();
-    let stderr_bytes = stderr_handle.join().unwrap_or_default();
-    let code = status.code().unwrap_or(1);
-    Ok((
-        CliShimExecutionResult {
-            exit_code: code,
-            resolved_executable: real_exe,
-            resolved_fingerprint: real_sha,
-            launch_request: req,
-        },
-        stdout_bytes,
-        stderr_bytes,
-    ))
-}
-
-/// Runs an interactive CLI session through `watch-sandbox-launcher` with inherited
-/// `stdin`, `stdout`, `stderr`, and controlling `TTY` (`Stdio::inherit()`), preserving
-/// interactive terminal behavior, streaming output, and exact exit status (`C01`).
-#[allow(clippy::too_many_arguments)]
-pub fn run_cli_interactive_via_sandbox_launcher(
-    launcher_binary: &Path,
-    registration_socket: Option<&Path>,
-    target: LaunchTarget,
-    shim_executable: &Path,
-    search_paths: &[PathBuf],
-    args: &[String],
-    cwd: Option<&Path>,
-    extra_env: &BTreeMap<String, String>,
-    gateway_addr: SocketAddr,
-    executor_boot_id: &str,
-    policy_version: PolicyVersion,
-    vpn_epoch: Option<VpnEpoch>,
-    extra_deny_ports: &[u16],
-) -> Result<CliShimExecutionResult> {
-    let cli_name = match target {
-        LaunchTarget::ClaudeCli => "claude",
-        LaunchTarget::CodexCli => "codex",
-        _ => {
-            return Err(CoreError::new(
-                "invalid_cli_target",
-                "受控 CLI shim 仅支持 claude-cli 或 codex-cli",
-            ))
-        }
-    };
-    let (real_exe, real_sha) =
-        resolve_real_cli_skipping_shim(cli_name, shim_executable, search_paths)?;
-    if is_script_file(&real_exe) {
-        return Err(CoreError::new("script_source_proof_required", "脚本启动必须走已核验的产品发现入口"));
-    }
-    let req = ControlledLaunchRequest {
-        entry_id: DesktopManagedEntrySpec::entry_bundle_id_for(target).to_string(),
-        target,
-        target_executable: real_exe.to_string_lossy().into_owned(),
-        target_fingerprint: real_sha.clone(),
-        args: args.to_vec(),
-        cwd: cwd.map(|p| p.to_string_lossy().into_owned()),
-        proxy_adaptation: ProxyAdaptationKind::EnvOnly,
-        gateway_endpoint: gateway_addr.to_string(),
-        policy_version,
-        vpn_epoch,
-        launch_nonce: format!("cli-nonce-{}", Uuid::new_v4()),
-        executor_boot_id: executor_boot_id.to_string(),
-        script_entry: None,
-        script_fingerprint: None,
-        interpreter: None,
-        interpreter_fingerprint: None,
-        script_source: None,
-    };
-    req.validate()?;
-    let req_json = serde_json::to_string(&req)
-        .map_err(|_| CoreError::new("serialize_launch_request_failed", "序列化受控启动请求失败"))?;
-
-    let mut cmd = Command::new(launcher_binary);
-    cmd.arg("--launch-json").arg(&req_json);
-    if let Some(sock) = registration_socket {
-        cmd.arg("--registration-socket").arg(sock);
-    }
-    for port in extra_deny_ports {
-        cmd.arg("--deny-port").arg(port.to_string());
-    }
-    if let Some(dir) = cwd {
-        cmd.current_dir(dir);
-    }
-    for (k, v) in extra_env {
-        if !claude_watch_core::controlled_launch::loader_startup_input(k) {
-            cmd.env(k, v);
-        }
-    }
-    clear_helper_loader_environment(&mut cmd);
-    cmd.stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit());
-
-    let status = cmd.status().map_err(|_| {
-        CoreError::new(
-            "sandbox_launcher_spawn_failed",
-            "无法启动 watch-sandbox-launcher",
-        )
-    })?;
-    Ok(CliShimExecutionResult {
-        exit_code: status.code().unwrap_or(1),
-        resolved_executable: real_exe,
-        resolved_fingerprint: real_sha,
-        launch_request: req,
     })
 }
 
@@ -937,35 +611,6 @@ pub fn stage_cli_entry_shim(
     fs::set_permissions(&shim_path, perms)
         .map_err(|_| CoreError::new("stage_shim_chmod_failed", "无法设置受控 CLI shim 执行权限"))?;
     Ok(shim_path)
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ClaudeCodeProcessWrapperPlan {
-    pub wrapper_executable: String,
-    pub wrapper_args: Vec<String>,
-    pub proxy_url: String,
-}
-
-/// Builds an optional Claude Code `processWrapper` configuration plan so sub-commands
-/// spawned by Claude Code also route through `watch-sandbox-launcher` (`ProxyAdaptationKind::ClaudeCodeProcessWrapper`).
-pub fn build_claude_code_process_wrapper_plan(
-    launcher_binary: &Path,
-    gateway_addr: SocketAddr,
-) -> Result<ClaudeCodeProcessWrapperPlan> {
-    if !gateway_addr.ip().is_loopback() || gateway_addr.port() == 0 {
-        return Err(CoreError::new(
-            "invalid_gateway_endpoint",
-            "Claude Code processWrapper 仅支持非零回环网关端口",
-        ));
-    }
-    let canon = fs::canonicalize(launcher_binary).map_err(|_| {
-        CoreError::new("helper_binary_missing", "watch-sandbox-launcher 二进制不存在")
-    })?;
-    Ok(ClaudeCodeProcessWrapperPlan {
-        wrapper_executable: canon.to_string_lossy().into_owned(),
-        wrapper_args: vec!["--launch-json".into()],
-        proxy_url: format!("http://{gateway_addr}"),
-    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

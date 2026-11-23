@@ -74,7 +74,7 @@ struct InitializationConnectionLogTests {
         let integratedLog = InitializationConnectionLog(directory: directory)
         var now = started
         let checks = FirstRunChecks(store: store, componentCheck: {}, accessibilityTrusted: { true }, requestAccessibility: {},
-            connectionNow: { now }, waitForConnectionPoll: { now += 1 }, connectionLog: integratedLog)
+            connectionNow: { now }, waitForConnectionChange: { deadline, _ in now = deadline }, connectionLog: integratedLog)
         let initialization = FirstRunInitialization(checks: LogTestChecks(checks), completed: false, saveCompletion: { fatalError("No completion writes") })
         await initialization.start()
         let failed = initialization.rows.first { $0.step == .connection }!

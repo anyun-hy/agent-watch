@@ -380,12 +380,17 @@ struct SwitcherRepairPlan: Decodable {
 struct SwitcherAccountSlot: Decodable, Identifiable {
     let id: String
     let stored, current: Bool
+    var login_state: String?
+    var profile_state: String?
+    var account_label: String?
 }
 struct SwitcherAccountState: Decodable {
     let current: String?
     let recovery_required: Bool
-    let accounts: [SwitcherAccountSlot]
+    var accounts: [SwitcherAccountSlot]
     let detail: String
+    var selected: String?
+    var login_checked: Bool?
 }
 struct AccountSlotPresentation {
     let summary, confirmationTitle, confirmationDetail, actionTitle: String
@@ -560,14 +565,13 @@ enum SwitcherCommandRunner {
         }
     }
 
-    private static func reapProcess(_ task: Process) {
+    private static func reapProcess(_ task: Process, exitGroup: DispatchGroup) {
         if task.isRunning {
             task.terminate()
             let pid = task.processIdentifier
             if pid > 0 {
                 // Short grace interval for SIGTERM
-                usleep(300_000)
-                if task.isRunning {
+                if exitGroup.wait(timeout: .now() + .milliseconds(300)) == .timedOut && task.isRunning {
                     kill(pid, SIGKILL)
                 }
             }
@@ -654,7 +658,7 @@ enum SwitcherCommandRunner {
         if state.isExceededMaxBytes {
             try? incoming.fileHandleForWriting.close()
             try? output.fileHandleForReading.close()
-            reapProcess(task)
+            reapProcess(task, exitGroup: exitGroup)
             _ = exitGroup.wait(timeout: .now() + 1.0)
             throw NSError(domain: "Switcher", code: 2, userInfo: [NSLocalizedDescriptionKey: "后台命令输出超出 4MB 限制，已终止进程。"])
         }
@@ -663,7 +667,7 @@ enum SwitcherCommandRunner {
             state.markTimedOut()
             try? incoming.fileHandleForWriting.close()
             try? output.fileHandleForReading.close()
-            reapProcess(task)
+            reapProcess(task, exitGroup: exitGroup)
             _ = exitGroup.wait(timeout: .now() + 1.0)
 
             let errorMsg = category == .mutatingTransaction
@@ -682,7 +686,7 @@ enum SwitcherCommandRunner {
             state.markTimedOut()
             try? incoming.fileHandleForWriting.close()
             try? output.fileHandleForReading.close()
-            reapProcess(task)
+            reapProcess(task, exitGroup: exitGroup)
             _ = exitGroup.wait(timeout: .now() + 1.0)
 
             let errorMsg = category == .mutatingTransaction
@@ -743,8 +747,16 @@ final class SwitcherStore: ObservableObject {
     @Published private(set) var webRTCReceiptError = ""
     @Published private(set) var sourceNotices: [EnvironmentSourceNotice] = []
     @Published private(set) var accounts: SwitcherAccountState?
-    @Published private(set) var currentLogin: ClaudeLoginProbeResult?
-    @Published private(set) var loginProbeRunning = false
+    @Published private(set) var chatGPTAccounts: SwitcherAccountState?
+    @Published private(set) var chatGPTAccountsError: String?
+    @Published private(set) var switchingChatGPTSlot: String?
+    private var chatGPTAccountRevision = 0
+    @Published private(set) var manualAccounts: [MonitoredProduct: DesktopAccountCapture] = [:]
+    @Published private(set) var accountFeedback: [MonitoredProduct: String] = [:]
+    @Published private(set) var readingAccount: MonitoredProduct?
+    private var manualReadGeneration = 0
+    var accountReadFixture: ((MonitoredProduct) async throws -> DesktopAccountCapture)?
+    var accountCommandFixture: (([String], Data?) async throws -> Data)?
     @Published private(set) var loginClock = Date()
     @Published private(set) var plan: SwitcherRepairPlan?
     @Published private(set) var planCommand = "repair"
@@ -812,8 +824,6 @@ final class SwitcherStore: ObservableObject {
     private var backgroundRequest: Task<Void, Never>?
     private var reviewScenario: SwitcherReviewScenario?
     private var reviewBackground: BackgroundServiceReceipt?
-    private var lastLoginProbeAt: Date = .distantPast
-    private var loginProbeGeneration = 0
     private var activityGeneration = 0
     var fixtureEnvironmentReadDelayNanoseconds: UInt64 = 0
     var environmentReadWaitTimeout: TimeInterval = 4
@@ -934,31 +944,101 @@ final class SwitcherStore: ObservableObject {
         self.background = background
         loaded = true
     }
-    func refreshCurrentLogin(force: Bool = false) async {
-        advanceLoginClock(Date())
-        guard !isFixture else { currentLogin = nil; return }
-        guard !loginProbeRunning else { return }
-        let now = Date()
-        guard force || now.timeIntervalSince(lastLoginProbeAt) >= 10 else { return }
-        lastLoginProbeAt = now
-        loginProbeGeneration += 1
-        let generation = loginProbeGeneration
-        loginProbeRunning = true
-        defer {
-            if generation == loginProbeGeneration { loginProbeRunning = false }
+    private func manualAccount(_ product: MonitoredProduct) async throws -> DesktopAccountCapture {
+        if isFixture {
+            if let accountReadFixture { return try await accountReadFixture(product) }
+            return .init(state: "unknown", detail: "隔离样本尚未提供桌面身份。")
         }
-        let result = await Task.detached(priority: .utility) {
-            ClaudeLoginProbe.probe(prompt: false)
-        }.value
-        guard generation == loginProbeGeneration else { return }
-        currentLogin = result
+        return try await Task.detached(priority: .userInitiated) { try DesktopAccountCapture.read(product) }.value
     }
+
+    private func accountCommand(_ args: [String], input: Data? = nil) async throws -> Data {
+        if isFixture {
+            guard let accountCommandFixture else {
+                throw NSError(domain: "Switcher", code: 4, userInfo: [NSLocalizedDescriptionKey: "隔离样本未提供账号操作回执。"])
+            }
+            return try await accountCommandFixture(args, input)
+        }
+        return try await Task.detached(priority: .userInitiated) { try SwitcherCommandRunner.run(args, input: input) }.value
+    }
+
+    func forgetManualAccount(_ product: MonitoredProduct) {
+        if readingAccount == product { manualReadGeneration += 1 }
+        manualAccounts[product] = nil
+        accountFeedback[product] = nil
+    }
+
+    @discardableResult
+    func loadManualAccount(_ product: MonitoredProduct) async -> DesktopAccountCapture? {
+        guard !busy else { return nil }
+        forgetManualAccount(product)
+        busy = true
+        readingAccount = product
+        let generation = manualReadGeneration
+        defer { readingAccount = nil; busy = false }
+        do {
+            let reading = try await manualAccount(product)
+            guard generation == manualReadGeneration else { return nil }
+            manualAccounts[product] = reading
+            return reading
+        } catch {
+            if generation == manualReadGeneration { accountFeedback[product] = error.localizedDescription }
+            return nil
+        }
+    }
+
+    func saveManualAccount(_ product: MonitoredProduct, to slot: String, expectedToken: String) async {
+        guard !busy, !hasUnsavedSettings, ["A", "B"].contains(slot),
+              let original = manualAccounts[product], original.canSave,
+              original.source_token == expectedToken, let label = original.label else { return }
+        busy = true
+        defer { busy = false }
+        accountFeedback[product] = nil
+        do {
+            // Claude's public menu label comes from its live AX window. Read it
+            // again before handing the process-bound profile token to Rust.
+            if product == .claude {
+                let latest = try await manualAccount(product)
+                guard latest.canSave, latest.label == label, latest.source_token == expectedToken else {
+                    forgetManualAccount(product)
+                    accountFeedback[product] = "当前桌面账号已变化，请重新加载后再保存。"
+                    return
+                }
+            }
+            var source = ["source_token": expectedToken]
+            if product == .claude { source["account_label"] = label }
+            let data = try await accountCommand(["account", "save", slot, "--product", product == .claude ? "claude" : "chatgpt", "--apply"],
+                                                input: try JSONEncoder().encode(source))
+            struct Saved: Decodable { let saved: Bool; let account, message: String }
+            let receipt = try JSONDecoder().decode(Saved.self, from: DesktopAccountCapture.checkedReceipt(data))
+            guard receipt.saved, receipt.account == slot else {
+                throw NSError(domain: "Switcher", code: 4, userInfo: [NSLocalizedDescriptionKey: "保存回执与所选槽位不符，请重新加载。"])
+            }
+            forgetManualAccount(product)
+            accountFeedback[product] = receipt.message
+            do {
+                if product == .claude {
+                    try consumeStatus(await accountCommand(["status"]))
+                } else {
+                    chatGPTAccountRevision += 1
+                    let revision = chatGPTAccountRevision
+                    let state = try await accountCommand(["account", "status", "--product", "chatgpt"])
+                    if revision == chatGPTAccountRevision {
+                        consumeChatGPTAccounts(try JSONSerialization.jsonObject(with: state))
+                        if chatGPTAccounts == nil { throw CocoaError(.coderReadCorrupt) }
+                    }
+                }
+            } catch {
+                accountFeedback[product] = receipt.message + " 槽位状态暂时未能重新读取。"
+            }
+        } catch {
+            forgetManualAccount(product)
+            accountFeedback[product] = error.localizedDescription
+        }
+    }
+
     func advanceLoginClock(_ date: Date) {
         loginClock = date
-    }
-    var currentLoginIsHistorical: Bool {
-        guard let login = currentLogin else { return false }
-        return Self.isLoginHistorical(observedAt: login.observedAt, now: loginClock.timeIntervalSince1970)
     }
     static func isLoginHistorical(observedAt: Double, now: Double) -> Bool {
         now - observedAt > 90
@@ -982,10 +1062,7 @@ final class SwitcherStore: ObservableObject {
                      confirmationDetail: "将先保存当前 \(source) 资料，再打开空的 \(slot.id) 资料。届时在 Claude 中登录所需账号；失败时恢复原资料。",
                      actionTitle: "保存当前并打开 \(slot.id)")
     }
-    var currentLoginAccount: ClaudeLoginAccount? {
-        guard currentLogin?.state != "app_closed" else { return nil }
-        return currentLogin?.account
-    }
+
     var sessionDisplayEvidence: SessionProtectionEvidence? {
         guard let value = background else { return nil }
         return SessionProtectionEvidence.fromBackground(value, error: backgroundError)
@@ -1004,6 +1081,7 @@ final class SwitcherStore: ObservableObject {
     func openClaudeWatchAccessibilitySettings() {
         guard !isFixture else { return }
         guard AccessibilityPermission.openSettings() else {
+            failure = true
             message = "系统设置未能自动打开，请手动前往 系统设置 › 隐私与安全性 › 辅助功能，并允许 Claude Watch。"
             return
         }
@@ -1398,6 +1476,9 @@ final class SwitcherStore: ObservableObject {
             return "环境检查结果已过期或时间无效，请重新检测。"
         }
         guard preview.ready, preview.blocked.isEmpty, environment.context_transition?.state == "stable" else {
+            if let row = preview.rows.first(where: { $0.id == "desktop_compatibility" && preview.blocked.contains($0.id) }) {
+                return row.detail
+            }
             return "环境检查尚未通过，请在环境状态查看原因。"
         }
         return nil
@@ -1604,8 +1685,61 @@ final class SwitcherStore: ObservableObject {
         self.plan = nil
         await refreshBackground()
     }
+    func switchChatGPTAccount(to id: String) async {
+        guard !busy, switchingChatGPTSlot == nil, !hasUnsavedSettings,
+              chatGPTAccounts?.accounts.contains(where: { $0.id == id && !$0.current }) == true else { return }
+        switchingChatGPTSlot = id
+        chatGPTAccountRevision += 1
+        defer { switchingChatGPTSlot = nil }
+        await perform(["account", "switch", id, "--product", "chatgpt", "--apply"], refresh: false)
+    }
+
+    func refreshChatGPTAccounts() async {
+        guard loaded, !busy, switchingChatGPTSlot == nil, !isFixture else { return }
+        await readChatGPTAccounts()
+    }
+
+    private func readChatGPTAccounts() async {
+        chatGPTAccountRevision += 1
+        let revision = chatGPTAccountRevision
+        do {
+            let data = try await Task.detached { try SwitcherCommandRunner.run(["account", "status", "--product", "chatgpt"]) }.value
+            guard !Task.isCancelled, revision == chatGPTAccountRevision else { return }
+            consumeChatGPTAccounts(try JSONSerialization.jsonObject(with: data))
+        } catch {
+            guard !Task.isCancelled, revision == chatGPTAccountRevision else { return }
+            consumeChatGPTAccounts(["error": error.localizedDescription])
+        }
+    }
+
+    func consumeChatGPTAccounts(_ value: Any?) {
+        let object = value as? [String: Any]
+        if object?["product"] as? String == "chatgpt", let object,
+           let data = try? JSONSerialization.data(withJSONObject: object),
+           var state = try? JSONDecoder().decode(SwitcherAccountState.self, from: data),
+           state.accounts.map(\.id) == ["A", "B"],
+           state.accounts.filter(\.current).map(\.id) == (state.current.map { [$0] } ?? []),
+           state.selected.map({ ["A", "B"].contains($0) }) ?? true {
+            if state.login_checked != true, let previous = chatGPTAccounts {
+                for index in state.accounts.indices where state.accounts[index].stored == previous.accounts[index].stored &&
+                    state.accounts[index].profile_state == previous.accounts[index].profile_state &&
+                    state.accounts[index].account_label == previous.accounts[index].account_label {
+                    state.accounts[index].login_state = previous.accounts[index].login_state
+                }
+            }
+            chatGPTAccounts = state
+            chatGPTAccountsError = nil
+        } else {
+            chatGPTAccounts = nil
+            chatGPTAccountsError = object?["error"] as? String
+        }
+    }
+
     func perform(_ args: [String], input: Data? = nil, refresh: Bool = true, setupProgress: SetupProgressObserver? = nil) async {
         guard !busy else { return }
+        if args.starts(with: ["account", "switch"]) || args.starts(with: ["account", "recover"]) || (args.starts(with: ["account", "import"]) && args.contains("--apply")) {
+            forgetManualAccount(args.contains("chatgpt") ? .openAI : .claude)
+        }
         busy = true
         let activityToken = beginActivity("等待环境读取结束…")
         defer {
@@ -1670,9 +1804,17 @@ final class SwitcherStore: ObservableObject {
                 }
                 else if args.first == "logs" { operationLog = "隔离记录：没有访问真实操作日志。" }
                 else if args.starts(with: ["account", "switch"]), args.count > 2 {
-                    accounts = .init(current: args[2], recovery_required: false, accounts: ["A", "B"].map {
-                        .init(id: $0, stored: true, current: $0 == args[2])
-                    }, detail: "隔离模拟账号")
+                    if args.contains("chatgpt"), let previous = chatGPTAccounts {
+                        chatGPTAccounts = .init(current: args[2], recovery_required: false, accounts: previous.accounts.map {
+                            .init(id: $0.id, stored: $0.stored || $0.id == args[2], current: $0.id == args[2],
+                                  login_state: $0.id == args[2] && $0.login_state == "uninitialized" ? "signed_out" : $0.login_state,
+                                  profile_state: $0.id == args[2] ? "present" : $0.profile_state)
+                        }, detail: previous.detail, selected: args[2], login_checked: previous.login_checked)
+                    } else {
+                        accounts = .init(current: args[2], recovery_required: false, accounts: ["A", "B"].map {
+                            .init(id: $0, stored: true, current: $0 == args[2])
+                        }, detail: "隔离模拟账号")
+                    }
                 }
                 if args.first != "checkdetail" { message = "隔离预览：未访问真实账号、未联网、未执行系统或进程操作。" }
                 failure = false
@@ -1705,6 +1847,11 @@ final class SwitcherStore: ObservableObject {
                 let raw = try JSONSerialization.jsonObject(with: data) as? [String: Any] ?? [:]
                 let status = raw["status"] as? String ?? ""
                 failure = ["error", "partial"].contains(status)
+                if args.starts(with: ["account", "switch"]), args.contains("chatgpt"), !failure {
+                    guard status == "ok", raw["product"] as? String == "chatgpt", raw["account"] as? String == args[2] else {
+                        throw NSError(domain: "Switcher", code: 9, userInfo: [NSLocalizedDescriptionKey: "未取得目标 ChatGPT 账号的切换回执。"])
+                    }
+                }
                 var auditDecoded = false
                 if let value = try? JSONDecoder().decode(EnvironmentAuditReceipt.self, from: data) {
                     audit = value
@@ -1765,6 +1912,17 @@ final class SwitcherStore: ObservableObject {
             }
             failure = true
         }
+        if let id = switchingChatGPTSlot, args.starts(with: ["account", "switch", id]), args.contains("chatgpt") {
+            if !isFixture { await readChatGPTAccounts() }
+            if !failure {
+                let selected = chatGPTAccounts?.selected ?? chatGPTAccounts?.current
+                let current = chatGPTAccounts?.current
+                if selected != id || (current != nil && current != id) {
+                    failure = true
+                    message = "未能从桌面状态核实已选择账号 \(id)。请查看账号卡上的回读结果。"
+                }
+            }
+        }
     }
     private static func launchDisplayName(_ args: [String]) -> String {
         guard let index = args.firstIndex(of: "--target"), args.indices.contains(index + 1) else { return "Claude" }
@@ -1805,6 +1963,7 @@ final class SwitcherStore: ObservableObject {
         if let object = raw["accounts"], !(object is NSNull) {
             accounts = try JSONDecoder().decode(SwitcherAccountState.self, from: JSONSerialization.data(withJSONObject: object))
         }
+        consumeChatGPTAccounts(raw["chatgpt_accounts"])
         if let object = raw["audit"], !(object is NSNull) {
             audit = try JSONDecoder().decode(EnvironmentAuditReceipt.self, from: JSONSerialization.data(withJSONObject: object))
         }
@@ -1906,6 +2065,10 @@ final class SwitcherStore: ObservableObject {
                          "accounts": [["id": "A", "stored": false, "current": false],
                                       ["id": "B", "stored": false, "current": false]],
                          "detail": "隔离账号槽位；没有真实登录信息"],
+            "chatgpt_accounts": ["product": "chatgpt", "current": "A", "selected": "A", "login_checked": true, "recovery_required": false,
+                                "accounts": [["id": "A", "stored": true, "current": true, "profile_state": "present", "login_state": "logged_in"],
+                                             ["id": "B", "stored": false, "current": false, "profile_state": "absent", "login_state": "uninitialized"]],
+                                "detail": "隔离的 ChatGPT 桌面账号"],
             "claude_version": "fixture"
         ]
         return try! JSONSerialization.data(withJSONObject: raw)

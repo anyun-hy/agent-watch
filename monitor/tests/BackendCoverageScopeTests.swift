@@ -8,7 +8,7 @@ struct BackendCoverageScopeTests {
         }
         struct Wire: Decodable {
             let snapshot: ChannelMonitorSnapshot
-            let events: [ChannelMonitorEvent]
+            let events: [ChannelHistoryEvent]
             let monitor: MonitorSnapshot
         }
         let decoder = JSONDecoder()
@@ -41,7 +41,11 @@ struct BackendCoverageScopeTests {
         require(!String(decoding: data, as: UTF8.self).contains("PRIVATE_DO_NOT_EMIT"), "private argv leaked")
         var subscriber = ChannelMonitorSubscriptionStore()
         require(subscriber.applySnapshot(wire.snapshot), "snapshot apply")
-        require(subscriber.applyEvent(wire.events.last!) == .ignoredStaleEvent, "stale event accepted")
+        let lastEvent = wire.events.last!
+        require(lastEvent.producer_boot_id == wire.snapshot.producer_boot_id && lastEvent.event_seq <= wire.snapshot.snapshot_seq,
+                "history extends beyond its producer snapshot")
+        require(subscriber.effectiveState(for: "claude", now: wire.snapshot.captured_at, live: true)?.coverage_scope == scope,
+                "current snapshot lost family coverage")
         var object = try JSONSerialization.jsonObject(with: data) as! [String: Any]
         let original = object["snapshot"] as! [String: Any]
         func familyWithScope(_ replacement: Any?) throws -> FamilyChannelMonitorState {

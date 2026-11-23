@@ -61,6 +61,7 @@ struct Fake {
     ip_force_calls: u32,
     ready: bool,
     fail_open: bool,
+    incompatible: bool,
 
     egress_calls: u32,
 
@@ -106,6 +107,7 @@ impl Default for Fake {
             ip_force_calls: 0,
             ready: true,
             fail_open: false,
+            incompatible: false,
 
             egress_calls: 0,
 
@@ -167,6 +169,10 @@ impl claude_watch_runtime::controlled::CliProcess for FakeCliChild {
     }
 }
 impl DesktopSystem for Fake {
+    fn check_desktop_compatibility(&mut self) -> Result<()> {
+        if self.incompatible { return Err(CoreError::new("desktop_sandbox_incompatible", "Aperitif")); }
+        Ok(())
+    }
 
     fn prepare_cli(&mut self) -> Result<()> {
         Ok(())
@@ -279,7 +285,133 @@ impl DesktopSystem for Fake {
         self.running = true;
         Ok(())
     }
+    fn supports_chatgpt_profiles(&self) -> bool {
+        self.root_kind == Some(claude_watch_core::processes::Kind::OpenaiMain)
+    }
+    fn quit_chatgpt_for_switch(&mut self, target: &claude_watch_core::processes::Target) -> Result<()> {
+        assert_eq!(target.identity.pid, 77);
+        assert_eq!(target.kind, claude_watch_core::processes::Kind::OpenaiMain);
+        self.closes += 1;
+        self.running = false;
+        Ok(())
+    }
+    fn open_chatgpt_profile(&mut self, _: &claude_watch_runtime::accounts::chatgpt::Profile) -> Result<u32> {
+        self.open_desktop()?;
+        Ok(77)
+    }
 
+}
+
+#[test]
+fn chatgpt_account_round_trip_respects_preflight_and_failed_relaunch() {
+    use claude_watch_core::processes::{Kind, LaunchTarget};
+    use claude_watch_runtime::accounts::chatgpt::{self, Slot};
+    let fixture = Fixture::new();
+    let storage = &fixture.storage;
+    let controller = Controller::new(storage.clone());
+    let mut system = Fake { target: LaunchTarget::ChatgptDesktop, root_kind: Some(Kind::OpenaiMain),
+        running: true, ..Fake::default() };
+    let claude_state = storage.paths.base().join("accounts.json");
+    storage.atomic_json(&claude_state, &json!({"schema":1,"current":"B"})).unwrap();
+    let selection = storage.paths.home.join("Library/Application Support/Claude Watch Accounts/ChatGPT/slots.json");
+    let before = chatgpt::status(storage, &AccountObserver(None)).unwrap();
+    assert!(before["selected"].is_null() && before["current"].is_null());
+    assert_eq!(before["accounts"][1]["stored"], false);
+    system.incompatible = true;
+    let error = controller.switch_chatgpt_account(&mut system, Slot::B).unwrap_err();
+    assert_eq!(error.code, "desktop_sandbox_incompatible");
+    assert_eq!((system.audits, system.opens, system.closes), (0, 0, 0));
+    assert!(system.running && !selection.parent().unwrap().exists());
+    system.running = false;
+    assert_eq!(controller.launch(&mut system).unwrap_err().code, error.code);
+    assert_eq!((system.audits, system.opens), (0, 0));
+    system.running = true;
+    system.incompatible = false;
+    system.ready = false;
+    assert!(controller.switch_chatgpt_account(&mut system, Slot::B).is_err());
+    assert!(system.running && !selection.exists());
+    assert_eq!((system.closes, system.opens), (0, 0));
+    system.ready = true;
+    for slot in [Slot::B, Slot::A, Slot::B] {
+        let receipt = controller.switch_chatgpt_account(&mut system, slot).unwrap();
+        assert_eq!(receipt["account"], slot.label());
+        assert_eq!(receipt["current"], slot.label());
+        assert_eq!(receipt["selected"], slot.label());
+        assert_eq!(receipt["product"], "chatgpt");
+        assert_eq!(receipt["authorization_scope"], "observation");
+        let process = system.observation_roots().unwrap().pop().unwrap().identity;
+        let status = chatgpt::status(storage, &AccountObserver(Some(process))).unwrap();
+        assert_eq!(status["selected"], slot.label());
+        assert_eq!(status["current"], slot.label());
+        assert_eq!(storage.read_json(&selection, Value::Null).unwrap()["slot"], slot.label());
+        assert_eq!(storage.read_json(&claude_state, Value::Null).unwrap()["current"], "B");
+    }
+    assert_eq!((system.closes, system.opens), (3, 3));
+    controller.switch_chatgpt_account(&mut system, Slot::B).unwrap();
+    assert_eq!((system.closes, system.opens), (3, 3), "same live slot is idempotent");
+    let last_good = fs::read(&selection).unwrap();
+    system.fail_open = true;
+    assert!(controller.switch_chatgpt_account(&mut system, Slot::A).is_err());
+    assert_eq!(fs::read(&selection).unwrap(), last_good);
+    let status = chatgpt::status(storage, &AccountObserver(None)).unwrap();
+    assert_eq!(status["selected"], "B");
+    assert!(status["current"].is_null());
+    system.fail_open = false;
+    assert_eq!(controller.launch(&mut system).unwrap()["status"], "ok");
+    assert_eq!(storage.read_json(&selection, Value::Null).unwrap()["slot"], "B");
+    system.running = false;
+    system.start_during_audit = true;
+    let before = (system.closes, system.opens);
+    assert!(controller.switch_chatgpt_account(&mut system, Slot::A).is_err());
+    assert_eq!((system.closes, system.opens), before, "never quits a concurrent launch");
+}
+
+// Only supplies the native observer response; production status decodes and
+// verifies the UID, executable and lifetime before exposing a running slot.
+struct AccountObserver(Option<claude_watch_core::processes::Identity>);
+impl claude_watch_runtime::commands::ReadRunner for AccountObserver {
+    fn run(&self, command: claude_watch_runtime::commands::ReadCommand, input: &[u8], _: Duration, _: usize)
+        -> Result<claude_watch_runtime::commands::Output>
+    {
+        use claude_watch_runtime::commands::{ObserverAction, Output, ReadCommand};
+        assert!(matches!(command, ReadCommand::Observer(ObserverAction::Identities)));
+        let query: Value = serde_json::from_slice(input).unwrap();
+        let targets = query["targets"].as_array().unwrap();
+        assert_eq!(targets.len(), 1);
+        let pid = &targets[0]["pid"];
+        let row = match &self.0 {
+            Some(identity) => json!({"pid":pid,"state":"ok","identity":identity}),
+            None => json!({"pid":pid,"state":"unknown","code":"process_exited"}),
+        };
+        let now = claude_watch_runtime::native::now();
+        let response = json!({"schema":1,"status":"ok","uid":501,"started_at":now,"finished_at":now,
+                              "round_id":query["round_id"],"identities":[row]});
+        Ok(Output { status:0, stdout:serde_json::to_vec(&response).unwrap(), stderr:vec![] })
+    }
+}
+
+#[test]
+fn chatgpt_account_normal_launch_records_default_but_does_not_claim_reused_pid() {
+    use claude_watch_core::processes::{Kind, LaunchTarget};
+    use claude_watch_runtime::accounts::chatgpt;
+    let fixture = Fixture::new();
+    let mut system = Fake { target: LaunchTarget::ChatgptDesktop, root_kind: Some(Kind::OpenaiMain),
+                            running: false, ..Fake::default() };
+    Controller::new(fixture.storage.clone()).launch(&mut system).unwrap();
+    let process = system.observation_roots().unwrap().pop().unwrap().identity;
+    let status = chatgpt::status(&fixture.storage, &AccountObserver(Some(process.clone()))).unwrap();
+    assert_eq!(status["selected"], "A");
+    assert_eq!(status["current"], "A");
+    let mut reused = process.clone();
+    reused.start_microseconds += 1;
+    let mut other_executable = process;
+    other_executable.executable.push_str(" Classic");
+    for changed in [reused, other_executable] {
+        let status = chatgpt::status(&fixture.storage, &AccountObserver(Some(changed))).unwrap();
+        assert_eq!(status["selected"], "A");
+        assert!(status["current"].is_null());
+        assert_eq!(status["accounts"][0]["current"], false);
+    }
 }
 
 #[test]
@@ -752,6 +884,27 @@ fn delegated_channel_session_skips_failing_desktop_inventory_and_reads_authority
     assert_eq!(receipt["channel_supervision"]["verdict"], "isolated_keep_process");
     assert_eq!(fixture.storage.read_json(&fixture.storage.paths.session_for("claude"), Value::Null).unwrap(), session);
     assert_eq!((system.closes, system.ip_force_calls), (0,0));
+    assert!(system.terminated_supervised.is_empty());
+}
+
+#[test]
+fn invalid_config_guard_reports_unknown_and_preserves_session() {
+    let fixture = Fixture::new();
+    let store = &fixture.storage;
+    let (session, permit, receipt) = channel_collector_fixture(&fixture);
+    publish_guard_fixture(&fixture, &permit, &receipt);
+    let path = store.paths.session_for("claude");
+    store.atomic_json(&path, &session).unwrap();
+    let before = fs::read(&path).unwrap();
+    store.atomic_bytes(&store.paths.config(), b"{", 0o600).unwrap();
+    let mut system = Fake { running: true, ..Fake::default() };
+
+    let report = Controller::new(store.clone()).guard_tick(&mut system).unwrap();
+    assert_eq!(report["status"], "unknown");
+    assert_eq!(report["action"], "observe");
+    assert!(report["code"].is_string());
+    assert_eq!(fs::read(path).unwrap(), before);
+    assert_eq!((system.closes, system.ip_force_calls), (0, 0));
     assert!(system.terminated_supervised.is_empty());
 }
 

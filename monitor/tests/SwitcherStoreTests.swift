@@ -31,7 +31,65 @@ struct SwitcherStoreTests {
                SwitcherStore.accountSlotPresentation(emptyB, current: "A").confirmationDetail.contains("保存当前 A") &&
                SwitcherStore.accountSlotPresentation(storedB, current: "A").actionTitle == "切换到 B",
                "A/B slot presentation preserves explicit empty-slot actions")
+        do {
+            let manager = SwitcherStore(isFixture: true)
+            var current = DesktopAccountCapture(state: "logged_in", detail: "fixture", email: "first@example.test", source_token: "one")
+            var requests = [[String]]()
+            let gptStatus = Data(#"{"product":"chatgpt","selected":"B","current":"B","recovery_required":false,"detail":"test","accounts":[{"id":"A","stored":false,"current":false},{"id":"B","stored":true,"current":true,"account_label":"first@example.test"}]}"#.utf8)
+            manager.accountReadFixture = { _ in current }
+            manager.accountCommandFixture = { args, data in
+                requests.append(args)
+                if args[1] == "status" { return gptStatus }
+                let input = try JSONDecoder().decode([String: String].self, from: data ?? Data())
+                expect(input == ["source_token": "one"] && !args.contains("one"), "ChatGPT save sends only the bound token on stdin")
+                return Data(#"{"saved":true,"account":"B","message":"已保存到 B"}"#.utf8)
+            }
+            await manager.saveManualAccount(.openAI, to: "B", expectedToken: "one")
+            expect(requests.isEmpty, "save requires an explicit identity read")
+            await manager.loadManualAccount(.openAI)
+            expect(manager.manualAccounts[.openAI]?.label == "first@example.test" && manager.manualAccounts[.claude] == nil, "manual identities remain separate")
+            await manager.saveManualAccount(.openAI, to: "B", expectedToken: "outdated")
+            expect(requests.isEmpty, "a superseded confirmation cannot write a slot")
+            await manager.saveManualAccount(.openAI, to: "B", expectedToken: "one")
+            expect(requests == [["account", "save", "B", "--product", "chatgpt", "--apply"], ["account", "status", "--product", "chatgpt"]] &&
+                   manager.chatGPTAccounts?.accounts.last?.account_label == "first@example.test" &&
+                   manager.accountFeedback[.openAI] == "已保存到 B" && manager.manualAccounts[.openAI] == nil,
+                   "validated save refreshes the slot label and consumes the reading")
+
+            await manager.loadManualAccount(.claude)
+            current.email = "second@example.test"
+            let count = requests.count
+            await manager.saveManualAccount(.claude, to: "A", expectedToken: "one")
+            expect(requests.count == count && manager.manualAccounts[.claude] == nil, "changed Claude identity invalidates the pending save before writing")
+            await manager.loadManualAccount(.claude)
+            manager.accountCommandFixture = { args, data in
+                let input = try JSONDecoder().decode([String: String].self, from: data ?? Data())
+                expect(args == ["account", "save", "A", "--product", "claude", "--apply"] &&
+                       input == ["source_token":"one", "account_label":"second@example.test"], "Claude sends the manually verified label on stdin")
+                return Data(#"{"status":"error","message":"该槽已有账号"}"#.utf8)
+            }
+            await manager.saveManualAccount(.claude, to: "A", expectedToken: "one")
+            expect(manager.accountFeedback[.claude] == "该槽已有账号" && manager.manualAccounts[.claude] == nil,
+                   "occupied slot rejection is surfaced verbatim without success state")
+            current.source_token = nil
+            await manager.loadManualAccount(.openAI)
+            expect(manager.manualAccounts[.openAI]?.canSave == false, "visible identity without verified process binding cannot enable save")
+        }
         var replaceable = try JSONDecoder().decode(CurrentEnvironmentReceipt.self, from: SwitcherStore.fixtureCurrentEnvironment())
+        let grouped = AtlasSubject.allCases.flatMap(\.ids)
+        expect(grouped.count == Set(grouped).count && Set(grouped) == Set(replaceable.rows.map(\.id)),
+               "all current audit rows belong to exactly one atlas section")
+        let blocked = EnvironmentCheckRow(id: "ip_history", name: "IP", state: "fail", detail: "baseline", scope: "fixture", required: true)
+        let extra = EnvironmentCheckRow(id: "future_probe", name: "Other", state: "ok", detail: "raw detail", scope: "fixture", required: false)
+        for historical in [false, true] {
+            let rows = [cachedRow, blocked, extra]
+            let checks = AtlasCheckGroups(rows: rows, historical: historical)
+            let displayed = checks.attention + AtlasSubject.allCases.flatMap { checks.sections[$0] ?? [] }
+            expect(displayed.map(\.id).sorted() == rows.map(\.id).sorted(), "each receipt row has exactly one evidence tile")
+            expect(checks.attention.map(\.id) == (historical ? [] : ["ip_history"]), "only a current blocker moves to attention")
+            expect(checks.sections[.other]?.first?.detail == extra.detail && checks.sections[.leaks]?.first?.query_error == cachedRow.query_error,
+                   "future and cached rows retain their source details")
+        }
         replaceable.source_notices = [.init(id: "metadata", title: "IPinfo", detail: "本轮元数据查询失败", severity: "warn")]
         let originalEgress = replaceable.rows.first { $0.id == "egress" }?.current
         replaceable.replaceDNSRow(cachedRow)
@@ -189,6 +247,16 @@ struct SwitcherStoreTests {
         expect(claudeLaunch.arguments == ["launch", "--apply"] &&
                chatgptLaunch.arguments == ["launch", "--target", "chatgpt-desktop", "--apply"],
                "graph starts the selected desktop using its own full launch entry")
+        var presence = WorkspaceDesktopPresence()
+        expect(presence.record(pid: 11, bundle: "com.openai.codex", launched: true) &&
+               !chatgptLaunch.hasRunningDesktop(in: presence), "Codex presence does not block ChatGPT launch")
+        expect(!presence.record(pid: 11, bundle: "com.openai.codex", launched: true), "duplicate launch does not publish a change")
+        _ = presence.record(pid: 12, bundle: "com.openai.chat", launched: true)
+        _ = presence.record(pid: 13, bundle: "com.openai.chat", launched: true)
+        _ = presence.record(pid: 12, bundle: "com.openai.chat", launched: false)
+        expect(chatgptLaunch.hasRunningDesktop(in: presence) && !claudeLaunch.hasRunningDesktop(in: presence), "one remaining ChatGPT instance is still running")
+        _ = presence.record(pid: 13, bundle: "com.openai.chat", launched: false)
+        expect(!chatgptLaunch.hasRunningDesktop(in: presence), "last termination clears ChatGPT independently of Codex")
         let cliOnly = [WatchedProcess(id: "cli", pid: 1, started: "fixture", kind: "codex-cli", authorized: nil)]
         let chatgptMain = [WatchedProcess(id: "desktop", pid: 2, started: "fixture", kind: "chatgpt-desktop-main", authorized: nil)]
         expect(!chatgptLaunch.hasRunningDesktop(in: cliOnly) && chatgptLaunch.hasRunningDesktop(in: chatgptMain) &&
@@ -394,6 +462,61 @@ struct SwitcherStoreTests {
         expect(store.plan == nil, "applied preview cleared")
         await store.perform(["account", "switch", "B", "--apply", "--ack-unverified-version"])
         expect(store.accounts?.current == "B", "fixture switching updates only fixture state")
+        expect(store.chatGPTAccounts?.current == "A", "Claude switching leaves the ChatGPT selection alone")
+        await store.switchChatGPTAccount(to: "B")
+        expect(store.chatGPTAccounts?.current == "B" && store.accounts?.current == "B",
+               "the ChatGPT B action addresses its own two slots")
+        await store.switchChatGPTAccount(to: "A")
+        expect(store.chatGPTAccounts?.current == "A" && store.accounts?.current == "B" &&
+               store.chatGPTAccounts?.accounts.last?.stored == true, "return to A retains B and the Claude slot")
+        await store.switchChatGPTAccount(to: "C")
+        expect(store.chatGPTAccounts?.current == "A", "unknown ChatGPT slot cannot dispatch a switch")
+        do {
+            let readback = SwitcherStore(isFixture: true)
+            func receipt(selected: String? = nil, current: String?, checked: Bool? = nil,
+                         login: [String: String] = [:]) -> [String: Any] {
+                let slots: [[String: Any]] = ["A", "B"].map { id in
+                    var slot: [String: Any] = ["id": id, "stored": true, "current": current == id]
+                    if let value = login[id] { slot["login_state"] = value }
+                    return slot
+                }
+                var reply: [String: Any] = ["product": "chatgpt", "accounts": slots,
+                                            "recovery_required": false, "detail": "isolated receipt"]
+                if let selected { reply["selected"] = selected }
+                if let current { reply["current"] = current }
+                if let checked { reply["login_checked"] = checked }
+                return reply
+            }
+            func slot(_ id: String) -> SwitcherAccountSlot? {
+                readback.chatGPTAccounts?.accounts.first { $0.id == id }
+            }
+            readback.consumeChatGPTAccounts(receipt(current: "A"))
+            expect(slot("A")?.current == true && slot("A")?.login_state != "logged_in",
+                   "legacy status identifies a running profile without asserting desktop login")
+
+            readback.consumeChatGPTAccounts(receipt(selected: "A", current: "A", checked: true,
+                                                   login: ["A": "logged_in", "B": "signed_out"]))
+            readback.consumeChatGPTAccounts(receipt(selected: "A", current: "A", checked: false))
+            expect(slot("A")?.login_state == "logged_in" && slot("B")?.login_state == "signed_out",
+                   "a summary reread preserves the separate login observations for unchanged profiles")
+            readback.consumeChatGPTAccounts(receipt(selected: "A", current: "A", checked: true,
+                                                   login: ["A": "unknown", "B": "signed_out"]))
+            expect(slot("A")?.current == true && slot("A")?.login_state != "logged_in" &&
+                   slot("B")?.login_state == "signed_out",
+                   "a new inconclusive login check supersedes a previous positive observation")
+
+            readback.consumeChatGPTAccounts(receipt(selected: "B", current: nil))
+            expect(readback.chatGPTAccounts?.selected == "B" && readback.chatGPTAccounts?.current == nil &&
+                   slot("B")?.current == false, "selected B survives a missing current process")
+            await readback.switchChatGPTAccount(to: "B")
+            expect(readback.chatGPTAccounts?.current == "B" && slot("B")?.current == true &&
+                   slot("B")?.login_state != "logged_in",
+                   "a selected but stopped B opens again without claiming a successful login")
+            await readback.switchChatGPTAccount(to: "A")
+            expect(readback.chatGPTAccounts?.current == "A" && slot("A")?.stored == true &&
+                   slot("B")?.stored == true && slot("A")?.login_state != "logged_in",
+                   "switching back to A retains both profile slots without granting login evidence")
+        }
         expect(store.message.contains("隔离预览"), "fixture boundary remains visible")
         expect(!store.busy, "operation state returns to idle")
         store.flag(Setting.requireDNS).wrappedValue = true

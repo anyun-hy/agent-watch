@@ -34,7 +34,7 @@ pub fn require_apply(request: &Request) -> Result<()> {
     let writes = matches!(
         (request.command.as_str(), request.action.as_deref()),
         ("config", Some("set"))
-            | ("account", Some("switch" | "recover"))
+            | ("account", Some("switch" | "save" | "recover"))
             | ("setup", Some("apply" | "recover"))
             | ("protection", Some("apply"))
     ) || matches!(
@@ -76,7 +76,7 @@ pub fn initialize_native_listener(request: &Request) -> Result<()> {
         _ => {
             return Err(CoreError::new(
                 "native_listener_arguments",
-                "系统采样管道仅用于固定后台或只读代理检查",
+                "系统采样通道仅用于固定后台或只读代理检查",
             ))
         }
     }
@@ -350,6 +350,8 @@ pub fn dispatch_read(request: &Request, paths: Paths) -> Result<Option<Value>> {
             let accounts = AccountStore::new(host.storage.clone(), super::ReadOnlyAccounts)
                 .status()?
                 .value();
+            let chatgpt_accounts = claude_watch_runtime::accounts::chatgpt::status(&host.storage, &host.runner)
+                .unwrap_or_else(|err| json!({"error":err.message}));
             let env = host.environment().ok();
             let now = native::now();
             let frame = claude_watch_runtime::channel_policy_status::read_frame(&host.storage);
@@ -358,7 +360,7 @@ pub fn dispatch_read(request: &Request, paths: Paths) -> Result<Option<Value>> {
             let policy_sync_state = frame.policy_sync_state();
             let service_status = background_from_frame(&host, &config, &frame, &evidence, now)?;
             Ok(Some(
-                json!({"status":"ok","config":config.value()?,"legacy_openai_force_review":legacy_openai_force_review,"accounts":accounts,"audit":audit,"service_status":service_status,"netcoffee_lookup":audit["netcoffee_lookup"],"source_notices":audit.get("source_notices").unwrap_or(&json!([])),
+                json!({"status":"ok","config":config.value()?,"legacy_openai_force_review":legacy_openai_force_review,"accounts":accounts,"chatgpt_accounts":chatgpt_accounts,"audit":audit,"service_status":service_status,"netcoffee_lookup":audit["netcoffee_lookup"],"source_notices":audit.get("source_notices").unwrap_or(&json!([])),
                 "policy_sync_state": policy_sync_state,
                 "repair":host.storage.read_json(&host.storage.paths.base().join("last-repair.json"),Value::Null)?,"guard":evidence,
                 "update_recovery_required":host.storage.paths.base().join("update-transaction.json").exists(),"setup_recovery_required":host.storage.paths.base().join("setup-transaction.json").exists()||host.storage.paths.base().join("service-transaction.json").exists()||host.storage.paths.watch().join("agent-install-transaction.json").exists(),"proxy_groups":[],
@@ -398,11 +400,11 @@ pub fn dispatch_read(request: &Request, paths: Paths) -> Result<Option<Value>> {
                     claude_watch_runtime::setup_progress::Phase::CollectEvidence,
                 );
             }
-            let (mut audit, guard_diagnostics) = if environment {
+            let (audit, guard_diagnostics) = if environment {
                 store.collect_environment(&mut host, &zones, request.launch_target(), options)?
             } else if scope == AuditScope::Full {
                 (
-                    store.collect_target(&mut host, &zones, request.launch_target(), options)?,
+                    store.collect_launch_preview(&mut host, &zones, request.launch_target(), options)?,
                     None,
                 )
             } else {
@@ -415,10 +417,6 @@ pub fn dispatch_read(request: &Request, paths: Paths) -> Result<Option<Value>> {
                 claude_watch_runtime::setup_progress::emit(
                     claude_watch_runtime::setup_progress::Phase::VerifyLaunchConditions,
                 );
-            }
-            audit["grants_launch_permission"] = json!(false);
-            if !environment && scope == AuditScope::Full {
-                audit["purpose"] = json!("launch_requirements_preview");
             }
             Ok(Some(if environment {
                 let mut receipt = claude_watch_runtime::environment_display::receipt(
@@ -584,10 +582,7 @@ pub fn dispatch_operations(request: &Request, paths: Paths) -> Result<Option<Ope
         return Ok(Some(OperationOutcome::Receipt(result)));
     }
     let account_action = request.command == "account"
-        && matches!(
-            request.action.as_deref(),
-            Some("switch" | "recover" | "import")
-        );
+        && matches!(request.action.as_deref(), Some("switch" | "recover" | "import"));
     let confirm_baseline = request.command == "environment" && request.flag("confirm-baseline");
     if !account_action
         && !confirm_baseline
@@ -722,6 +717,14 @@ pub fn dispatch_operations(request: &Request, paths: Paths) -> Result<Option<Ope
         ).map(Some);
     }
     let mut desktop = native_desktop_for_request(request, &storage, host.runner.clone(), process_helper, authority)?;
+    if account_action && request.value("product") == Some("chatgpt") {
+        let slot = claude_watch_runtime::accounts::chatgpt::Slot::parse(request.target.as_deref())?;
+        desktop.select_chatgpt_account_client()?;
+        let mut runtime = DesktopRuntime { desktop: &mut desktop, network: host.network.clone(),
+            system: &mut host, storage: storage.clone(), started: Instant::now(), cli: None };
+        let result = Controller::new(storage).switch_chatgpt_account(&mut runtime, slot)?;
+        return Ok(Some(OperationOutcome::Receipt(result)));
+    }
     if account_action {
         let config = ConfigStore {
             storage: storage.clone(),

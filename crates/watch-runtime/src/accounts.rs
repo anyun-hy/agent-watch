@@ -20,7 +20,10 @@ use std::{
 };
 use uuid::Uuid;
 
+pub mod chatgpt;
 mod commit_recovery;
+mod manual_save;
+pub use manual_save::{observe_claude_source, SaveCurrentAccount};
 
 const TRANSIENT: &[&str] = &["SingletonLock", "SingletonCookie", "SingletonSocket"];
 const MANIFEST_LIMIT: usize = 2_000_000;
@@ -33,6 +36,9 @@ fn io(_: std::io::Error) -> CoreError {
 
 /// Application and COW authority is injected by the eventual dispatcher.
 pub trait AccountOs {
+    fn current_desktop(&mut self) -> Result<claude_watch_core::processes::Identity> {
+        Err(err("source_unavailable", "无法核对当前 Claude 桌面实例"))
+    }
     fn claude_version(&mut self) -> Result<Option<String>>;
     fn quit_claude(&mut self) -> Result<()>;
     fn claude_running(&mut self) -> Result<bool>;
@@ -50,6 +56,7 @@ pub struct AccountStatus {
     pub id: String,
     pub stored: bool,
     pub current: bool,
+    pub account_label: Option<String>,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Status {
@@ -72,7 +79,7 @@ pub struct SwitchResult {
 }
 impl Status {
     pub fn value(&self) -> Value {
-        json!({"schema":1,"current":self.current,"recovery_required":self.recovery_required,"accounts":self.accounts.iter().map(|x|json!({"id":x.id,"stored":x.stored,"current":x.current})).collect::<Vec<_>>(),"legacy_conflict":self.legacy_conflict,"login_verified":false,"detail":"账号槽位表示本地资料目录，不证明远端账号身份或钥匙串隔离"})
+        json!({"schema":1,"current":self.current,"recovery_required":self.recovery_required,"accounts":self.accounts.iter().map(|x|json!({"id":x.id,"stored":x.stored,"current":x.current,"account_label":x.account_label})).collect::<Vec<_>>(),"legacy_conflict":self.legacy_conflict,"login_verified":false,"detail":"账号槽位表示本地资料目录，不证明远端账号身份或钥匙串隔离"})
     }
 }
 impl SwitchResult {
@@ -334,6 +341,7 @@ impl<O: AccountOs> AccountStore<O> {
                     id: (*id).into(),
                     stored: self.profile(id).is_dir(),
                     current: current.as_deref() == Some(id),
+                    account_label: self.saved_label(id),
                 })
                 .collect(),
             current,
@@ -357,6 +365,7 @@ impl<O: AccountOs> AccountStore<O> {
                         id: (*id).into(),
                         stored: ids.contains(id),
                         current: false,
+                        account_label: None,
                     })
                     .collect(),
                 legacy_conflict: None,
@@ -582,13 +591,16 @@ impl<O: AccountOs> AccountStore<O> {
         if !p.exists() {
             return Ok(());
         }
+        let j = self.storage.read_json(&p, json!({}))?;
+        if j["kind"] == "save_current" {
+            return self.recover_manual_save(&j);
+        }
         if self.os.claude_running()? {
             return Err(err(
                 "claude_still_running",
                 "先退出 Claude，再恢复未完成事务",
             ));
         }
-        let j = self.storage.read_json(&p, json!({}))?;
         let schema = j["schema"]
             .as_u64()
             .ok_or_else(|| err("invalid_journal", "恢复记录格式错误"))?;
@@ -793,6 +805,9 @@ impl<O: AccountOs> AccountStore<O> {
         fs::rename(profile, stage.join("profile")).map_err(io)?;
         let m = tree_manifest(&stage.join("profile"))?;
         self.write_manifest(&stage, &m, version)?;
+        if let Some(label) = self.saved_label(id) {
+            self.storage.atomic_json(&stage.join("account-label.json"), &json!(label))?;
+        }
         let slot = self.slot(id);
         if slot.exists() {
             fs::rename(&slot, work.join("previous-slot")).map_err(io)?;
@@ -821,6 +836,9 @@ impl<O: AccountOs> AccountStore<O> {
         self.storage.atomic_json(&slot.join("manifest.json"), &v)
     }
     fn copy_tree(&mut self, source: &Path, target: &Path) -> Result<CopyMetrics> {
+        self.copy_verified_tree(source, target).map(|(metrics, _)| metrics)
+    }
+    fn copy_verified_tree(&mut self, source: &Path, target: &Path) -> Result<(CopyMetrics, Value)> {
         let before = tree_manifest(source)?;
         if target.exists() {
             return Err(err("copy_target_exists", "复制目标已存在"));
@@ -841,7 +859,7 @@ impl<O: AccountOs> AccountStore<O> {
             "copy"
         }
         .into();
-        Ok(m)
+        Ok((m, before))
     }
 }
 fn fingerprint_path(path: &Path) -> Result<Option<String>> {

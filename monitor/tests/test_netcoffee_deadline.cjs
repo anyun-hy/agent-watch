@@ -53,7 +53,9 @@ function fixture(options = {}) {
     createOffer() { return Promise.resolve({}); }
     setLocalDescription() {
       clock.set(() => {
-        this.onicecandidate && this.onicecandidate({ candidate: { address: '8.8.4.4', type: 'srflx' } });
+        for (const candidate of options.iceCandidates ?? [{ address: '8.8.4.4', type: 'srflx' }]) {
+          this.onicecandidate && this.onicecandidate({ candidate });
+        }
         this.onicecandidate && this.onicecandidate({ candidate: null });
       }, 0);
       return Promise.resolve();
@@ -160,6 +162,22 @@ async function collect(run, kind = 'dns', id = 'one', rounds = 5) {
   assert.equal(run.requests.filter(row => row.kind === 'trace').length, 2);
   assert(run.diagnostics.includes('http_retry'));
   assert(recoveredRTC.elapsedMs < 70000);
+
+  run = fixture({ iceCandidates: [
+    { address: 'workstation.local', type: 'host' },
+    { candidate: 'candidate:1 1 udp 1 2606:4700:4700::1111 9 typ prflx' },
+  ] });
+  const mixedICE = await collect(run, 'webrtc');
+  assert.equal(mixedICE.status, 'complete');
+  assert(mixedICE.observations.some(row => row.kind === 'mdns' && row.address === 'workstation.local' && row.family === null));
+  assert(mixedICE.observations.some(row => row.kind === 'prflx' && row.address === '2606:4700:4700::1111' && row.family === 6));
+  assert(!run.requests.some(row => row.query === 'workstation.local'));
+
+  run = fixture({ iceCandidates: [{ address: '10.0.0.1', type: 'host' }, { address: '8.8.4.4', type: 'relay' }] });
+  const noPublicSTUN = await collect(run, 'webrtc');
+  assert.equal(noPublicSTUN.status, 'partial');
+  assert(noPublicSTUN.observations.some(row => row.kind === 'http'));
+  assert.equal(noPublicSTUN.errors.filter(row => row.stage === 'ice').length, 3);
 
   // Both failed attempts remain incomplete, and both stalled requests are
   // cancelled rather than silently becoming a pass.

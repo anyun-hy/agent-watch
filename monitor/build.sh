@@ -124,11 +124,10 @@ cp "$ROOT/build/ClaudeWatchMonitor.$CW_BUILD_ARCH" "$APP/Contents/MacOS/ClaudeWa
 cp "$ROOT/build/watch-leak-worker.$CW_BUILD_ARCH" "$APP/Contents/Resources/watch-leak-worker"
 cp "$ROOT/build/ControlledEntry.$CW_BUILD_ARCH" "$APP/Contents/Resources/ControlledEntry"
 
-# A reused build directory must not carry a retired extension/profile into
-# the Seatbelt package. This only cleans the candidate output, never an install.
+# Remove retired components from a reused candidate output.
 rm -rf "$APP/Contents/Library/SystemExtensions"
 rm -f "$APP/Contents/embedded.provisionprofile"
-cp "$ROOT/Resources/webrtc_probe.html" "$ROOT/Resources/webrtc_probe.js" "$APP/Contents/Resources/"
+rm -f "$APP/Contents/Resources/webrtc_probe.html" "$APP/Contents/Resources/webrtc_probe.js"
 cp "$ROOT/Resources/netcoffee_probe.html" "$ROOT/Resources/netcoffee_probe.js" "$ROOT/Resources/netcoffee_probe.css" "$ROOT/Resources/watch-admin.sh" "$APP/Contents/Resources/"
 cp "$ROOT/Resources/ipleak_probe.html" "$ROOT/Resources/ipleak_probe.js" "$APP/Contents/Resources/"
 mkdir -p "$APP/Contents/Resources/ThirdParty/ClaudeSwitcher" "$APP/Contents/Resources/ThirdParty/nono"

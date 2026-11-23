@@ -14,6 +14,7 @@ use claude_watch_core::{
     error::{CoreError, Result},
     observation,
     region::ZoneCatalog,
+    processes::LaunchTarget,
 };
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -22,6 +23,7 @@ pub trait AuditSystem {
     fn now(&self) -> f64;
     fn network(&self) -> Result<Value>;
     fn local(&self, config: &Config) -> Result<Value>;
+    fn check_preview_compatibility(&self, _target: LaunchTarget) -> Result<()> { Ok(()) }
     fn local_for_target(
         &self,
         config: &Config,
@@ -140,6 +142,7 @@ impl AuditStore {
             claude_watch_core::processes::LaunchTarget::ClaudeDesktop,
             options,
             None,
+            false,
         )
     }
     pub fn collect_target<S: AuditSystem>(
@@ -149,7 +152,15 @@ impl AuditStore {
         target: claude_watch_core::processes::LaunchTarget,
         options: AuditOptions,
     ) -> Result<Value> {
-        self.collect_inner(system, zones, AuditScope::Full, target, options, None)
+        self.collect_inner(system, zones, AuditScope::Full, target, options, None, false)
+    }
+    pub fn collect_launch_preview<S: AuditSystem>(
+        &self, system: &mut S, zones: &ZoneCatalog, target: LaunchTarget, options: AuditOptions,
+    ) -> Result<Value> {
+        let mut receipt = self.collect_inner(system, zones, AuditScope::Full, target, options, None, true)?;
+        receipt["purpose"] = json!("launch_requirements_preview");
+        receipt["grants_launch_permission"] = json!(false);
+        Ok(receipt)
     }
     /// Capture supplemental evidence only for the display-only environment request.
     /// Launch and protection audits continue through the unchanged no-capture path.
@@ -174,6 +185,7 @@ impl AuditStore {
             target,
             options,
             Some(&mut capture),
+            true,
         )?;
         let round = capture
             .before
@@ -197,6 +209,7 @@ impl AuditStore {
         target: claude_watch_core::processes::LaunchTarget,
         mut options: AuditOptions,
         mut guard_capture: Option<&mut crate::guard_diagnostics::GuardCapture>,
+        preview: bool,
     ) -> Result<Value> {
         let capture_chatgpt_preview = guard_capture.is_some() && target.protected();
         if !target.protected() {
@@ -364,6 +377,11 @@ impl AuditStore {
         let confirmed_ip = confirmed_env.as_ref()
             .and_then(|v| v.pointer("/values/ip"))
             .and_then(Value::as_str);
+        if preview {
+            if let Err(error) = system.check_preview_compatibility(target) {
+                before["desktop_compatibility_error"] = json!(error);
+            }
+        }
         let mut output = audit::evaluate_target(
             AuditInput {
                 config: &after_config,
@@ -383,6 +401,9 @@ impl AuditStore {
             // Re-evaluate the same observations for the other desktop target.
             // No additional probes or launch permission are produced here.
             let mut local = before.clone();
+            if let Err(error) = system.check_preview_compatibility(LaunchTarget::ChatgptDesktop) {
+                local["desktop_compatibility_error"] = json!(error);
+            }
             for key in ["backend_healthy", "backend_native"] {
                 local[key] = json!(before[key] == true && after[key] == true);
             }

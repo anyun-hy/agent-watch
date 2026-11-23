@@ -32,6 +32,7 @@ pub trait DesktopSystem {
     fn launch_target(&self) -> LaunchTarget {
         LaunchTarget::ClaudeDesktop
     }
+    fn check_desktop_compatibility(&mut self) -> Result<()> { Ok(()) }
     /// Native-verified, current-user main processes for the selected target.
     fn observation_roots(&mut self) -> Result<Vec<Target>> {
         Err(CoreError::new(
@@ -52,6 +53,14 @@ pub trait DesktopSystem {
     fn egress(&mut self) -> Value;
     fn backend_healthy(&mut self) -> Result<bool>;
     fn open_desktop(&mut self) -> Result<()>;
+
+    fn supports_chatgpt_profiles(&self) -> bool { false }
+    fn quit_chatgpt_for_switch(&mut self, _target: &Target) -> Result<()> {
+        Err(CoreError::new("unsupported_chatgpt_profile", "当前桌面客户端不支持切换 ChatGPT 账号"))
+    }
+    fn open_chatgpt_profile(&mut self, _profile: &crate::accounts::chatgpt::Profile) -> Result<u32> {
+        Err(CoreError::new("unsupported_chatgpt_profile", "当前桌面客户端不支持切换 ChatGPT 账号"))
+    }
 
 }
 pub trait CliProcess {

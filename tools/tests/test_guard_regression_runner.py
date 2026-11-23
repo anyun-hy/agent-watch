@@ -49,6 +49,10 @@ elif name == "swiftc":
                           + os.environ.get("MOCK_TEST_STATUS", "0") + "\n", encoding="utf-8")
         output.chmod(0o700)
 elif name == "cargo":
+    if "--exact" in args:
+        cases = args[args.index("--color") + 2:]
+        count = len(cases) - int(os.environ.get("MOCK_MISSING_CASES", "0"))
+        print(f"test result: ok. {count} passed; 0 failed; 0 ignored; 0 measured; 0 filtered out")
     sys.exit(int(os.environ.get("MOCK_CARGO_STATUS", "0")))
 else:
     sys.exit("unexpected fake tool: " + name)
@@ -65,6 +69,8 @@ class GuardRunnerTests(unittest.TestCase):
         source = Path(__file__).resolve().parents[1] / "test-guard-regressions.sh"
         self.runner = self.root / "tools/test-guard-regressions.sh"
         shutil.copyfile(source, self.runner)
+        helper = source.with_name("run-exact-runtime-tests.sh")
+        shutil.copyfile(helper, self.runner.with_name(helper.name))
         self.minimum = self.root / "monitor/macos-minimum.txt"
         self.minimum.write_text("26.0\n", encoding="utf-8")
         self.bin = self.root / "fake tools"
@@ -82,7 +88,7 @@ class GuardRunnerTests(unittest.TestCase):
         self.env = dict(os.environ, PATH=str(self.bin) + os.pathsep + os.environ.get("PATH", ""),
                         TMPDIR=str(self.builds), MOCK_LOG=str(self.log), MOCK_OS="Darwin",
                         MOCK_ARCH="arm64", MOCK_COMPILER=str(self.compiler), MOCK_SDK=str(self.sdk))
-        for key in ("MOCK_DISCOVERY_FAIL", "MOCK_COMPILE_FAIL", "MOCK_TEST_STATUS", "MOCK_CARGO_STATUS"):
+        for key in ("MOCK_DISCOVERY_FAIL", "MOCK_COMPILE_FAIL", "MOCK_TEST_STATUS", "MOCK_CARGO_STATUS", "MOCK_MISSING_CASES"):
             self.env.pop(key, None)
         self.bash = shutil.which("bash")
         self.assertIsNotNone(self.bash)
@@ -141,17 +147,26 @@ class GuardRunnerTests(unittest.TestCase):
         self.assertIn("PROCESS_POLICY_TESTS", args)
         self.assertEqual(self.calls("xcrun"), [])
 
-    def test_rust_mode_runs_existing_four_cargo_commands_only(self):
+    def test_rust_mode_runs_guard_and_exit_contracts(self):
         result = self.run_script("rust")
         self.assertEqual(result.returncode, 0, result.stderr)
         calls = self.calls("cargo")
         self.assertEqual(len(calls), 4)
         self.assertEqual(calls[0]["args"], ["check", "--locked", "-p", "claude-watch-runtime", "-p", "claude-watch-engine"])
-        self.assertIn("controlled::guard_regressions", calls[1]["args"])
+        self.assertIn("controlled_contracts", calls[1]["args"])
+        self.assertIn("delegated_channel_expired_receipt_stays_closed_and_projects_pending_verification", calls[1]["args"])
+        self.assertIn("--exact", calls[1]["args"])
         self.assertIn("process_exit::tests::normal_exit_selection_preserves_manual_cli_and_account_desktop_scope", calls[2]["args"])
         self.assertIn("supervised_evidence_regressions", calls[3]["args"])
         self.assertEqual(self.calls("swiftc"), [])
         self.assertEqual(self.calls("xcrun"), [])
+
+    def test_rust_mode_fails_when_one_selected_case_is_missing(self):
+        self.env["MOCK_MISSING_CASES"] = "1"
+        result = self.run_script("rust")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Expected 4 passing exact tests", result.stderr)
+        self.assertEqual(len(self.calls("cargo")), 2)
 
     def test_invalid_mode_does_not_start_any_tool(self):
         self.assertEqual(self.run_script("invalid").returncode, 2)

@@ -273,22 +273,6 @@ impl SessionStore {
         self.save(&value)?;
         Ok(value)
     }
-    /// A session adopted from an already-running Claude keeps its origin, so
-    /// later diagnostics and the UI can tell it apart from a controlled
-    /// launch without weakening any check.
-    pub fn mark_adopted(&self, id: &str, now: f64) -> Result<Session> {
-        let _lock = self.storage.lock(&self.lock_name(), None)?;
-        let mut value = self
-            .load(now)?
-            .filter(|v| v.session_id == id)
-            .ok_or_else(|| CoreError::new("session_changed", "会话已变化，未写入采纳来源"))?;
-        value
-            .extra
-            .insert("adopted_from".into(), json!("running_desktop"));
-        self.save(&value)?;
-        Ok(value)
-    }
-
     /// End only the session whose exact bound process was independently
     /// confirmed gone. A stale observation must not end a replacement session.
     pub fn end_desktop(
@@ -322,20 +306,6 @@ impl SessionStore {
             .extra
             .insert("exit_tree_pending".into(), json!(tree_pending));
         self.save(&value)?;
-        Ok(true)
-    }
-
-    pub fn clear_ended_tree(&self, id: &str, now: f64) -> Result<bool> {
-        let _lock = self.storage.lock(&self.lock_name(), None)?;
-        let Some(mut value) = self.load(now)? else {
-            return Ok(false);
-        };
-        if value.session_id != id || value.state != Phase::Ended {
-            return Ok(false);
-        }
-        if value.extra.remove("exit_tree_pending").is_some() {
-            self.save(&value)?;
-        }
         Ok(true)
     }
 
@@ -684,43 +654,6 @@ impl SessionStore {
             return Ok(None);
         }
         closer().map(Some)
-    }
-    pub fn close_if_unreadable<T>(
-        &self,
-        now: f64,
-        closer: impl FnOnce() -> Result<T>,
-    ) -> Result<Option<T>> {
-        let _lock = self.storage.lock(&self.lock_name(), None)?;
-        if self.load(now).is_ok() {
-            return Ok(None);
-        }
-        closer().map(Some)
-    }
-    /// Resume normal supervision for a warn-tier session whose underlying
-    /// condition has cleared: the latch reverts to the active phase and the
-    /// stale reason is dropped. Only a still-current locked session can be
-    /// resumed, and the drift baseline stays untouched.
-    pub fn resume_if_current(&self, id: Option<&str>, now: f64) -> Result<bool> {
-        let _lock = self.storage.lock(&self.lock_name(), None)?;
-        let Some(mut value) = self.load(now)? else {
-            return Ok(false);
-        };
-        if value.session_id.as_str() != id.unwrap_or_default() || value.state != Phase::Locked
-            || desktop_groups::group_rechecking(&value)
-        {
-            return Ok(false);
-        }
-        value.state = Phase::Active;
-        value.reason = None;
-        value.last_reason = None;
-        value.locked_at = None;
-        value.last_risk_state = None;
-        value.unknown_count = 0;
-        value.unknown_since = None;
-        value.risk_evidence = json!({"state":"unknown"});
-        value.extra.insert("guard_checked_at".into(), json!(now));
-        self.save(&value)?;
-        Ok(true)
     }
     pub fn mark_failure(
         &self,

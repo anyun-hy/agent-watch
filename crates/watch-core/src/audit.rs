@@ -12,7 +12,8 @@ use crate::{
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
 
-pub const CHECKS: [(&str, &str); 15] = [
+pub const CHECKS: [(&str, &str); 16] = [
+    ("desktop_compatibility", "桌面启动兼容性"),
     ("proxy", "代理内核"),
     ("tun", "TUN 网卡"),
     ("egress", "出口国家"),
@@ -668,6 +669,12 @@ pub fn evaluate_target(
         }
     } else {
         apply_risks(&mut rows, &automatic)
+    }
+    if let Some(message) = local["desktop_compatibility_error"]["message"].as_str() {
+        let state = if local["desktop_compatibility_error"]["code"] == "desktop_sandbox_incompatible" { "fail" } else { "unknown" };
+        let mut check = row("desktop_compatibility", state, message, true, "已选桌面安装");
+        check["code"] = local["desktop_compatibility_error"]["code"].clone();
+        rows.push(check);
     }
     let blocked: Vec<_> = rows
         .iter()

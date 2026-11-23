@@ -47,78 +47,44 @@ struct AIInspectorPage: View {
         case .matched, .unconfigured: return p.blue
         }
     }
-    private var statusSymbol: String {
-        switch state.verdict.state {
-        case .idle: return "circle.dotted"
-        case .running: return "arrow.triangle.2.circlepath"
-        case .difference: return "exclamationmark.circle"
-        case .incomplete: return "clock.badge.exclamationmark"
-        case .cancelled: return "xmark.circle"
-        case .matched, .unconfigured: return "waveform.path"
-        }
-    }
-
     var body: some View {
-        VStack(alignment: .leading, spacing: 20) {
+        VStack(alignment: .leading, spacing: 14) {
             heading
-            statusSummary
+            InspectorStatus(verdict: state.verdict, running: state.running,
+                            source: service == .claude ? "Claude / Anthropic" : "ChatGPT / OpenAI API",
+                            brand: service == .claude ? .claude : .chatgpt, tint: statusTint, p: p)
+            SamplingEvidence(source: "公开服务端点 · HTTP 诊断请求", timeLabel: state.running ? "上次完成" : "完成于",
+                             timestamp: result?.finishedAt, p: p)
+            endpointSection
             if layout == .inspector || service == .claude {
                 inspector
             } else {
                 report
             }
-            endpointSection
             CoffeeAIReport(ip: result?.exitIP ?? "", store: store.netCoffee, p: p) { store.page = .ipScore }
             GPTSharedChecks(store: store.leakChecks, p: p,
                 openDNS: { store.page = .dns }, openRTC: { store.page = .webrtc })
             evidenceDetails
         }
-        .font(.body).foregroundStyle(p.text)
+        .font(WatchTypography.body).foregroundStyle(p.text)
         .frame(maxWidth: 1120, alignment: .leading)
         .padding(.top, 24)
     }
 
     private var heading: some View {
         InspectorHeading(title: service.title,
-            subtitle: service == .claude ? "Claude 与 Anthropic · 网络诊断" : "ChatGPT 与 OpenAI API · 网络诊断",
-            symbol: service == .claude ? "sparkles" : "bubble.left.and.bubble.right",
-            color: service == .claude ? style.service : style.proxy, p: p, brand:service == .claude ? .claude : .chatgpt) {
+            subtitle: service == .claude ? "核对 Claude 服务响应、诊断出口与应用连接。" : "核对 ChatGPT 与 OpenAI API 的服务响应、诊断出口与应用连接。", p: p) {
             Button {
                 state.running ? probes.cancel(service) : probes.start(service)
             } label: {
-                Label(state.running ? "取消检测" : "开始检测",
+                Label(state.running ? "取消检测" : service == .claude ? "检测 Claude" : "检测 GPT / Codex",
                       systemImage: state.running ? "stop.fill" : "play.fill")
-                    .font(.body.weight(.medium)).padding(.horizontal, 4).frame(minHeight: 28)
+                    .font(WatchTypography.bodyStrong)
             }
-            .buttonStyle(.borderedProminent).controlSize(.large)
+            .buttonStyle(.borderedProminent)
             .tint(state.running ? p.secondary : accent)
-            .accessibilityLabel(state.running ? "取消 \(service.title)" : "开始 \(service.title)")
+            .accessibilityLabel(state.running ? "取消 \(service.title)" : result == nil ? "开始 \(service.title)" : "重新运行 \(service.title)")
         }
-    }
-
-    private var statusSummary: some View {
-        HStack(alignment: .top, spacing: 12) {
-            if state.running {
-                ProgressView().controlSize(.small).frame(width: 20, height: 20)
-            } else {
-                symbol(statusSymbol, tint: statusTint).frame(width: 20, height: 20)
-            }
-            VStack(alignment: .leading, spacing: 5) {
-                Text(state.verdict.title).font(.headline).foregroundStyle(statusTint)
-                Text(state.verdict.detail).font(.callout).foregroundStyle(p.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-            Spacer(minLength: 12)
-            if let result, result.finishedAt > 0 {
-                Label(timeText(result.finishedAt), systemImage: "clock")
-                    .font(.caption).foregroundStyle(p.secondary).monospacedDigit()
-                    .help("本轮完成：" + timeText(result.finishedAt, date: true))
-            } else {
-                Text("手动检测").font(.caption).foregroundStyle(p.secondary)
-            }
-        }
-        .padding(16).frame(maxWidth: .infinity, alignment: .leading)
-        .background(statusTint.opacity(p.dark ? 0.09 : 0.045), in: RoundedRectangle(cornerRadius: 10))
     }
 
     private var inspector: some View {
@@ -354,8 +320,7 @@ struct AIInspectorPage: View {
             .symbolRenderingMode(.hierarchical).foregroundStyle(tint).accessibilityHidden(true)
     }
     private func openConnections() {
-        store.networkSelection.product = service.product
-        store.page = .network
+        store.showConnections(service.product)
     }
     private func clean(_ value: String?) -> String? {
         guard let value else { return nil }

@@ -130,6 +130,10 @@ pub enum EntrySource {
     },
 }
 impl EntrySource {
+    fn check_launch_compatibility(&self) -> Result<()> {
+        if let Self::Desktop { spec, .. } = self { spec.check_seatbelt_compatibility()?; }
+        Ok(())
+    }
     fn executable(&self) -> &Path {
         match self {
             Self::Cli { executable, .. } => executable,
@@ -354,6 +358,7 @@ impl ManagedEntryActivationManager {
         let mut shell_config_path = None;
         let mut shell_snippet = None;
         let check = (|| {
+            source.check_launch_compatibility()?;
             if target_bundle_path
                 .as_ref()
                 .is_some_and(|bundle| &destination_path == bundle)
@@ -422,6 +427,7 @@ impl ManagedEntryActivationManager {
         source: &EntrySource,
         activity: &EntryActivity,
     ) -> Result<ManagedEntryActivationResult> {
+        source.check_launch_compatibility()?;
         if !activity.unmanaged.is_empty() || !activity.pending.is_empty() {
             return Err(err(
                 "already_running_unmanaged",

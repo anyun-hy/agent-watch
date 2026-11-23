@@ -181,6 +181,10 @@ impl LostRecords {
             }
         }
     }
+    fn pending(&self) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.queue.load(Relaxed) != 0 || self.writes.load(Relaxed) != 0
+    }
     fn persist(&self, write: &mut impl FnMut(Vec<u8>) -> io::Result<()>) {
         use std::sync::atomic::Ordering::Relaxed;
         let queue = self.queue.load(Relaxed);
@@ -208,7 +212,7 @@ impl LostRecords {
     }
 }
 struct AsyncLog {
-    sender: std::sync::mpsc::SyncSender<Vec<u8>>,
+    sender: std::sync::mpsc::SyncSender<Option<Vec<u8>>>,
     lost: std::sync::Arc<LostRecords>,
 }
 impl AsyncLog {
@@ -219,15 +223,20 @@ impl AsyncLog {
         std::thread::Builder::new()
             .name("gateway-event-log".into())
             .spawn(move || loop {
-                match receiver.recv_timeout(std::time::Duration::from_secs(1)) {
-                    Ok(body) => {
+                let message = if worker_lost.pending() {
+                    receiver.recv_timeout(std::time::Duration::from_secs(1))
+                } else {
+                    receiver.recv().map_err(|_| std::sync::mpsc::RecvTimeoutError::Disconnected)
+                };
+                match message {
+                    Ok(Some(body)) => {
                         if write(body).is_err() {
                             LostRecords::increment(&worker_lost.writes);
                             unavailable();
                         }
                         worker_lost.persist(&mut write);
                     }
-                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    Ok(None) | Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                         // Recovery is observable even when no further client
                         // handoff arrives after logging becomes writable.
                         worker_lost.persist(&mut write);
@@ -241,10 +250,13 @@ impl AsyncLog {
         Ok(Self { sender, lost })
     }
     fn send(&self, body: Vec<u8>) -> bool {
-        if self.sender.try_send(body).is_ok() {
+        if self.sender.try_send(Some(body)).is_ok() {
             true
         } else {
             LostRecords::increment(&self.lost.queue);
+            // The consumer may have drained the last entry between try_send
+            // and the counter increment. Either a queued entry or this notice wakes it.
+            let _ = self.sender.try_send(None);
             false
         }
     }

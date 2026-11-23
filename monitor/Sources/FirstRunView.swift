@@ -33,10 +33,22 @@ struct FirstRunView: View {
     var body: some View {
         VStack(spacing: 0) {
             ScrollView {
-                VStack(alignment: .leading, spacing: 24) {
+                VStack(alignment: .leading, spacing: 16) {
                     header
                     Surface(p, padding: 0) {
                         VStack(spacing: 0) {
+                            VStack(alignment: .leading, spacing: 9) {
+                                HStack {
+                                    SectionHeading(title: "检查进度", p: p)
+                                    Spacer()
+                                    Text("\(initialization.passedCount) / \(initialization.rows.count) 项已通过")
+                                        .font(WatchTypography.captionStrong).foregroundStyle(p.secondary)
+                                }
+                                ProgressView(value: Double(initialization.passedCount), total: Double(initialization.rows.count))
+                                    .progressViewStyle(.linear).tint(p.mint)
+                                    .accessibilityLabel("初始化检查进度")
+                            }.padding(16)
+                            Divider()
                             ForEach(Array(initialization.rows.enumerated()), id: \.element.id) { index, row in
                                 checkRow(row, number: index + 1)
                                 if index < initialization.rows.count - 1 { Divider().padding(.leading, 68) }
@@ -110,6 +122,7 @@ struct FirstRunView: View {
             footer
         }
         .foregroundStyle(p.text).background(p.background)
+        .font(WatchTypography.body).fontDesign(.monospaced)
         .preferredColorScheme(dark ? .dark : .light)
         .frame(minWidth: 900, minHeight: 660)
         .navigationTitle("Claude Watch · 首次初始化")
@@ -144,20 +157,35 @@ struct FirstRunView: View {
                     .font(WatchTypography.body).foregroundStyle(p.secondary)
                 Text("全部通过后，等待期间会自动刷新 DNS、WebRTC 和环境状态。")
                     .font(WatchTypography.caption).foregroundStyle(p.secondary)
-                HStack(spacing: 12) {
-                    Text("\(initialization.passedCount) / \(initialization.rows.count) 项已通过")
-                        .font(WatchTypography.bodyStrong).foregroundStyle(p.mint)
-                    if initialization.running { ProgressView().controlSize(.small) }
-                }
             }
         }
     }
+    @ViewBuilder
     private func checkRow(_ row: InitializationRow, number: Int) -> some View {
+        if row.status == .passed {
+            DisclosureGroup {
+                Text(row.detail).font(WatchTypography.caption).foregroundStyle(p.secondary)
+                    .fixedSize(horizontal: false, vertical: true).textSelection(.enabled)
+                    .padding(.leading, 25)
+            } label: {
+                HStack(spacing: 9) {
+                    Image(systemName: "checkmark.circle.fill").foregroundStyle(tint(.passed))
+                    Text("\(number). \(row.step.title)").font(WatchTypography.bodyStrong)
+                    Spacer()
+                    Text(row.status.title).font(WatchTypography.caption).foregroundStyle(tint(.passed))
+                }
+            }.disclosureGroupStyle(FullWidthDisclosureStyle(p: p)).padding(.horizontal, 18).padding(.vertical, 7)
+        } else {
+            pendingRow(row, number: number)
+        }
+    }
+
+    private func pendingRow(_ row: InitializationRow, number: Int) -> some View {
         HStack(alignment: .top, spacing: 16) {
             Group {
                 if row.status == .running { ProgressView().controlSize(.small) }
                 else {
-                    Image(systemName: row.status == .passed ? "checkmark.circle.fill" : row.status == .authorization ? "lock.circle" : row.status == .failed ? "exclamationmark.circle.fill" : "circle")
+                    Image(systemName: row.status == .authorization ? "lock.circle" : row.status == .failed ? "exclamationmark.circle.fill" : "circle")
                         .font(.system(size: 24, weight: .regular))
                 }
             }.frame(width: 28, height: 28).foregroundStyle(tint(row.status))
@@ -186,7 +214,7 @@ struct FirstRunView: View {
                     }.disabled(initialization.running)
                 }
             }
-        }.padding(20).accessibilityElement(children: .contain)
+        }.padding(.horizontal, 18).padding(.vertical, row.status == .pending ? 7 : 14).accessibilityElement(children: .contain)
     }
     private var footer: some View {
         HStack(spacing: 12) {

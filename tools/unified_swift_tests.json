@@ -895,7 +895,7 @@
       ],
       "dependencies": [],
       "fixture_only": true,
-      "safety_notes": "Pure in-memory refresh gate state machine."
+      "safety_notes": "Refresh gate and macOS file publication events for owned temporary files, including atomic replacement and rotation."
     },
     {
       "id": "swift.ResidentWebViewTests",

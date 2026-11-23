@@ -470,6 +470,19 @@ impl<R: ReadRunner> NativeDesktop<R> {
         self.target = target;
         Ok(())
     }
+    pub fn select_chatgpt_account_client(&mut self) -> Result<()> {
+        let target = LaunchTarget::ChatgptDesktop;
+        let snapshot = self.discovery_for(None).refresh(&self.runner, native::now());
+        let path = snapshot.chatgpt_account_source()?;
+        self.select_target_source(target, &path)?;
+        if !self.supports_chatgpt_profiles() {
+            return Err(CoreError::new("target_install_changed", "ChatGPT 桌面客户端在选择期间已变化"));
+        }
+        Ok(())
+    }
+    fn supports_chatgpt_profiles(&self) -> bool {
+        self.selected.as_ref().is_some_and(|app| app.kind == Kind::OpenaiMain)
+    }
     /// Explicit source selection is separate from discovery and must still pass
     /// current metadata/content, registry, sandbox and permit gates.
     pub fn select_target_source(&mut self, target: LaunchTarget, path: &Path) -> Result<()> {
@@ -801,7 +814,8 @@ impl<R: ReadRunner> NativeDesktop<R> {
         executor_boot_id: &str,
         policy_version: claude_watch_core::channel::PolicyVersion,
         vpn_epoch: Option<claude_watch_core::vpn::VpnEpoch>,
-    ) -> Result<()> {
+        profile: Option<&crate::accounts::chatgpt::Profile>,
+    ) -> Result<u32> {
         if self.authority != Authority::ExplicitPermit {
             return Err(CoreError::new(
                 "write_not_authorized",
@@ -814,12 +828,21 @@ impl<R: ReadRunner> NativeDesktop<R> {
             }
         }
         let spec = self.build_managed_entry_spec()?;
+        spec.check_seatbelt_compatibility()?;
+        let mut command = std::process::Command::new(launcher_bin);
+        let mut args = Vec::new();
+        if let Some(profile) = profile {
+            if !self.supports_chatgpt_profiles() {
+                return Err(CoreError::new("unsupported_chatgpt_profile", "已选应用不支持 ChatGPT 账号资料"));
+            }
+            profile.configure(&mut command, &mut args);
+        }
         let req = claude_watch_core::controlled_launch::ControlledLaunchRequest {
             entry_id: spec.entry_bundle_id.clone(),
             target: spec.target,
             target_executable: spec.target_executable.to_string_lossy().into_owned(),
             target_fingerprint: spec.target_fingerprint.clone(),
-            args: Vec::new(),
+            args,
             cwd: None,
             proxy_adaptation: spec.proxy_adaptation,
             gateway_endpoint: gateway_endpoint.to_string(),
@@ -837,7 +860,6 @@ impl<R: ReadRunner> NativeDesktop<R> {
         let req_json = serde_json::to_string(&req).map_err(|_| {
             CoreError::new("serialize_launch_request_failed", "序列化桌面受控启动请求失败")
         })?;
-        let mut command = std::process::Command::new(launcher_bin);
         for (key, _) in std::env::vars_os() {
             if key.to_str().is_some_and(claude_watch_core::controlled_launch::loader_startup_input) {
                 command.env_remove(key);
@@ -857,8 +879,12 @@ impl<R: ReadRunner> NativeDesktop<R> {
                     "无法启动 watch-sandbox-launcher",
                 )
             })?;
-        std::thread::sleep(Duration::from_millis(120));
-        if let Ok(Some(status)) = child.try_wait() {
+        let mut early_exit = None;
+        crate::process_exit::wait_for_exits(vec![child.id()], Instant::now() + Duration::from_millis(120), || {
+            early_exit = child.try_wait().ok().flatten();
+            early_exit.is_some()
+        });
+        if let Some(status) = early_exit {
             if !status.success() {
                 let mut err_msg = String::new();
                 if let Some(mut err_pipe) = child.stderr.take() {
@@ -881,7 +907,7 @@ impl<R: ReadRunner> NativeDesktop<R> {
                 ));
             }
         }
-        Ok(())
+        Ok(child.id())
     }
     /// The launch target this desktop adapter supervises; the policy family
     /// and every provider-specific decision derive from it.
@@ -1144,6 +1170,14 @@ impl<R: ReadRunner, T: Transport, S: AuditSystem + ServiceSystem> DesktopSystem
     fn launch_target(&self) -> LaunchTarget {
         self.desktop.target()
     }
+    fn check_desktop_compatibility(&mut self) -> Result<()> {
+        if self.desktop.selected.as_ref().is_some_and(|app|
+            crate::managed_entry::DesktopManagedEntrySpec::may_match_seatbelt_conflict(&app.bundle_id, &app.executable)
+        ) {
+            self.desktop.build_managed_entry_spec()?.check_seatbelt_compatibility()?;
+        }
+        Ok(())
+    }
 
     fn observation_roots(&mut self) -> Result<Vec<Target>> {
         self.desktop.observation_roots()
@@ -1245,15 +1279,42 @@ impl<R: ReadRunner, T: Transport, S: AuditSystem + ServiceSystem> DesktopSystem
 
 
     fn open_desktop(&mut self) -> Result<()> {
+        self.open_desktop_profile(None).map(|_| ())
+    }
+
+    fn supports_chatgpt_profiles(&self) -> bool {
+        self.desktop.supports_chatgpt_profiles()
+    }
+
+    fn quit_chatgpt_for_switch(&mut self, target: &Target) -> Result<()> {
+        self.desktop.require_quit_authority()?;
+        if !self.desktop.supports_chatgpt_profiles() || target.kind != Kind::OpenaiMain {
+            return Err(CoreError::new("target_identity_mismatch", "无法确认要切换账号的 ChatGPT 实例"));
+        }
+        crate::process_exit::quit_desktop_instance(&target.identity, |process|
+            request_appkit_quit(&self.desktop.helper, process))
+    }
+
+    fn open_chatgpt_profile(&mut self, profile: &crate::accounts::chatgpt::Profile) -> Result<u32> {
+        self.open_desktop_profile(Some(profile))
+    }
+}
+
+impl<R: ReadRunner, T: Transport, S: AuditSystem + ServiceSystem> DesktopRuntime<'_, R, T, S> {
+    fn open_desktop_profile(&mut self, profile: Option<&crate::accounts::chatgpt::Profile>) -> Result<u32> {
         let config = ConfigStore {
             storage: self.storage.clone(),
         }
         .load()?;
         let (launcher_bin, reg_sock, gw_endpoint, boot_id, policy_version, vpn_epoch) =
             self.resolve_seatbelt_launch_context(&config)?;
-        self.desktop.open_via_sandbox_launcher(
-            &launcher_bin, &reg_sock, &gw_endpoint, &boot_id, policy_version, vpn_epoch,
-        )
+        let pid = self.desktop.open_via_sandbox_launcher(
+            &launcher_bin, &reg_sock, &gw_endpoint, &boot_id, policy_version, vpn_epoch, profile,
+        )?;
+        let events = ProcessEvents::new().ok();
+        if let Some(events) = &events { let _ = events.watch_exec_or_exit(pid); }
+        self.desktop.launch_events = events;
+        Ok(pid)
     }
 
 
@@ -1264,6 +1325,30 @@ impl<R: ReadRunner, T: Transport, S: AuditSystem + ServiceSystem> DesktopSystem
 #[cfg(test)]
 mod target_contracts {
     use super::*;
+    #[test]
+    fn script_approval_wakes_on_publication_and_requires_matching_boot_and_row() {
+        use std::sync::mpsc;
+        let home = std::env::temp_dir().join(format!("cw-script-approval-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&home).unwrap();
+        let store = StateStore::new(crate::storage::Paths::new(&home).unwrap());
+        let path = store.paths.watch().join("state/target-discovery.json");
+        let combo = serde_json::json!({"source_id":"selected","interpreter_fingerprint":"bound"});
+        let publish = |boot: &str, row: &Value| store.atomic_json(&path,
+            &serde_json::json!({"approval_executor_boot_id":boot, "script_launch_approvals":[row]})).unwrap();
+        publish("old", &combo);
+        std::thread::scope(|scope| {
+            let (sent, done) = mpsc::channel();
+            let store = &store;
+            let combo = &combo;
+            scope.spawn(move || sent.send(wait_for_script_approval(store, "current", combo, Instant::now() + Duration::from_secs(3))).unwrap());
+            assert!(matches!(done.recv_timeout(Duration::from_millis(40)), Err(mpsc::RecvTimeoutError::Timeout)));
+            publish("current", &serde_json::json!({"source_id":"selected","interpreter_fingerprint":"other"}));
+            assert!(matches!(done.recv_timeout(Duration::from_millis(40)), Err(mpsc::RecvTimeoutError::Timeout)));
+            publish("current", combo);
+            done.recv_timeout(Duration::from_secs(1)).unwrap().unwrap();
+        });
+        std::fs::remove_dir_all(home).unwrap();
+    }
     use crate::commands::{Output, ReadCommand};
     #[test]
     fn channel_inventory_includes_cli_and_children_without_cross_family_or_launcher() {
@@ -1357,7 +1442,7 @@ mod target_contracts {
         assert_eq!(desktop.selected.as_ref().unwrap().kind, Kind::OpenaiMain);
         assert_eq!(desktop.open_via_sandbox_launcher(
             Path::new("/unused/launcher"), Path::new("/unused/socket"), "127.0.0.1:1", "fixture",
-            claude_watch_core::channel::PolicyVersion { policy_digest: "p".into(), guard_policy_digest: "g".into() }, None,
+            claude_watch_core::channel::PolicyVersion { policy_digest: "p".into(), guard_policy_digest: "g".into() }, None, None,
         ).unwrap_err().code, "write_not_authorized");
         // The target belongs to a supervised family, so the exit entry accepts
         // it in principle; only the read-only authority refuses the action.

@@ -8,6 +8,16 @@ struct LeakCheckTests {
             assertions += 1
             if !condition { fputs("FAIL: \(detail)\n", stderr); exit(1) }
         }
+        let first = LeakObservation(address: "2001:db8::1", kind: "srflx", source: "STUN A", family: 6, country: "JP")
+        let otherSource = LeakObservation(address: "2001:0db8::1", kind: "srflx", source: "STUN B", family: 6, country: "US")
+        let relay = LeakObservation(address: first.address, kind: "relay", source: first.source, family: 6)
+        let unspecifiedFamily = LeakObservation(address: first.address, kind: first.kind, source: first.source)
+        let groups = LeakCandidateGroup.group([first, relay, otherSource, first, unspecifiedFamily])
+        expect(groups.map(\.observations) == [[first, otherSource, first], [relay], [unspecifiedFamily]],
+               "candidate display preserves order and every source receipt while separating kinds and address families")
+        expect(groups[0].sourceCount == 2, "duplicate observations do not inflate the visible source count")
+        expect(groups[0].countries == ["JP", "US"] && groups[1].countries == ["地区未取得"],
+               "a collapsed candidate shows differing countries and distinguishes missing geography")
         let store = LeakCheckStore(isFixture: true)
         var context: String? = "fixture-A"
         store.contextProvider = { context }; store.automaticContextProvider = { context }

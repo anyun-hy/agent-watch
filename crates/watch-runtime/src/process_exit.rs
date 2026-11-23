@@ -164,6 +164,27 @@ fn same_process(a: &ProcessKernelIdentity, b: &ProcessKernelIdentity) -> bool {
         && a.executable_path == b.executable_path
 }
 
+/// A profile switch addresses one verified Desktop window. Its AppKit quit can
+/// be cancelled by the user. Standalone CLIs and other editions are outside it.
+pub(crate) fn quit_desktop_instance(expected: &claude_watch_core::processes::Identity,
+    mut request_appkit: impl FnMut(&ProcessKernelIdentity) -> Result<bool>) -> Result<()> {
+    let changed = || CoreError::new("target_identity_changed", "ChatGPT 实例已变化，未请求退出");
+    let live = inspect_process_identity(expected.pid).ok_or_else(changed)?;
+    if !expected.valid() || live.uid != claude_watch_system::effective_uid()
+        || live.uid != expected.uid || live.start_seconds != expected.start_seconds
+        || live.start_microseconds != expected.start_microseconds || live.executable_path != expected.executable {
+        return Err(changed());
+    }
+    let results = execute_targets(&[ExitTarget { process: live, desktop_main: true }], Duration::from_secs(15),
+        |target| Ok(if request_appkit(&target.process)? { BoundSignalResult::Sent } else { BoundSignalResult::Failed }),
+        bound_lifetime_exited);
+    if matches!(results[0].process_state.as_str(), "already_exited" | "confirmed_exit_after_request") {
+        Ok(())
+    } else {
+        Err(CoreError::new("chatgpt_quit_unconfirmed", "ChatGPT 尚未退出。请处理桌面端的未保存提示后重试。"))
+    }
+}
+
 fn execute_targets(targets: &[ExitTarget], timeout: Duration,
     mut request: impl FnMut(&ExitTarget) -> Result<BoundSignalResult>,
     exited: impl Fn(&ProcessKernelIdentity) -> bool) -> Vec<ExitResult> {

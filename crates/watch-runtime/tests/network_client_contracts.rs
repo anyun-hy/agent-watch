@@ -173,7 +173,7 @@ fn homepage_reachability_is_separate_from_the_egress_trace() {
     assert_eq!(observed["challenge"]["provider"], "cloudflare");
     let egress = client.service_metadata("claude");
     assert_eq!(egress.source_url, "https://claude.ai/cdn-cgi/trace");
-    assert_eq!(trace_ip(&egress).as_deref(), Some("1.1.1.1"));
+    assert_eq!(egress.raw, "ip=1.1.1.1\n");
     let requests = transport.0.lock().unwrap();
     assert_eq!(requests.len(), 2);
     assert_eq!(requests[0].max_body, 0);
@@ -394,36 +394,6 @@ fn production_transport_classifies_a_real_global_deadline_as_timeout() {
         .unwrap_err();
     server.join().unwrap();
     assert_eq!(error.code, "timeout");
-}
-
-#[test]
-fn trace_and_collection_keep_service_and_reference_exit_evidence_separate() {
-    let trace = Receipt {
-        kind: "trace".into(),
-        query: String::new(),
-        source_url: "https://claude.ai/cdn-cgi/trace".into(),
-        queried_at: 1.0,
-        finished_at: 1.0,
-        status: "complete".into(),
-        http_status: Some(200),
-        raw: "colo=NRT\nip=1.1.1.1\n".into(),
-        data: None,
-        error: None,
-        context_id: None,
-        measurement_at: None,
-        response_headers: HashMap::new(),
-        transport: String::new(),
-        cache_state: "miss".into(),
-        cache_age: None,
-        retry_after: None,
-        last_good: None,
-    };
-    assert_eq!(trace_ip(&trace).as_deref(), Some("1.1.1.1"));
-    assert!(trace_ip(&Receipt {
-        raw: "xip=1.1.1.1".into(),
-        ..trace
-    })
-    .is_none());
 }
 
 #[test]

@@ -11,8 +11,13 @@ case "$MODE" in all|rust|swift) ;; *) echo 'Usage: bash tools/test-guard-regress
 if [[ "$MODE" != swift ]]; then
   command -v cargo >/dev/null || { echo 'cargo is required; no Rust tests have run.' >&2; exit 1; }
   cargo check --locked -p claude-watch-runtime -p claude-watch-engine
-  cargo test --locked -p claude-watch-runtime --lib controlled::guard_regressions -- --nocapture
-  cargo test --locked -p claude-watch-runtime --lib process_exit::tests::normal_exit_selection_preserves_manual_cli_and_account_desktop_scope -- --nocapture
+  bash tools/run-exact-runtime-tests.sh controlled_contracts \
+    delegated_channel_session_skips_failing_desktop_inventory_and_reads_authority_receipt \
+    missing_frame_does_not_import_a_legacy_receipt \
+    delegated_channel_expired_receipt_stays_closed_and_projects_pending_verification \
+    delegated_channel_reported_execution_failure_keeps_failure_projection
+  bash tools/run-exact-runtime-tests.sh --lib \
+    process_exit::tests::normal_exit_selection_preserves_manual_cli_and_account_desktop_scope
   cargo test --locked -p claude-watch-runtime --test supervised_evidence_regressions -- --nocapture
 fi
 if [[ "$MODE" != rust ]]; then

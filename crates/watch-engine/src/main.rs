@@ -35,6 +35,9 @@ use std::{
 
 struct ReadOnlyAccounts;
 impl claude_watch_runtime::accounts::AccountOs for ReadOnlyAccounts {
+    fn current_desktop(&mut self) -> Result<claude_watch_core::processes::Identity> {
+        claude_watch_runtime::accounts::observe_claude_source(runtime::runner()?.as_ref())
+    }
     fn claude_version(&mut self) -> Result<Option<String>> {
         Ok(None)
     }
@@ -152,6 +155,27 @@ fn local_command(request: &claude_watch_core::cli::Request, paths: Paths) -> Res
                 "message": "VPN 监督预期已保存到 Watch 配置（待监督与执行器回执生效）"
             })))
         }
+        ("account", Some("identity")) if request.value("product") == Some("chatgpt") =>
+            claude_watch_runtime::accounts::chatgpt::identity::read(&storage, runtime::runner()?.as_ref()).map(Some),
+        ("account", Some("save")) if request.value("product") == Some("chatgpt") => {
+            use claude_watch_runtime::accounts::chatgpt;
+            request.require_apply()?;
+            let input = bounded_input(4096)?;
+            let token = input["source_token"].as_str().unwrap_or("");
+            let slot = chatgpt::Slot::parse(request.target.as_deref())?;
+            chatgpt::save(&storage, runtime::runner()?.as_ref(), slot, token).map(Some)
+        }
+        ("account", Some("current")) if request.value("product").unwrap_or("claude") == "claude" =>
+            AccountStore::new(storage, ReadOnlyAccounts).current_source().map(Some),
+        ("account", Some("save")) if request.value("product").unwrap_or("claude") == "claude" => {
+            request.require_apply()?;
+            let input = serde_json::from_value(bounded_input(4096)?)
+                .map_err(|_| CoreError::new("invalid_account_source", "请重新读取当前 Claude 账号"))?;
+            AccountStore::new(storage, ReadOnlyAccounts)
+                .save_current(request.target.as_deref().unwrap_or(""), &input).map(Some)
+        }
+        ("account", Some("status")) if request.value("product") == Some("chatgpt") =>
+            claude_watch_runtime::accounts::chatgpt::status_with_login(&storage, runtime::runner()?.as_ref()).map(Some),
         ("account", Some("status")) => Ok(Some(
             AccountStore::new(storage, ReadOnlyAccounts)
                 .status()?

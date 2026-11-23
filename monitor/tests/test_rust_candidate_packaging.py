@@ -92,7 +92,7 @@ class RustCandidatePackagingTests(unittest.TestCase):
         self.assertIn('raw == "rust-candidate"', variant)
         # The Python backend is retired: no runner may keep a branch for it.
         self.assertNotIn('case "stable"', variant)
-        self.assertIn('SnapshotRunner.run(full: full)', monitor)
+        self.assertIn('arguments: ["snapshot", "--without-channel-events"]', snapshot_reader)
         self.assertIn('SnapshotProcessTransport.run(', snapshot_reader)
         for runner in (snapshot_reader, switcher):
             self.assertIn('guard let variant = BundledBackendVariant.current() else {', runner)

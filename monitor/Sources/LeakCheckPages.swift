@@ -39,26 +39,30 @@ private struct LeakInspectorPage: View {
     private var principal: [LeakObservation] { detected.filter { !isLocal($0) } }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 20) {
+        VStack(alignment: .leading, spacing: 14) {
             InspectorHeading(title: title,
                 subtitle: isDNS ? "递归解析出口 · 与同轮公网出口国家核对" : "当前检测 WebView · ICE / STUN 与 HTTP 出口核对",
-                symbol: isDNS ? "network" : "antenna.radiowaves.left.and.right",
-                color: isDNS ? style.network : style.location, p: p) {
+                p: p) {
                     Button {
                         state.running ? store.cancel(kind) : store.start(kind)
                     } label: {
-                        Label(state.running ? "取消检测" : "开始检测", systemImage: state.running ? "stop.fill" : "play.fill")
-                            .font(.body.weight(.medium)).padding(.horizontal, 4).frame(minHeight: 28)
-                    }.buttonStyle(.borderedProminent).controlSize(.large).tint(style.action)
-                        .accessibilityLabel(state.running ? "取消\(title)" : "开始\(title)")
+                        Label(state.running ? "取消检测" : isDNS ? "检测 DNS" : "检测 WebRTC",
+                              systemImage: state.running ? "stop.fill" : "play.fill").font(WatchTypography.bodyStrong)
+                    }.buttonStyle(.borderedProminent).tint(style.action)
+                        .accessibilityLabel(state.running ? "取消\(title)" : latestResult == nil ? "开始\(title)" : "重新运行\(title)")
                 }
             if state.running, let progress = currentProgress { Label(progress,systemImage:"arrow.triangle.2.circlepath").font(.callout).foregroundStyle(style.network) }
-            InspectorStatus(verdict: state.verdict, running: state.running, finishedAt: latestResult?.finishedAt, p: p)
+            InspectorStatus(verdict: state.verdict, running: state.running,
+                            source: isDNS ? "DNS · 递归解析器" : "WebRTC · ICE / STUN",
+                            symbol: isDNS ? Page.dns.symbol : Page.webrtc.symbol, p: p)
+            SamplingEvidence(source: isDNS ? "IPLeak · 本机 WebView 查询" : "本机 WebView · ICE 候选",
+                             timeLabel: showingPreviousSuccessfulResult ? "上次有效样本" : state.running ? "上次完成" : "完成于",
+                             timestamp: result?.finishedAt, p: p)
             if let error = diagnosticLog.error ?? LeakDiagnosticTrace.shared.error {
                 Label(error, systemImage: "exclamationmark.triangle").font(WatchTypography.caption).foregroundStyle(p.amber)
             }
             if showingPreviousSuccessfulResult, let previous = result {
-                Label("本轮查询未完成；下方保留上次有效样本（" + probeTime(previous.finishedAt) + "）供核对。当前判词与启动预检仍按本轮失败结果执行。", systemImage: "clock.arrow.circlepath")
+                Label("本轮查询" + (latestResult.map { "（" + probeTime($0.finishedAt) + "）" } ?? "") + "未完成。下方显示上次有效样本（" + probeTime(previous.finishedAt) + "），启动预检采用本轮结果。", systemImage: "clock.arrow.circlepath")
                     .font(.callout).foregroundStyle(p.amber).fixedSize(horizontal: false, vertical: true)
             }
             if latestResult?.contextChanged == true {
@@ -68,79 +72,52 @@ private struct LeakInspectorPage: View {
             if let diagnostic = store.diagnostics[kind] {
                 Text(diagnostic).font(.callout).foregroundStyle(p.secondary)
             }
-            referenceAndSettings
-            addresses
+            addressComparison
             if !local.isEmpty {
                 DisclosureGroup(isExpanded: $localExpanded) {
-                    addressList(local).padding(.top, 12)
+                    observationList(local).padding(.top, 8)
                 } label: {
                     Label("本地与 mDNS 候选（\(local.count)）", systemImage: "desktopcomputer")
                         .font(.callout.weight(.medium)).foregroundStyle(style.location)
                 }.disclosureGroupStyle(FullWidthDisclosureStyle(p: p))
             }
+            if !isDNS { settings }
             details
-            Text("检测结果在环境状态、DNS 与 WebRTC 页面共享；离开本页不会取消正在进行的采样。").font(.caption).foregroundStyle(p.secondary)
             Label(isDNS ? "本机 WebView 发起查询，IPLeak 返回 DNS 观测；不代表所有 AI 应用。"
                   : "仅代表当前检测 WebView，不代表 AI 应用或其他浏览器。", systemImage: "info.circle")
                 .font(.caption).foregroundStyle(p.secondary)
                 .fixedSize(horizontal: false, vertical: true)
-        }.font(.body).foregroundStyle(p.text)
+        }.font(WatchTypography.body).foregroundStyle(p.text)
             .frame(maxWidth: 1120, alignment: .leading).padding(.top, 24)
     }
 
-    private var referenceAndSettings: some View {
-        InspectorPanel(p: p) {
+    private var addressComparison: some View {
+        Surface(p) {
             ViewThatFits(in: .horizontal) {
-                HStack(alignment: .top, spacing: 0) {
-                    referenceSummary.padding(20).frame(minWidth: 320, maxWidth: .infinity, alignment: .leading)
-                    Rectangle().fill(style.border).frame(width: 1).padding(.vertical, 20)
-                    settings.padding(20).frame(width: 312, alignment: .leading)
+                HStack(alignment: .top, spacing: 20) {
+                    addresses.frame(minWidth: 282, maxWidth: .infinity, alignment: .leading)
+                    Divider()
+                    referenceSummary.frame(minWidth: 230, maxWidth: .infinity, alignment: .leading)
                 }.fixedSize(horizontal: false, vertical: true)
-                VStack(alignment: .leading, spacing: 0) {
-                    referenceSummary.padding(20)
-                    Divider().padding(.horizontal, 20)
-                    settings.padding(20)
-                }
+                VStack(alignment: .leading, spacing: 14) { addresses; Divider(); referenceSummary }
             }
         }
     }
+
     private var referenceSummary: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            HStack(spacing:8) {
-                if isIPLeak { InspectorIcon(name:"globe",color:style.transport) }
-                else { BrandLogo(brand:.cloudflare,size:18) }
-                Text("HTTP 出口参考").font(.headline)
-            }
+        VStack(alignment: .leading, spacing: 12) {
+            sectionHeading("HTTP 出口参考", icon: "globe", color: style.transport)
             if reference.isEmpty {
-                Text(result == nil ? "未检测" : "未取得")
-                    .font(.system(size: 24, weight: .semibold, design: .monospaced))
-                Text(state.running ? "等待本轮 HTTP 出口参考" : result == nil ? "开始检测后展示同轮出口地址" : "本轮没有有效的 HTTP 出口参考")
-                    .font(.callout).foregroundStyle(p.secondary)
+                Text(state.running ? "等待本轮 HTTP 出口参考" : result == nil ? "等待首次检测" : "未取得 HTTP 出口参考")
+                    .font(WatchTypography.body).foregroundStyle(p.secondary)
             } else {
-                ForEach(reference) { item in
-                    VStack(alignment: .leading, spacing: 8) {
-                        Text(item.address).font(.system(size: 24, weight: .semibold, design: .monospaced))
-                            .textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
-                        if item.country != nil {
-                            CountryLine(code:countryCodes[item.address],country:item.country,region:item.region,city:item.city,organization:item.isp,p:p)
-                        }
-                        Label(item.family.map { "IPv\($0) · HTTP 参考" } ?? "HTTP 参考", systemImage: "cloud")
-                            .font(.callout).foregroundStyle(style.network)
-                        Text(item.source).font(.caption).foregroundStyle(p.secondary)
-                            .textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
-                    }
-                }
+                observationList(reference)
             }
-            Divider().overlay(style.border)
-            Label(isDNS ? "用于对照网络出口，不视为 DNS 解析器地址。"
-                  : "与同轮 ICE / STUN 公网候选比较。", systemImage: "arrow.left.arrow.right")
-                .font(.callout).foregroundStyle(p.secondary)
-                .fixedSize(horizontal: false, vertical: true)
         }
     }
+
     private var settings: some View {
         VStack(alignment: .leading, spacing: 12) {
-            sectionHeading("本次诊断对照值", icon: "slider.horizontal.3", color: style.location)
             if isDNS {
                 Text("自动比较同一轮 DNS 递归出口与 HTTP 公网出口的国家：同国通过；异国显示泄漏风险；任一国家缺失则本轮未完成。无需填写或确认 DNS IP 名单。")
                     .font(.caption).foregroundStyle(p.secondary).fixedSize(horizontal: false, vertical: true)
@@ -157,66 +134,70 @@ private struct LeakInspectorPage: View {
                 Label(error, systemImage: "exclamationmark.triangle").font(.callout).foregroundStyle(p.amber)
                     .fixedSize(horizontal: false, vertical: true)
             }
-            Divider().overlay(style.border)
-            Label(isDNS ? "IPLeak DNS · IPLeak HTTP · 本机采样" : "Net.Coffee 归属 · Cloudflare HTTP · 本机采样", systemImage: "server.rack")
-                .font(.caption).foregroundStyle(style.transport)
-            Text(isDNS ? "DNS 与 HTTP 参考均通过当前检测 WebView。" : "按当前系统路由检测，不强制 UDP 走 7890。")
-                .font(.caption).foregroundStyle(p.secondary).fixedSize(horizontal: false, vertical: true)
         }
     }
     private var addresses: some View {
         VStack(alignment: .leading, spacing: 12) {
-            HStack {
-                sectionHeading(isDNS ? "DNS 递归出口" : "出口与中继候选",
-                               icon: isDNS ? "network" : "point.3.connected.trianglepath.dotted",
-                               color: isDNS ? style.network : style.transport)
-                Spacer()
-                Text("\(principal.count) 项").font(.caption).foregroundStyle(p.secondary)
-            }
+            sectionHeading(isDNS ? "DNS 递归出口" : "公网与中继候选",
+                           icon: isDNS ? "network" : "antenna.radiowaves.left.and.right", color: style.network)
             if principal.isEmpty {
-                InspectorPanel(p: p) {
-                    HStack(spacing: 12) {
-                        InspectorIcon(name: state.running ? "arrow.triangle.2.circlepath" : "tray", color: p.secondary)
-                        VStack(alignment: .leading, spacing: 5) {
-                            Text(state.running ? "正在收集地址" : result == nil ? "等待首次检测" : "本轮未取得可用于对照的地址")
-                                .font(.body.weight(.medium))
-                            Text(result == nil ? "点击开始检测，结果会显示在这里。" : "缺少结果不能判定安全，请查看检测状态与原始证据。")
-                                .font(.callout).foregroundStyle(p.secondary).fixedSize(horizontal: false, vertical: true)
-                        }
-                        Spacer(minLength: 0)
-                    }.padding(20)
-                }
-            } else { addressList(principal) }
-        }
-    }
-    private func addressList(_ rows: [LeakObservation]) -> some View {
-        InspectorPanel(p: p) {
-            VStack(spacing: 0) {
-                ForEach(Array(rows.enumerated()), id: \.offset) { index, observation in
-                    if index > 0 { Divider().padding(.leading, 56) }
-                    HStack(alignment: .top, spacing: 12) {
-                        Group {
-                            if let brand = ServiceBrand.provider(observation.isp) ?? ServiceBrand.endpoint(observation.source) { BrandLogo(brand:brand,size:18) }
-                            else { InspectorIcon(name:observationIcon(observation),color:observationColor(observation)) }
-                        }.frame(width:24,height:22)
-                        VStack(alignment: .leading, spacing: 7) {
-                            Text(observation.address).font(.system(.body, design: .monospaced)).textSelection(.enabled)
-                                .fixedSize(horizontal: false, vertical: true)
-                            if observation.country != nil || observation.isp != nil {
-                                CountryLine(code:countryCodes[observation.address],country:observation.country,region:observation.region,city:observation.city,organization:observation.isp,p:p)
+                Text(state.running ? "正在收集地址" : result == nil ? "等待首次检测" : "本轮未取得可对照的地址")
+                    .font(WatchTypography.body).foregroundStyle(p.secondary)
+            } else if isDNS {
+                observationList(principal)
+            } else {
+                ForEach(LeakCandidateGroup.group(principal)) { group in
+                    if group.observations.count > 1 {
+                        DisclosureGroup {
+                            observationList(group.observations).padding(.top, 6)
+                        } label: {
+                            VStack(alignment: .leading, spacing: 5) {
+                                Text(group.id.address).font(WatchTypography.mono).textSelection(.enabled)
+                                let countries = group.countries
+                                if countries.count == 1, let country = countries.first, country != "地区未取得" {
+                                    CountryLine(code: countryCodes[group.id.address], country: country, p: p)
+                                } else {
+                                    Text(countries.joined(separator: " / ")).font(WatchTypography.caption)
+                                        .foregroundStyle(p.secondary)
+                                }
+                                Text([observationKind(group.id.kind), group.id.family.map { "IPv\($0)" },
+                                      "\(group.sourceCount) 个来源"].compactMap { $0 }.joined(separator: " · "))
+                                    .font(WatchTypography.caption).foregroundStyle(p.secondary)
                             }
-                            Text(observation.source).font(.caption).foregroundStyle(p.secondary).textSelection(.enabled)
-                                .fixedSize(horizontal: false, vertical: true)
-                        }.frame(maxWidth: .infinity, alignment: .leading)
-                        VStack(alignment: .trailing, spacing: 6) {
-                            Text(observationKind(observation.kind)).font(.callout).foregroundStyle(observationColor(observation))
-                            if let family = observation.family { Text("IPv\(family)").font(.caption).foregroundStyle(p.secondary) }
-                        }.frame(minWidth: 88, alignment: .trailing)
-                    }.padding(16)
+                        }.disclosureGroupStyle(FullWidthDisclosureStyle(p: p))
+                    } else if let item = group.observations.first {
+                        observationRow(item)
+                    }
                 }
             }
         }
     }
+
+    private func observationList(_ rows: [LeakObservation]) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            ForEach(Array(rows.enumerated()), id: \.offset) { index, item in
+                if index > 0 { Divider() }
+                observationRow(item)
+            }
+        }
+    }
+
+    private func observationRow(_ item: LeakObservation) -> some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Text(item.address).font(WatchTypography.mono.weight(.semibold)).textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
+            CountryLine(code: countryCodes[item.address], country: item.country, region: item.region,
+                        city: item.city, organization: item.isp, p: p)
+            Text([item.kind == "http" ? "HTTP 参考" : observationKind(item.kind),
+                  item.family.map { "IPv\($0)" }, item.source].compactMap { $0 }.joined(separator: " · "))
+                .font(WatchTypography.caption).foregroundStyle(p.secondary).textSelection(.enabled)
+            if let source = item.geoSource {
+                Text(source + (item.geoQueriedAt.map { " · " + probeTime($0) } ?? ""))
+                    .font(WatchTypography.small).foregroundStyle(p.secondary)
+            }
+        }.frame(maxWidth: .infinity, alignment: .leading)
+    }
+
     private var details: some View {
         VStack(alignment: .leading, spacing: 12) {
             if let latestResult, !latestResult.errors.isEmpty {
@@ -225,6 +206,9 @@ private struct LeakInspectorPage: View {
             }
             DisclosureGroup(isExpanded: $detailsExpanded) {
                 VStack(alignment: .leading, spacing: 12) {
+                    if isDNS { settings }
+                    Text(isDNS ? "IPLeak DNS 和 HTTP 均通过当前 WebView 采样。" : "Net.Coffee 提供归属，Cloudflare 提供 HTTP 参考。UDP 按系统路由检测。")
+                        .font(WatchTypography.caption).foregroundStyle(p.secondary)
                     if let result {
                         if showingPreviousSuccessfulResult {
                             DetailRow(title: "展示样本", value: "上次有效结果；当前判词见页面顶部", p: p)
@@ -262,23 +246,6 @@ private struct LeakInspectorPage: View {
         guard !isDNS else { return false }
         return observation.kind == "mdns" || (observation.kind == "host" && LeakIPAddress(observation.address)?.isPublic != true)
     }
-    private func observationColor(_ observation: LeakObservation) -> Color {
-        switch observation.kind {
-        case "resolver": return style.network
-        case "relay": return style.proxy
-        case "mdns", "host": return style.location
-        default: return style.transport
-        }
-    }
-    private func observationIcon(_ observation: LeakObservation) -> String {
-        switch observation.kind {
-        case "resolver": return "network"
-        case "relay": return "server.rack"
-        case "mdns": return "lock.shield"
-        case "host": return "desktopcomputer"
-        default: return "antenna.radiowaves.left.and.right"
-        }
-    }
     private func observationKind(_ value: String) -> String {
         switch value {
         case "resolver": return "递归解析器"
@@ -292,5 +259,40 @@ private struct LeakInspectorPage: View {
     }
     private func probeTime(_ epoch: Double) -> String {
         epoch.isFinite && epoch > 0 ? timeText(epoch, date: true) : "未取得"
+    }
+}
+
+/// Presentation groups retain every original observation, including its source and location.
+struct LeakCandidateGroup: Identifiable {
+    struct Key: Hashable {
+        let address, kind: String
+        let family: Int?
+    }
+    let id: Key
+    var observations: [LeakObservation]
+    var sourceCount: Int { Set(observations.map(\.source)).count }
+    var countries: [String] {
+        var seen: Set<String> = []
+        return observations.compactMap {
+            let country = $0.country?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let label = country.isEmpty ? "地区未取得" : country
+            return seen.insert(label).inserted ? label : nil
+        }
+    }
+
+    static func group(_ observations: [LeakObservation]) -> [Self] {
+        var result: [Self] = []
+        var indices: [Key: Int] = [:]
+        for item in observations {
+            let key = Key(address: LeakIPAddress(item.address)?.canonical ?? item.address,
+                          kind: item.kind, family: item.family)
+            if let index = indices[key] {
+                result[index].observations.append(item)
+            } else {
+                indices[key] = result.count
+                result.append(Self(id: key, observations: [item]))
+            }
+        }
+        return result
     }
 }

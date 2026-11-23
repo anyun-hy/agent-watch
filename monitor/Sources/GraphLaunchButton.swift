@@ -16,7 +16,7 @@ enum GraphLaunchTarget: Equatable {
     func hasRunningDesktop(in processes: [WatchedProcess]) -> Bool {
         processes.contains { process in
             self == .claude ? process.kind == "desktop-main"
-                : ["chatgpt-desktop-main", "openai-desktop-main"].contains(process.kind)
+                : process.kind == "chatgpt-desktop-main"
         }
     }
     /// A launch is only impossible when the backend cannot represent the target
@@ -78,7 +78,7 @@ struct GraphLaunchButton: View {
             }
             .buttonStyle(.plain)
             .disabled(!isEnabled)
-            .help(reason ?? "启动时会重新执行完整检查，通过后建立受控会话。")
+            .help(reason ?? "启动时会重新检查。进程启动后，联网状态以通道回执为准。")
             .accessibilityHint(reason ?? "启动前将重新检查当前环境。")
         }
         .confirmationDialog("检查并启动 \(pending?.title ?? "应用")？", isPresented: $confirming, titleVisibility: .visible) {
@@ -87,10 +87,7 @@ struct GraphLaunchButton: View {
             }
             Button("取消", role: .cancel) { pending = nil }
         } message: {
-            let multiWarning = monitor.managedEntryControl.hasMultipleSources
-                ? "\n\n⚠️ 提示：检测到系统中存在 \(monitor.managedEntryControl.candidateSources.count) 个安装版本，已选用系统官方安装启动。建议稍后处理多余版本。"
-                : ""
-            Text("将重新执行 \(pending?.title ?? "应用") 的完整启动检查，通过后建立该应用的受控会话。\(multiWarning)")
+            Text("后台将核验 \(pending?.title ?? "应用") 的安装来源、启动兼容性和当前环境。启动后的联网状态以通道回执为准。")
         }
         .alert(resultTitle, isPresented: $showingResult) {
             Button("知道了", role: .cancel) {}
