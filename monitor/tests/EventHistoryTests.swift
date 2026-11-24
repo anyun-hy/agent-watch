@@ -55,6 +55,21 @@ struct EventHistoryTests {
             throw NSError(domain: "fixture", code: 5)
         }
         expect(filtered.total == 1 && filtered.events.first?.id == "sample-0", "search before paging")
+        let canonicalRoot = String(cString: realpath(root.path, nil)!)
+        let exportURL = URL(fileURLWithPath: canonicalRoot).appendingPathComponent("diagnostics-export.json")
+        guard case .success(let savedURL, let exportMessage) = DiagnosticExportRunner.write(to: exportURL) else {
+            fputs("FAIL: diagnostic export failed for \(exportURL.path)\n", stderr)
+            throw NSError(domain: "fixture", code: 7)
+        }
+        expect(savedURL == exportURL && !exportMessage.isEmpty, "diagnostic export returns destination and message")
+        let exportedData = try Data(contentsOf: exportURL)
+        let exportedObj = try JSONSerialization.jsonObject(with: exportedData) as? [String: Any]
+        expect(exportedObj?["kind"] as? String == "claude_watch_diagnostics", "exported valid diagnostic bundle")
+        expect(exportedObj?["summary"] is [String: Any], "exported top-level summary")
+        guard case .failure(let overwriteMessage) = DiagnosticExportRunner.write(to: exportURL) else {
+            throw NSError(domain: "fixture", code: 8)
+        }
+        expect(!overwriteMessage.isEmpty, "existing export target fails closed with message")
         print("EventHistoryTests passed")
     }
 }

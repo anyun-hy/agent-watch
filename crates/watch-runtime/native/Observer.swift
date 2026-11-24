@@ -25,7 +25,23 @@ private var observerIdentityMisses: [Int32: Int] = [:]
 private var observerAfterInventoryScan: (() -> Void)?
 private var observerBeforeSocketRecheck: ((Int32) -> Void)?
 #endif
-private func currentIdentity(_ pid: Int32) -> Identity? {
+private func kernelExecPath(_ pid: Int32) -> String? {
+    var mib = [Int32(CTL_KERN), Int32(KERN_PROCARGS2), pid]
+    var size = 0
+    guard sysctl(&mib, UInt32(mib.count), nil, &size, nil, 0) == 0, size > 4, size <= 1_048_576 else { return nil }
+    var bytes = [UInt8](repeating: 0, count: size)
+    let result = bytes.withUnsafeMutableBytes { pointer in sysctl(&mib, UInt32(mib.count), pointer.baseAddress, &size, nil, 0) }
+    guard result == 0, size > 4 else { return nil }
+    // KERN_PROCARGS2 starts with argc (Int32) followed immediately by the kernel-recorded
+    // NUL-terminated exec_path written at execve() time, before user-mutable argv.
+    var end = 4
+    while end < size && bytes[end] != 0 { end += 1 }
+    guard end > 4, let path = String(bytes: bytes[4..<end], encoding: .utf8),
+          path.hasPrefix("/"),
+          !path.unicodeScalars.contains(where: { $0.value < 0x20 || $0.value == 0x7f }) else { return nil }
+    return path
+}
+private func currentIdentity(_ pid: Int32, allowUnlinkedExecPath: Bool = false) -> Identity? {
     #if OBSERVER_TESTING
     if let count = observerIdentityMisses[pid], count > 0 {
         observerIdentityMisses[pid] = count - 1
@@ -37,11 +53,27 @@ private func currentIdentity(_ pid: Int32) -> Identity? {
     let size = Int32(MemoryLayout<proc_bsdinfo>.size)
     guard proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, size) == size, info.pbi_status != SZOMB else { return nil }
     var path = [CChar](repeating: 0, count: 4 * Int(MAXPATHLEN))
-    guard proc_pidpath(pid, &path, UInt32(path.count)) > 0 else { return nil }
+    errno = 0
+    let executable: String
+    if proc_pidpath(pid, &path, UInt32(path.count)) > 0 {
+        executable = String(cString: path)
+    } else if allowUnlinkedExecPath && errno == ENOENT && info.pbi_uid == getuid(),
+              let fallback = kernelExecPath(pid) {
+        // Re-verify process birth identity after reading KERN_PROCARGS2 to prevent PID reuse races.
+        var recheck = proc_bsdinfo()
+        guard proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &recheck, size) == size,
+              recheck.pbi_status != SZOMB,
+              recheck.pbi_uid == info.pbi_uid,
+              recheck.pbi_start_tvsec == info.pbi_start_tvsec,
+              recheck.pbi_start_tvusec == info.pbi_start_tvusec else { return nil }
+        executable = fallback
+    } else {
+        return nil
+    }
     let formatter = DateFormatter(); formatter.locale = Locale(identifier: "en_US_POSIX")
     formatter.dateFormat = "EEE MMM d HH:mm:ss yyyy"
     return Identity(pid: pid, parent: Int32(info.pbi_ppid), uid: info.pbi_uid,
-        executable: String(cString: path), start_seconds: info.pbi_start_tvsec, start_microseconds: info.pbi_start_tvusec,
+        executable: executable, start_seconds: info.pbi_start_tvsec, start_microseconds: info.pbi_start_tvusec,
         start_stamp: formatter.string(from: Date(timeIntervalSince1970: Double(info.pbi_start_tvsec))))
 }
 private func encoded(_ value: Identity) throws -> [String: Any] {
@@ -95,7 +127,7 @@ private func inventory() throws -> [String: Any] {
         if DispatchTime.now().uptimeNanoseconds > deadline {
             unavailable.append(["pid": pid, "code": "inventory_deadline"]); break
         }
-        guard let identity = currentIdentity(pid), identity.uid == getuid() else {
+        guard let identity = currentIdentity(pid, allowUnlinkedExecPath: true), identity.uid == getuid() else {
             if exited(pid) { ended.append(pid) } else { pending.append(pid) }
             continue
         }
@@ -110,7 +142,7 @@ private func inventory() throws -> [String: Any] {
         if DispatchTime.now().uptimeNanoseconds > deadline {
             unavailable.append(["pid": pid, "code": "inventory_deadline"]); break
         }
-        if let identity = currentIdentity(pid), identity.uid == getuid() { try appendIdentity(identity) }
+        if let identity = currentIdentity(pid, allowUnlinkedExecPath: true), identity.uid == getuid() { try appendIdentity(identity) }
         else if exited(pid) { ended.append(pid) }
         else { unavailable.append(["pid": pid, "code": "identity_unavailable"]) }
     }

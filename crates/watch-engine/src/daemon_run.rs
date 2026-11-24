@@ -156,6 +156,7 @@ pub struct ProductionChannelStack {
     pub event_tx: Sender<SupervisionEvent>,
     pub event_rx: Receiver<SupervisionEvent>,
     pub vpn_wake_handle: Option<UnixStream>,
+    last_vpn_refresh_signal: Option<Instant>,
     pub lease_watchdog: thread::JoinHandle<()>,
     pub async_audit_worker: claude_watch_runtime::channel_supervisor::AuditWorker,
     process_disposition_worker: Option<thread::JoinHandle<()>>,
@@ -479,8 +480,10 @@ fn spawn_vpn_observation_worker(
         &uuid::Uuid::new_v4().simple().to_string()[..8]
     );
     let watcher = NetworkEventWatcher::default();
-    let (wake_handle, cancellation) = UnixStream::pair()
+    let (wake_handle, mut cancellation) = UnixStream::pair()
         .map_err(|_| CoreError::new("vpn_observer_worker_failed", "VPN 观察停止通道无法启动"))?;
+    let _ = wake_handle.set_nonblocking(true);
+    let _ = cancellation.set_nonblocking(true);
     let listener_stream = custom_reader.is_none().then(super::runtime::listener_stream).flatten();
     let mut frames = listener_stream.as_ref().map(|stream| stream.subscribe_frames()).transpose()?;
     let handle = thread::Builder::new()
@@ -561,7 +564,33 @@ fn spawn_vpn_observation_worker(
                 let mut readers = vec![cancellation.as_fd()];
                 if let Some(frames) = &frames { readers.push(frames.as_fd()); }
                 let (events, ready) = watcher.wait_with_readers(timeout, &readers);
-                if ready == Some(0) || stop.load(Ordering::Acquire) { break; }
+                let mut requested_refresh = false;
+                if ready == Some(0) {
+                    use std::io::Read;
+                    let mut buffer = [0u8; 64];
+                    let mut peer_closed = false;
+                    loop {
+                        match cancellation.read(&mut buffer) {
+                            Ok(0) => {
+                                peer_closed = true;
+                                break;
+                            }
+                            Ok(_) => {
+                                requested_refresh = true;
+                            }
+                            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
+                            Err(_) => {
+                                peer_closed = true;
+                                break;
+                            }
+                        }
+                    }
+                    if peer_closed || stop.load(Ordering::Acquire) {
+                        break;
+                    }
+                } else if stop.load(Ordering::Acquire) {
+                    break;
+                }
                 if ready == Some(1) {
                     use std::io::Read;
                     let mut buffer = [0; 256];
@@ -648,7 +677,7 @@ fn spawn_vpn_observation_worker(
                     && active_guard.has_active_managed()
                     && observer.observed_listener_pid().is_some()
                     && last_steady_check.is_none_or(|at| at.elapsed() >= STEADY_STATE_VPN_CHECK_INTERVAL);
-                if !refresh && !due && !steady_due && !retry && ready != Some(1) { continue; }
+                if !refresh && !due && !steady_due && !retry && !requested_refresh && ready != Some(1) { continue; }
 
                 if let Some(reader) = &custom_reader {
                     if let Ok(transition) = observer.observe_from_reader(reader.as_ref(), &expectation, false, now) {
@@ -662,7 +691,7 @@ fn spawn_vpn_observation_worker(
                     let can_try_steady = !source_changed
                         && !starting
                         && awaiting_revision.is_none()
-                        && (due || steady_due || retry)
+                        && (due || steady_due || retry || requested_refresh)
                         && observer.observed_listener_pid().is_some();
                     if can_try_steady {
                         if live_reader.is_none() {
@@ -765,7 +794,7 @@ fn spawn_vpn_observation_worker(
                                     continue;
                                 }
                             }
-                        } else if awaiting_revision.is_none() && (due || retry) {
+                        } else if awaiting_revision.is_none() && (due || retry || requested_refresh) {
                             match stream.request_or_join_sample() {
                                 Ok(revision) => { awaiting_revision = Some(revision); }
                                 Err(error) => {
@@ -791,7 +820,7 @@ fn spawn_vpn_observation_worker(
                             refresh = true;
                         }
                     }
-                    if live_reader.is_none() || refresh || due {
+                    if live_reader.is_none() || refresh || due || requested_refresh {
                         match resolve_vpn_controller_credentials(&storage, &expectation.proxy_mode) {
                             Ok(credentials) => {
                                 live_reader = Some(HttpControllerVpnReader::new_live(expectation.proxy_mode.clone(), credentials)
@@ -810,7 +839,7 @@ fn spawn_vpn_observation_worker(
                         }
                     }
                     let Some(reader) = &live_reader else { continue };
-                    let result = observer.observe_listener_event(reader, &expectation, refresh || due,
+                    let result = observer.observe_listener_event(reader, &expectation, refresh || due || requested_refresh,
                         native::now(), collector_loss, |obs| {
                             let publish = || send(obs.clone());
                             if let Some(stream) = &listener_stream { stream.send_if_no_new_failure(seen_failure.get(), publish) }
@@ -993,6 +1022,7 @@ where F: Fn(&AsyncAuditRequest) -> Result<(Value, Value, f64)> + Send + Sync + '
         event_tx,
         event_rx,
         vpn_wake_handle,
+        last_vpn_refresh_signal: None,
         lease_watchdog,
         async_audit_worker,
         process_disposition_worker,
@@ -1233,7 +1263,26 @@ impl ProductionChannelStack {
         if trigger_hint || vpn_changed || families_added {
             self.active_guard.request_immediate_probe();
         }
+        if self.supervisor.needs_proactive_vpn_refresh(delivered_at) {
+            self.request_vpn_refresh_now();
+        }
         Ok(())
+    }
+
+    fn request_vpn_refresh_now(&mut self) {
+        const MIN_ON_DEMAND_VPN_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
+        if self
+            .last_vpn_refresh_signal
+            .is_some_and(|at| at.elapsed() < MIN_ON_DEMAND_VPN_REFRESH_INTERVAL)
+        {
+            return;
+        }
+        if let Some(stream) = self.vpn_wake_handle.as_mut() {
+            use std::io::Write;
+            if stream.write(b"R").is_ok() {
+                self.last_vpn_refresh_signal = Some(Instant::now());
+            }
+        }
     }
 
     /// Production authority loop: slow network/process reads and guard_ticks
@@ -2741,5 +2790,100 @@ mod r1_tests {
             assert!(Instant::now() < deadline, "changed target was not refreshed");
             thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    #[test]
+    fn vpn_observer_worker_refreshes_immediately_on_wake_byte_without_exiting() {
+        use claude_watch_core::vpn::{ObservationConsistency, ObservedField, UpstreamProtocol, VpnEpoch, VpnObservation};
+        use claude_watch_runtime::vpn_observer::VpnSourceReader;
+        use std::io::Write;
+        use std::sync::atomic::AtomicUsize;
+
+        struct CountingReader(AtomicUsize);
+        impl VpnSourceReader for CountingReader {
+            fn read_observation(
+                &self,
+                _expectation: &VpnExpectation,
+                _include_rules: bool,
+                sample_seq: u64,
+                epoch: VpnEpoch,
+                now: f64,
+            ) -> VpnObservation {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                VpnObservation {
+                    source: "clash-verge".into(),
+                    source_instance: Some("inst-wake".into()),
+                    source_revision: Some("rev-1".into()),
+                    upstream_endpoint: Some("http://127.0.0.1:17890".into()),
+                    upstream_protocol: ObservedField::Known(UpstreamProtocol::MixedHttp),
+                    running_mode: ObservedField::Known("rule".into()),
+                    tun_enabled: ObservedField::Known(false),
+                    system_proxy_enabled: ObservedField::Known(false),
+                    selected_group: ObservedField::Known("AI-Group".into()),
+                    selected_node: ObservedField::Known("US-West-01".into()),
+                    proxy_chain: ObservedField::Known(vec!["AI-Group".into(), "US-West-01".into()]),
+                    rules_digest: ObservedField::Unknown("fixture".into()),
+                    sample_started_at: now,
+                    observed_at: now,
+                    valid_until: now + 60.0,
+                    consistency: ObservationConsistency::RevisionVerified,
+                    source_error: None,
+                    sample_seq,
+                    epoch,
+                }
+            }
+        }
+
+        let root = std::env::temp_dir().join(format!("cw-vpn-wake-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let store = StateStore::new(Paths::new(&root).unwrap());
+        let mut cfg = Config::default_for_new_install();
+        cfg.proxy_mode = "clash-verge".into();
+        cfg.proxy_url = "http://127.0.0.1:17890".into();
+        let mut exp = VpnExpectation::unconfigured();
+        exp.configured = true;
+        exp.proxy_mode = "clash-verge".into();
+        exp.proxy_url = "http://127.0.0.1:17890".into();
+        cfg.vpn_expectation = Some(exp);
+        ConfigStore { storage: store.clone() }.save(cfg.value().unwrap()).unwrap();
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let reader = Arc::new(CountingReader(AtomicUsize::new(0)));
+        let (handle, mut wake_handle) = spawn_vpn_observation_worker(
+            store,
+            None,
+            stop.clone(),
+            tx,
+            thread::current(),
+            Arc::new(ActiveGuardState::default()),
+            Some(reader.clone()),
+        )
+        .unwrap();
+
+        // 1. Initial sample arrives immediately on startup.
+        let first = rx.recv_timeout(Duration::from_secs(2)).expect("initial VPN observation");
+        let first_seq = match first {
+            SupervisionEvent::VpnObservationUpdated { observation, .. } => observation.sample_seq,
+            other => panic!("unexpected event: {other:?}"),
+        };
+        assert_eq!(first_seq, 1);
+
+        // 2. Writing a refresh byte wakes the worker immediately without exiting.
+        wake_handle.write_all(b"R").unwrap();
+        let second = rx.recv_timeout(Duration::from_secs(2)).expect("on-demand refreshed VPN observation");
+        let second_seq = match second {
+            SupervisionEvent::VpnObservationUpdated { observation, .. } => observation.sample_seq,
+            other => panic!("unexpected event: {other:?}"),
+        };
+        assert_eq!(second_seq, 2);
+        assert!(!handle.is_finished(), "refresh wake byte must not terminate VPN observer thread");
+        assert!(reader.0.load(Ordering::SeqCst) >= 2);
+
+        // 3. Shutdown still stops cleanly when stop flag is set and wake handle drops.
+        stop.store(true, Ordering::Release);
+        drop(wake_handle);
+        handle.join().expect("VPN observer worker must exit cleanly on shutdown");
+        let _ = fs::remove_dir_all(&root);
     }
 }

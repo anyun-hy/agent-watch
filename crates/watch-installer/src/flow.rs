@@ -543,6 +543,67 @@ fn wait_for_watch_exit(
     )))
 }
 
+const MANAGED_ENTRY_TARGETS: [&str; 5] = [
+    "claude-desktop",
+    "codex-desktop",
+    "chatgpt-desktop",
+    "claude-cli",
+    "codex-cli",
+];
+
+/// Deactivate any opt-in managed desktop wrappers or CLI shell shims while
+/// their `entry-ownership/*.json` records still exist, so resetting Watch's
+/// data directory never orphans `~/Applications/* (Controlled).app` or shell
+/// rc blocks without ownership proof.
+fn deactivate_owned_entries(layout: &Layout, runner: &dyn Runner, uid: u32) -> Result<()> {
+    let ownership_dir = layout.base().join("entry-ownership");
+    if !exists(&ownership_dir) {
+        return Ok(());
+    }
+    safe_user_path(&ownership_dir, &layout.home, uid)?;
+    let mut targets = Vec::new();
+    for target in MANAGED_ENTRY_TARGETS {
+        let record = ownership_dir.join(format!("{target}.json"));
+        if exists(&record) {
+            safe_user_path(&record, &layout.home, uid)?;
+            targets.push(target);
+        }
+    }
+    if targets.is_empty() {
+        return Ok(());
+    }
+    let engine = built_engine(layout);
+    require(
+        is_executable(&engine),
+        "缺少本轮构建的入口停用组件；保留现有受控入口与数据目录。",
+    )?;
+    for target in targets {
+        println!("正在停用已登记的受控入口：{target}");
+        let result = json_command(
+            runner,
+            &[
+                engine.display().to_string(),
+                "entry".to_string(),
+                "deactivate".to_string(),
+                "--target".to_string(),
+                target.to_string(),
+                "--apply".to_string(),
+            ],
+        )?;
+        let confirmed = result.get("status").and_then(Value::as_str) == Some("ok")
+            && result
+                .get("result")
+                .and_then(|r| r.get("target"))
+                .and_then(Value::as_str)
+                == Some(target);
+        require(
+            confirmed,
+            &format!("已登记的受控入口 {target} 未能干净停用；保留数据目录以保护所有权记录。"),
+        )?;
+    }
+    Ok(())
+}
+
 fn clean_data(
     layout: &Layout,
     runner: &dyn Runner,
@@ -583,6 +644,7 @@ fn clean_data(
     check_transactions(layout)?;
     let trashed_app = trashed.map(|path| path.join("Claude Watch Monitor.app"));
     wait_for_watch_exit(layout, runner, uid, trashed_app.as_deref(), sleep)?;
+    deactivate_owned_entries(layout, runner, uid)?;
     let mut paths = layout.data_paths();
     // The launch agent plists are Watch's own files. Once the job is booted
     // out they are just leftovers, so a reset removes them rather than

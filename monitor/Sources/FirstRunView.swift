@@ -24,6 +24,8 @@ struct FirstRunView: View {
     @State private var showingReport = false
     @State private var showingPolicyDetails = false
     @State private var lastPresentedApproval: String?
+    @State private var exportingDiagnostics = false
+    @State private var diagnosticExportResult: DiagnosticExportResult?
 
     init(store: MonitorStore, initialization: FirstRunInitialization) {
         self.store = store; self.initialization = initialization; self.switcher = store.switcher
@@ -260,6 +262,26 @@ struct FirstRunView: View {
                 Text(initialization.diagnosticReport).font(WatchTypography.mono).textSelection(.enabled)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }.frame(height: 280)
+            if let result = diagnosticExportResult {
+                HStack(spacing: 10) {
+                    switch result {
+                    case let .success(url, message):
+                        Image(systemName: "checkmark.circle.fill").foregroundStyle(p.mint)
+                        Text("已导出 \(url.lastPathComponent)：\(message)")
+                            .font(WatchTypography.caption).foregroundStyle(p.secondary)
+                            .lineLimit(2).textSelection(.enabled)
+                        Spacer(minLength: 6)
+                        Button("在访达中显示") { DiagnosticExportRunner.revealInFinder(url) }
+                            .controlSize(.small)
+                    case let .failure(message):
+                        Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(p.amber)
+                        Text(message)
+                            .font(WatchTypography.caption).foregroundStyle(p.secondary)
+                            .lineLimit(2).textSelection(.enabled)
+                        Spacer(minLength: 6)
+                    }
+                }
+            }
             HStack {
                 Button("关闭") { showingReport = false }.frame(minHeight: 44)
                 Spacer()
@@ -275,8 +297,21 @@ struct FirstRunView: View {
                         catch { NSAlert(error: error).runModal() }
                     }
                 }.frame(minHeight: 44)
+                Button(exportingDiagnostics ? "正在导出…" : "导出完整诊断包…") { exportDiagnostics() }
+                    .buttonStyle(.borderedProminent).tint(p.blue).frame(minHeight: 44)
+                    .disabled(exportingDiagnostics)
             }
-        }.padding(24).frame(width: 680).foregroundStyle(p.text).background(p.surface)
+        }.padding(24).frame(width: 720).foregroundStyle(p.text).background(p.surface)
+    }
+    @MainActor private func exportDiagnostics() {
+        guard let url = DiagnosticExportRunner.pickDestinationURL() else { return }
+        exportingDiagnostics = true
+        diagnosticExportResult = nil
+        Task {
+            let result = await Task.detached(priority: .utility) { DiagnosticExportRunner.write(to: url) }.value
+            exportingDiagnostics = false
+            diagnosticExportResult = result
+        }
     }
     private func tint(_ status: InitializationStatus) -> Color {
         switch status {

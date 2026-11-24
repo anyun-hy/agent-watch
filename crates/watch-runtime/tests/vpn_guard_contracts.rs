@@ -2521,3 +2521,181 @@ fn single_transient_local_guard_unknown_preserves_permitted_flow_but_second_cons
     assert_eq!(snap_fail.families["claude"].permit_state, ChannelPermitState::Revoked);
     assert_eq!(snap_fail.families["claude"].reason_code, "proxy_or_tun_failed");
 }
+
+#[test]
+fn initial_adoption_defers_near_expiry_vpn_lease_and_promotes_without_second_audit() {
+    let (_tmp, store, cfg) = setup_store_with_vpn_expectation(|_, _| {});
+    let enforcer = Arc::new(LocalTunnelEnforcer::new("enforcer-near-expiry"));
+    let now = 1_800_000_000.0;
+    enforcer.set_local_proxy_ready(true, now).unwrap();
+    enforcer.configure_seatbelt_backend(true, now).unwrap();
+    let (tx, rx) = mpsc::channel();
+    let mut supervisor = ChannelSupervisor::new_with_config(
+        store.clone(),
+        cfg.clone(),
+        None,
+        Some(enforcer.clone()),
+        Some(tx.into()),
+    )
+    .unwrap();
+    let desktop = Desktop {
+        pid: 6100,
+        start_seconds: 1000,
+        start_microseconds: 1,
+    };
+    let token = BoundProcessToken::with_system_identity(6100, 501, 1000, 1, ProcessRole::DesktopMain)
+        .with_audit_token([501, 501, 20, 501, 20, 6100, 0, 9]);
+
+    // 1. Seed a normal 60s VPN observation and healthy local_guard before launch.
+    let mut obs = sample_vpn_observation(now, 1);
+    obs.valid_until = now + 60.0;
+    supervisor
+        .handle_event(SupervisionEvent::VpnObservationUpdated {
+            observation: obs.clone(),
+            observed_at: now,
+        })
+        .unwrap();
+    let mut initial_eg = controlled_egress(&cfg, now + 45.0, "1.1.1.1", "US", Some(obs.epoch.clone()));
+    initial_eg["policy_version"] = json!(supervisor.saved_policy_version());
+    supervisor
+        .handle_event(SupervisionEvent::EnvironmentUpdated {
+            egress: initial_eg.clone(),
+            local_guard: json!({"proxy": "ok", "tun": "disabled", "context_id": "ctx-vpn"}),
+            observed_at: now + 45.0,
+        })
+        .unwrap();
+
+    // 2. App launches when 15s (< 25s proactive threshold) remains on the VPN observation.
+    let pending = supervisor
+        .handle_event(SupervisionEvent::ProcessInventoryUpdated {
+            family: "claude".into(),
+            desktops: vec![(desktop.clone(), true, "u501:1000:1".into())],
+            processes: vec![token.clone()],
+            observed_at: now + 45.0,
+        })
+        .unwrap();
+    assert_eq!(pending.families["claude"].permit_state, ChannelPermitState::PendingVerification);
+    assert_eq!(pending.families["claude"].reason_code, "initial_audit_pending");
+    assert!(
+        supervisor.needs_proactive_vpn_refresh(now + 45.0),
+        "active audit with <25s VPN remaining must request proactive refresh"
+    );
+    let req = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+    // 3. Audit completes with only 30ms left before obs.valid_until (exact Build 444 race).
+    let adopt_at = now + 59.97;
+    seed_probe_receipts(&store, adopt_at, "US");
+    let mut audit = fixture_audit_val(&store, adopt_at, "1.1.1.1", "US");
+    audit["policy"] = json!(supervisor.saved_policy_version().policy_digest);
+    let mut adopt_egress = controlled_egress(&cfg, adopt_at, "1.1.1.1", "US", Some(obs.epoch.clone()));
+    adopt_egress["policy_version"] = json!(supervisor.saved_policy_version());
+    let deferred = supervisor
+        .handle_event(SupervisionEvent::AsyncAuditCompleted {
+            request_id: req.request_id,
+            family: req.family,
+            session_id: req.session_id,
+            policy_version: req.policy_version,
+            requested_at: req.requested_at,
+            completed_at: adopt_at,
+            outcome: AsyncAuditOutcome::Succeeded {
+                audit,
+                egress: adopt_egress,
+            },
+        })
+        .unwrap();
+    assert_eq!(
+        deferred.families["claude"].permit_state,
+        ChannelPermitState::PendingVerification,
+        "must stay fail-closed PendingVerification instead of issuing a 30ms Permitted that bounces into hard Revoked"
+    );
+    assert_eq!(deferred.families["claude"].reason_code, "vpn_refresh_pending");
+    assert!(supervisor.needs_proactive_vpn_refresh(adopt_at));
+    assert!(
+        rx.try_recv().is_err(),
+        "deferring for VPN refresh must not schedule a duplicate second audit"
+    );
+
+    // 4. Refreshed same-epoch VPN observation arrives 20ms later -> immediate Permitted!
+    let mut refreshed_obs = sample_vpn_observation(now + 59.99, 1);
+    refreshed_obs.sample_started_at = now + 59.98;
+    refreshed_obs.observed_at = now + 59.99;
+    refreshed_obs.valid_until = now + 119.99;
+    refreshed_obs.sample_seq = 2;
+    let promoted = supervisor
+        .handle_event(SupervisionEvent::VpnObservationUpdated {
+            observation: refreshed_obs,
+            observed_at: now + 59.99,
+        })
+        .unwrap();
+    assert_eq!(promoted.families["claude"].permit_state, ChannelPermitState::Permitted);
+    assert!(!supervisor.needs_proactive_vpn_refresh(now + 59.99));
+    assert!(
+        rx.try_recv().is_err(),
+        "promotion after same-epoch VPN refresh must reuse verified adoption without a second audit"
+    );
+
+    // 5. Fail-closed verification: if a deferred adoption's VPN observation actually expires
+    //    without refreshing, LeaseExpired revokes fail-closed as vpn_observation_stale.
+    let (_tmp2, store2, cfg2) = setup_store_with_vpn_expectation(|_, _| {});
+    let enf2 = Arc::new(LocalTunnelEnforcer::new("enforcer-near-expiry-stale"));
+    enf2.set_local_proxy_ready(true, now).unwrap();
+    enf2.configure_seatbelt_backend(true, now).unwrap();
+    let (tx2, rx2) = mpsc::channel();
+    let mut sup2 = ChannelSupervisor::new_with_config(
+        store2.clone(),
+        cfg2.clone(),
+        None,
+        Some(enf2),
+        Some(tx2.into()),
+    )
+    .unwrap();
+    sup2.handle_event(SupervisionEvent::VpnObservationUpdated {
+        observation: obs.clone(),
+        observed_at: now,
+    })
+    .unwrap();
+    let mut eg2 = controlled_egress(&cfg2, now + 45.0, "1.1.1.1", "US", Some(obs.epoch.clone()));
+    eg2["policy_version"] = json!(sup2.saved_policy_version());
+    sup2.handle_event(SupervisionEvent::EnvironmentUpdated {
+        egress: eg2,
+        local_guard: json!({"proxy": "ok", "tun": "disabled", "context_id": "ctx-vpn"}),
+        observed_at: now + 45.0,
+    })
+    .unwrap();
+    sup2.handle_event(SupervisionEvent::ProcessInventoryUpdated {
+        family: "claude".into(),
+        desktops: vec![(desktop, true, "u501:1000:1".into())],
+        processes: vec![token],
+        observed_at: now + 45.0,
+    })
+    .unwrap();
+    let req2 = rx2.recv_timeout(Duration::from_secs(1)).unwrap();
+    seed_probe_receipts(&store2, adopt_at, "US");
+    let mut audit2 = fixture_audit_val(&store2, adopt_at, "1.1.1.1", "US");
+    audit2["policy"] = json!(sup2.saved_policy_version().policy_digest);
+    let mut adopt_eg2 = controlled_egress(&cfg2, adopt_at, "1.1.1.1", "US", Some(obs.epoch));
+    adopt_eg2["policy_version"] = json!(sup2.saved_policy_version());
+    let deferred2 = sup2
+        .handle_event(SupervisionEvent::AsyncAuditCompleted {
+            request_id: req2.request_id,
+            family: req2.family,
+            session_id: req2.session_id,
+            policy_version: req2.policy_version,
+            requested_at: req2.requested_at,
+            completed_at: adopt_at,
+            outcome: AsyncAuditOutcome::Succeeded {
+                audit: audit2,
+                egress: adopt_eg2,
+            },
+        })
+        .unwrap();
+    assert_eq!(deferred2.families["claude"].reason_code, "vpn_refresh_pending");
+    let expired = sup2
+        .handle_event(SupervisionEvent::LeaseExpired {
+            observed_at: now + 60.05,
+            woke_from_sleep: false,
+        })
+        .unwrap();
+    assert_eq!(expired.families["claude"].permit_state, ChannelPermitState::Revoked);
+    assert_eq!(expired.families["claude"].reason_code, "vpn_observation_stale");
+}

@@ -81,6 +81,20 @@ fn project(frame: &StatusFrame<'_>, backend: bool, healthy: bool, installation_i
             }
         }
     }
+    if channel["families"].as_object().is_some_and(|families| {
+        families.iter().any(|(family, state)| {
+            let permit = &channel["authoritative_permits"][family];
+            state["producer_boot_id"] == channel["producer_boot_id"]
+                && state["saved_policy_version"] == *policy
+                && permit["policy_version"] == *policy
+                && permit["family"] == *family
+                && state["command_seq"] == permit["command_seq"]
+                && state["permit_generation"] == permit["permit_generation"]
+                && permit["reason_code"] == "channel_inventory_incomplete"
+        })
+    }) {
+        return "process_inventory_incomplete";
+    }
     if crate::config_store::guard_heartbeat_policy_matches(heartbeat, config) != Some(true) { return "guard_policy_unverified"; }
     if !heartbeat["time"].as_f64().is_some_and(|at| at.is_finite() && (0.0..=35.0).contains(&(now-at))) { return "guard_heartbeat_stale"; }
     "execution_not_confirmed"
@@ -218,6 +232,29 @@ mod tests {
             "execution_evidence_stale_or_mismatched"
         );
     }
+
+    #[test]
+    fn incomplete_process_inventory_reports_specific_readiness_reason() {
+        let (config, mut channel, heartbeat) = fixture();
+        channel["families"]["claude"]["policy_sync_state"] = json!("applied");
+        channel["enforcement_receipts"]["claude"]["enforcement_state"] = json!("blocked");
+        channel["enforcement_receipts"]["claude"]["error_code"] = json!("channel_inventory_incomplete");
+        for key in ["interception_active", "local_proxy_ready", "active_flows_closed", "direct_fallback_blocked", "sandbox_ready"] {
+            channel["enforcement_receipts"]["claude"][key] = json!(true);
+        }
+        channel["authoritative_permits"]["claude"]["reason_code"] = json!("channel_inventory_incomplete");
+        let code = project(
+            &StatusFrame::new(&channel, &config, 103.0),
+            true,
+            false,
+            None,
+            &Value::Null,
+            &heartbeat,
+            true,
+        );
+        assert_eq!(code, "process_inventory_incomplete");
+        assert!(detail(code).contains("进程清单采样不完整"));
+    }
 }
 
 pub(crate) fn detail(code: &str) -> &'static str {
@@ -237,6 +274,7 @@ pub(crate) fn detail(code: &str) -> &'static str {
         "vpn_observation_unknown" => "当前 VPN 状态无法完整确认，网络保护尚未就绪。",
         "guard_policy_unverified" => "保护后台尚未确认当前保存的设置，正在等待新配置的执行回执。",
         "guard_heartbeat_stale" => "保护后台运行中；最近一轮保护证据已过期，正在重新核验。",
+        "process_inventory_incomplete" => "本轮系统进程清单采样不完整，网络保护暂未确认，正在重试核验。",
         "execution_evidence_stale_or_mismatched" => "网络保护回执已过期或不属于当前运行实例及设置，正在等待重新核验。",
         _ => "Watch 保镖的实际执行结果尚未确认，请查看检查记录。",
     }

@@ -383,6 +383,56 @@ impl Runner for Fake {
                 Ok(result(0, "", ""))
             }
             "/usr/bin/open" => Ok(result(0, "", "")),
+            _ if args.get(1).map(String::as_str) == Some("entry")
+                && args.get(2).map(String::as_str) == Some("deactivate") =>
+            {
+                let target = args
+                    .windows(2)
+                    .find(|w| w[0] == "--target")
+                    .map(|w| w[1].as_str())
+                    .expect("entry deactivate target");
+                assert!(
+                    args.iter().any(|value| value == "--apply"),
+                    "reinstall entry deactivate must pass --apply"
+                );
+                let record = self
+                    .layout
+                    .base()
+                    .join("entry-ownership")
+                    .join(format!("{target}.json"));
+                assert!(
+                    record.is_file(),
+                    "ownership record must still exist when deactivating {target}"
+                );
+                if fail == "entry_deactivate" {
+                    return Ok(result(
+                        4,
+                        &json!({"status": "error", "code": "entry_conflict", "message": "fixture conflict"})
+                            .to_string(),
+                        "",
+                    ));
+                }
+                if target == "chatgpt-desktop" {
+                    let wrapper = self.layout.home.join("Applications/ChatGPT (Controlled).app");
+                    if wrapper.exists() {
+                        std::fs::remove_dir_all(&wrapper).expect("remove owned wrapper");
+                    }
+                }
+                std::fs::remove_file(&record).expect("remove ownership record");
+                Ok(result(
+                    0,
+                    &json!({
+                        "status": "ok",
+                        "result": {
+                            "target": target,
+                            "was_present": true,
+                            "removed_path": self.layout.home.join("Applications/ChatGPT (Controlled).app").display().to_string(),
+                        }
+                    })
+                    .to_string(),
+                    "",
+                ))
+            }
             _ if args.get(1).map(String::as_str) == Some("app-uninstall") => {
                 if !args.iter().any(|value| value == "--apply") {
                     return Ok(result(
@@ -1000,4 +1050,68 @@ fn reinstall_confirmation_explicitly_names_administrator_gateway_operations() {
     assert!(matches!(outcome,flow::Outcome::Cancelled));assert!(prompt.contains("管理员网关操作"));
     assert!(h.fake.calls().iter().any(|c| c.get(1).map(String::as_str)==Some("--service-preview")));
     assert!(h.fake.layout.app.exists());h.assert_preserved();
+}
+
+#[test]
+fn reinstall_deactivates_owned_managed_entries_before_removing_data_directory() {
+    let h = Harness::new();
+    let ownership_dir = h.fake.layout.base().join("entry-ownership");
+    std::fs::create_dir_all(&ownership_dir).expect("ownership dir");
+    std::fs::write(ownership_dir.join("chatgpt-desktop.json"), r#"{"schema":1}"#)
+        .expect("ownership record");
+    let wrapper = h.fake.layout.home.join("Applications/ChatGPT (Controlled).app");
+    let unrelated = h.fake.layout.home.join("Applications/Other.app");
+    std::fs::create_dir_all(wrapper.join("Contents/MacOS")).expect("owned wrapper");
+    std::fs::create_dir_all(unrelated.join("Contents/MacOS")).expect("unrelated app");
+
+    let outcome = h.perform("4.0.0", "445", false, "y").expect("reinstall succeeds");
+    assert!(matches!(outcome, flow::Outcome::Installed { .. }));
+    assert!(
+        !wrapper.exists(),
+        "owned ChatGPT (Controlled).app must be cleanly deactivated before wiping entry-ownership"
+    );
+    assert!(unrelated.exists(), "unrelated user apps must never be touched");
+    let calls = h.fake.calls();
+    let deactivate_idx = calls
+        .iter()
+        .position(|c| {
+            c.get(1).map(String::as_str) == Some("entry")
+                && c.get(2).map(String::as_str) == Some("deactivate")
+                && c.iter().any(|a| a == "chatgpt-desktop")
+        })
+        .expect("entry deactivate called for owned target");
+    let install_idx = calls
+        .iter()
+        .position(|c| c.get(1).map(String::as_str) == Some("app-install"))
+        .expect("app-install called");
+    assert!(deactivate_idx < install_idx, "deactivation must happen before installing new app");
+    h.assert_preserved();
+}
+
+#[test]
+fn failed_managed_entry_deactivation_preserves_ownership_records_and_blocks_reset() {
+    let h = Harness::new();
+    let ownership_dir = h.fake.layout.base().join("entry-ownership");
+    std::fs::create_dir_all(&ownership_dir).expect("ownership dir");
+    let record = ownership_dir.join("chatgpt-desktop.json");
+    std::fs::write(&record, r#"{"schema":1}"#).expect("ownership record");
+    let wrapper = h.fake.layout.home.join("Applications/ChatGPT (Controlled).app");
+    std::fs::create_dir_all(wrapper.join("Contents/MacOS")).expect("owned wrapper");
+    h.fake.set_fail("entry_deactivate");
+
+    let outcome = h.perform("4.0.0", "445", false, "y");
+    assert!(outcome.is_err(), "failed entry deactivation must abort reset");
+    assert!(
+        record.is_file(),
+        "ownership record must remain intact if deactivation fails"
+    );
+    assert!(wrapper.exists(), "conflicting entry must remain untouched");
+    assert!(
+        !h.fake
+            .calls()
+            .iter()
+            .any(|c| c.get(1).map(String::as_str) == Some("app-install")),
+        "app-install must not proceed after entry deactivation failure"
+    );
+    h.assert_preserved();
 }

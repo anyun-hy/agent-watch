@@ -48,6 +48,25 @@ pub const DEFAULT_ASYNC_AUDIT_TIMEOUT_SECONDS: f64 = 30.0;
 /// Proactive renewal lead time before a `Permitted` lease reaches its safety-net
 /// expiry so healthy flows renew seamlessly instead of hitting `permit_lease_expired`.
 pub const PERMIT_RENEWAL_LEAD_SECONDS: f64 = 15.0;
+/// Minimum remaining VPN validity required before granting a *new* `Permitted`
+/// transition (initial adoption or recovery) so a nearly-expired observation
+/// cannot expire in transit and trigger a hard revocation + second full audit.
+pub const MIN_PERMIT_ISSUANCE_MARGIN_SECONDS: f64 = 5.0;
+/// Lead window during an active async audit: if the latest VPN observation has
+/// less than this remaining, request an immediate proactive VPN refresh so the
+/// observation is already fresh when the audit completes.
+pub const PROACTIVE_AUDIT_VPN_REFRESH_MARGIN_SECONDS: f64 = 25.0;
+
+/// Adaptive minimum remaining validity for granting a new `Permitted` lease.
+/// Normal 60s observations require `5.0s`; compact test observations scale to
+/// 25% of their TTL so short-TTL contract tests remain valid.
+pub fn min_permit_issuance_margin(obs: &VpnObservation) -> f64 {
+    if !obs.valid_until.is_finite() || !obs.observed_at.is_finite() {
+        return MIN_PERMIT_ISSUANCE_MARGIN_SECONDS;
+    }
+    let ttl = (obs.valid_until - obs.observed_at).max(0.0);
+    MIN_PERMIT_ISSUANCE_MARGIN_SECONDS.min(ttl * 0.25)
+}
 
 /// Compute the timer wakeup instant for proactive `Permitted` renewal:
 /// 15s before expiry for normal (>=30s) leases, or halfway through compact
@@ -1163,6 +1182,46 @@ impl ChannelSupervisor {
                 (has_managed_proc || has_active_permit).then(|| family.clone())
             })
             .collect()
+    }
+
+    /// Returns whether any supervised family needs an immediate proactive VPN
+    /// refresh — either because an async audit is running while the current VPN
+    /// observation has limited remaining TTL, or because a verified adoption is
+    /// holding in `PendingVerification("vpn_refresh_pending")` waiting for fresh
+    /// VPN validity before granting `Permitted`.
+    pub fn needs_proactive_vpn_refresh(&self, now: f64) -> bool {
+        if !self.config.vpn_expectation.as_ref().is_some_and(|e| e.configured) {
+            return false;
+        }
+        let mut waiting_for_margin = false;
+        let mut audit_running = false;
+        for track in self.tracks.values() {
+            if track.current_permit.as_ref().is_some_and(|p| {
+                p.state == ChannelPermitState::PendingVerification
+                    && p.reason_code == "vpn_refresh_pending"
+            }) {
+                waiting_for_margin = true;
+            }
+            if track.audit_in_flight.is_some() {
+                audit_running = true;
+            }
+        }
+        if !waiting_for_margin && !audit_running {
+            return false;
+        }
+        let Some(obs) = self.latest_vpn_observation.as_ref() else {
+            return true;
+        };
+        if !obs.valid_until.is_finite() || !now.is_finite() || obs.source_error.is_some() {
+            return true;
+        }
+        let remaining = obs.valid_until - now;
+        if waiting_for_margin {
+            return remaining < min_permit_issuance_margin(obs);
+        }
+        let ttl = (obs.valid_until - obs.observed_at).max(0.0);
+        let lead = PROACTIVE_AUDIT_VPN_REFRESH_MARGIN_SECONDS.min(ttl * 0.5);
+        remaining < lead
     }
 
     /// An inline executor response is received after execution, potentially
@@ -2698,6 +2757,22 @@ impl ChannelSupervisor {
                     recovered_permit.backend = self.config.effective_network_backend();
                     recovered_permit.coverage_scope = self.coverage_scopes.get(family).cloned();
                     if let Some(obs) = self.latest_vpn_observation.as_ref() {
+                        if obs.valid_until <= now {
+                            return self.record_async_audit_failure(
+                                family,
+                                current_session.as_ref(),
+                                "vpn_observation_stale",
+                                now,
+                            );
+                        }
+                        if (obs.valid_until - now) < min_permit_issuance_margin(obs) {
+                            return self.record_async_audit_failure(
+                                family,
+                                current_session.as_ref(),
+                                "vpn_refresh_pending",
+                                now,
+                            );
+                        }
                         recovered_permit.valid_until =
                             recovered_permit.valid_until.min(obs.valid_until);
                     }
@@ -2837,7 +2912,11 @@ impl ChannelSupervisor {
     fn reset_audit_retry_after_commit(&mut self, family: &str) {
         if let Some(track) = self.tracks.get_mut(family) {
             // Command construction can still downgrade an expired permit.
-            if track.current_permit.as_ref().is_some_and(|permit| permit.state == ChannelPermitState::Permitted) {
+            if track.current_permit.as_ref().is_some_and(|permit| {
+                permit.state == ChannelPermitState::Permitted
+                    || (permit.state == ChannelPermitState::PendingVerification
+                        && permit.reason_code == "vpn_refresh_pending")
+            }) {
                 track.audit_retry_count = 0;
                 track.audit_retry_not_before = None;
                 track.audit_last_failure_code = None;
@@ -2912,7 +2991,18 @@ impl ChannelSupervisor {
 
         // Logic Fix 1: Cap `valid_until` by key evidence expiration time (and VPN
         // observation expiration when present), and refuse to issue `Permitted` if
-        // egress evidence has already expired!
+        // egress evidence has already expired or if a newly-granted permit would
+        // inherit a nearly-expired VPN observation that would bounce into hard
+        // revocation (`permit_lease_expired`) milliseconds after issuance.
+        let currently_permitted = self
+            .tracks
+            .get(family)
+            .and_then(|t| t.current_permit.as_ref())
+            .is_some_and(|p| p.state == ChannelPermitState::Permitted);
+        let vpn_margin_short = !currently_permitted
+            && self.latest_vpn_observation.as_ref().is_some_and(|obs| {
+                obs.valid_until > now && (obs.valid_until - now) < min_permit_issuance_margin(obs)
+            });
         let (effective_desired_state, effective_reason, valid_until) =
             if desired_state == ChannelPermitState::Permitted {
                 match Egress::fresh(self.latest_egress.get(family).unwrap_or(&Value::Null), now, session::GUARD_EGRESS_TTL) {
@@ -2926,6 +3016,12 @@ impl ChannelSupervisor {
                             (
                                 ChannelPermitState::Revoked,
                                 "vpn_observation_stale".to_string(),
+                                now + DEFAULT_PERMIT_TTL,
+                            )
+                        } else if vpn_margin_short {
+                            (
+                                ChannelPermitState::PendingVerification,
+                                "vpn_refresh_pending".to_string(),
                                 now + DEFAULT_PERMIT_TTL,
                             )
                         } else {
