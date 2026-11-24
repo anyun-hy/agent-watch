@@ -115,6 +115,7 @@ dependencies = [
  "claude-watch-installer",
  "claude-watch-runtime",
  "claude-watch-system",
+ "libc",
  "serde_json",
  "uuid",
 ]

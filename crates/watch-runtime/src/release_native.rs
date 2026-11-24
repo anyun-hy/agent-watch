@@ -940,6 +940,10 @@ impl<E: FixedCommandExecutor> UpdateOs for NativeRelease<E> {
             "CFBundleShortVersionString",
         )
     }
+    fn installed_build(&mut self, app: &Path) -> Result<Option<u64>> {
+        let raw = self.plist_value(&app.join("Contents/Info.plist"), "CFBundleVersion")?;
+        Ok(raw.trim().parse::<u64>().ok().filter(|b| *b > 0))
+    }
     fn macos_version(&mut self) -> Result<(u64, u64)> {
         let out = self.require(
             "/usr/bin/sw_vers",

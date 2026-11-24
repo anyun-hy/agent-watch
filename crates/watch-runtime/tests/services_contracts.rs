@@ -137,8 +137,22 @@ fn saved_intent_is_not_actual_service() {
         ..Config::default()
     };
     let s = services::service_status(&f, &c).unwrap();
-    assert_eq!(s["services"][3]["state"], "unavailable");
+    let expected_updater = if claude_watch_core::release_source::builtin_release_source().is_some()
+    {
+        "mismatch"
+    } else {
+        "unavailable"
+    };
+    assert_eq!(s["services"][3]["state"], expected_updater);
     assert_eq!(s["services"][1]["state"], "scheduled");
+    let partial = Config {
+        auto_update: true,
+        update_url: "https://updates.invalid/release.json".into(),
+        update_public_key: String::new(),
+        ..Config::default()
+    };
+    let s_partial = services::service_status(&f, &partial).unwrap();
+    assert_eq!(s_partial["services"][3]["state"], "unavailable");
 }
 #[test]
 fn updater_definition_is_fixed_to_twelve_hours_and_safe_arguments() {
@@ -244,6 +258,18 @@ fn watchdog_preview_plans_the_helper_install_instead_of_refusing_to_enable() {
 fn update_preview_requires_pinned_source_and_apply_reads_back() {
     let (home, st) = store();
     let mut f = fake();
+    if claude_watch_core::release_source::builtin_release_source().is_none() {
+        assert_eq!(
+            services::protection_preview(&st, &f, &json!({"auto_update":true}))
+                .unwrap_err()
+                .code,
+            "update_source_missing"
+        );
+    }
+    let mut partial = Config::default().value().unwrap();
+    partial["update_url"] = json!("https://updates.invalid/release.json");
+    partial["update_public_key"] = json!("");
+    st.atomic_json(&st.paths.config(), &partial).unwrap();
     assert_eq!(
         services::protection_preview(&st, &f, &json!({"auto_update":true}))
             .unwrap_err()

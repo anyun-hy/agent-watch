@@ -51,6 +51,7 @@ fn invalid_signature_and_unsafe_archive_are_rejected() {
     w.finish().unwrap();
     let release = Release {
         version: "1.0.0".into(),
+        build: None,
         archive_url: "https://updates.example/release.zip".into(),
         archive_sha256: archive_hash(&zip).unwrap(),
         architecture: "arm64".into(),
@@ -168,6 +169,7 @@ fn native_archives_require_matching_components_and_reject_old_business_resources
         writer.finish().unwrap();
         let release = Release {
             version: "3.0.0".into(),
+            build: None,
             architecture: "arm64".into(),
             archive_url: "https://updates.example/release.zip".into(),
             archive_sha256: archive_hash(&archive).unwrap(),
@@ -210,6 +212,7 @@ fn new_native_failure_removes_new_roots_and_leaves_legacy_backend_untouched() {
     fs::write(source.join("runtime"), b"new-runtime").unwrap();
     let release = Release {
         version: "3.0.0".into(),
+        build: None,
         architecture: "arm64".into(),
         archive_url: "https://updates.example/release.zip".into(),
         archive_sha256: String::new(),
@@ -448,6 +451,7 @@ fn apply_false_is_unavailable_without_source_and_health_failure_restores_all_com
     }
     let rel = Release {
         version: "1.0.0".into(),
+        build: None,
         archive_url: "https://updates.example/release.zip".into(),
         archive_sha256: "".into(),
         architecture: "arm64".into(),
@@ -548,6 +552,7 @@ fn failed_update_after_accessibility_reset_reports_required_reauthorization() {
     fs::write(source.join("runtime"), b"new runtime").unwrap();
     let release = Release {
         version: "3.0.0".into(),
+        build: None,
         architecture: "arm64".into(),
         archive_url: "https://updates.example/release.zip".into(),
         archive_sha256: String::new(),
@@ -597,4 +602,142 @@ fn interrupted_update_recovery_reports_possible_accessibility_reauthorization() 
     assert!(updater.recover().unwrap());
     assert!(!updater.paths.base.join("update-transaction.json").exists());
     fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn build_number_comparison_and_github_release_cdn_rules_work() {
+    assert!(is_newer_release("3.0.0", Some(444), "3.0.0", Some(445)).unwrap());
+    assert!(!is_newer_release("3.0.0", Some(445), "3.0.0", Some(445)).unwrap());
+    assert!(!is_newer_release("3.0.0", Some(445), "3.0.0", Some(444)).unwrap());
+    assert!(is_newer_release("3.0.0", Some(999), "3.0.1", Some(1)).unwrap());
+    assert!(!is_newer_release("3.0.1", Some(1), "3.0.0", Some(999)).unwrap());
+    assert!(!is_newer_release("3.0.0", Some(444), "3.0.0", None).unwrap());
+
+    assert!(claude_watch_core::release_source::archive_origin_allowed(
+        "https://github.com/anyun-hy/claude-watch/releases/latest/download/release-manifest.json",
+        "https://github.com/anyun-hy/claude-watch/releases/download/v3.0.1/Claude-Watch-update.zip"
+    ));
+    assert!(claude_watch_core::release_source::archive_origin_allowed(
+        "https://github.com/anyun-hy/claude-watch/releases/latest/download/release-manifest.json",
+        "https://objects.githubusercontent.com/github-production-release-asset/foo.zip"
+    ));
+    assert!(!claude_watch_core::release_source::archive_origin_allowed(
+        "https://github.com/anyun-hy/claude-watch/releases/latest/download/release-manifest.json",
+        "https://evil.invalid/Claude-Watch-update.zip"
+    ));
+}
+
+#[test]
+fn package_release_update_script_output_verifies_end_to_end_in_rust_updater() {
+    use std::process::Command;
+
+    let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap();
+    let script = repo_root.join("tools/package-release-update.py");
+    assert!(script.is_file(), "missing {}", script.display());
+
+    let root = temp();
+    let app = root.join("Fixture.app");
+    let resources = app.join("Contents/Resources");
+    let macos = app.join("Contents/MacOS");
+    fs::create_dir_all(&resources).unwrap();
+    fs::create_dir_all(&macos).unwrap();
+    fs::write(app.join("Contents/Info.plist"), b"synthetic-info-plist").unwrap();
+    fs::write(macos.join("ClaudeWatchMonitor"), b"synthetic-ui-bin").unwrap();
+    for name in [
+        "watch-engine",
+        "watch-native-observer",
+        "watch-process-control",
+        "watch-admin.sh",
+        "watch-sandbox-launcher",
+        "watch-gateway-broker",
+        "ControlledEntry",
+        "watch-native-collector.zsh",
+        "watch-leak-worker",
+        "BuildInfo.plist",
+        "BuildIdentity.json",
+    ] {
+        fs::write(resources.join(name), format!("synthetic-{name}")).unwrap();
+    }
+
+    // Generate ephemeral test RSA keypair via system openssl (never stored in repo).
+    let priv_key = root.join("test-private.pem");
+    let pub_key = root.join("test-public.pem");
+    assert!(Command::new("/usr/bin/openssl")
+        .args(["genpkey", "-algorithm", "RSA", "-pkeyopt", "rsa_keygen_bits:2048", "-out"])
+        .arg(&priv_key)
+        .status()
+        .unwrap()
+        .success());
+    assert!(Command::new("/usr/bin/openssl")
+        .args(["pkey", "-in"])
+        .arg(&priv_key)
+        .args(["-pubout", "-out"])
+        .arg(&pub_key)
+        .status()
+        .unwrap()
+        .success());
+
+    let archive_out = root.join("out/Claude-Watch-update-3.0.1-build501-arm64.zip");
+    let manifest_out = root.join("out/release-manifest.json");
+    let archive_url =
+        "https://github.com/anyun-hy/claude-watch/releases/download/v3.0.1/Claude-Watch-update-3.0.1-build501-arm64.zip";
+
+    let pkg = Command::new("python3")
+        .arg(&script)
+        .args(["--app", app.to_str().unwrap()])
+        .args(["--version", "3.0.1"])
+        .args(["--build", "501"])
+        .args(["--architecture", "arm64"])
+        .args(["--archive-url", archive_url])
+        .args(["--archive-output", archive_out.to_str().unwrap()])
+        .args(["--manifest-output", manifest_out.to_str().unwrap()])
+        .args(["--private-key", priv_key.to_str().unwrap()])
+        .args(["--public-key", pub_key.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        pkg.status.success(),
+        "packager failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&pkg.stdout),
+        String::from_utf8_lossy(&pkg.stderr)
+    );
+
+    let public_pem = fs::read_to_string(&pub_key).unwrap();
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&fs::read(&manifest_out).unwrap()).unwrap();
+    let payload = STANDARD
+        .decode(envelope["manifest"].as_str().unwrap())
+        .unwrap();
+    let signature = STANDARD
+        .decode(envelope["signature"].as_str().unwrap())
+        .unwrap();
+
+    // 1. Rust verifier accepts Python/OpenSSL signed manifest and extracts archive cleanly.
+    let release = verify_manifest(&payload, &signature, &public_pem, "arm64").unwrap();
+    assert_eq!(release.version, "3.0.1");
+    assert_eq!(release.build, Some(501));
+    assert_eq!(release.archive_url, archive_url);
+    assert_eq!(archive_hash(&archive_out).unwrap(), release.archive_sha256);
+
+    let extracted = root.join("extracted");
+    verify_extract(&archive_out, &extracted, &release).unwrap();
+    assert!(extracted.join("app/Claude Watch Monitor.app/Contents/Info.plist").is_file());
+    assert!(extracted.join("runtime/watch-engine").is_file());
+    assert!(extracted.join("runtime/watch-gateway-broker").is_file());
+
+    // 2. Tampering with 1 byte of signature fails closed.
+    let mut bad_sig = signature.clone();
+    bad_sig[0] ^= 0xff;
+    assert_eq!(
+        verify_manifest(&payload, &bad_sig, &public_pem, "arm64")
+            .unwrap_err()
+            .code,
+        "release_signature_invalid"
+    );
+
+    let _ = fs::remove_dir_all(root);
 }

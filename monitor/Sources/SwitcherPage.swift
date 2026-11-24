@@ -805,9 +805,11 @@ struct SwitcherPage: View {
             vpnExpectationSection
             DisclosureGroup("发布源与工具维护", isExpanded: $showSource) {
                 VStack(alignment: .leading, spacing: 12) {
-                    Text("此处供本项目发布维护使用。缺少发布源或固定公钥时，自动更新显示尚不可用。")
-                    TextField("本项目 HTTPS 发布清单", text: store.text(Setting.updateURL)).textFieldStyle(.roundedBorder)
-                    Text("固定 RSA 公钥（PEM）").font(WatchTypography.caption)
+                    Text(store.updateSourceIsBuiltin
+                         ? "已内置官方 GitHub 发布源（anyun-hy/claude-watch），无需手动填写即可检查与更新；下方仅在需要自定义测试源时覆盖。"
+                         : "此处供本项目发布维护使用。未内置公钥且未手动填写发布源与固定公钥时，自动更新显示尚不可用。")
+                    TextField("本项目 HTTPS 发布清单（留空则使用内置源）", text: store.text(Setting.updateURL)).textFieldStyle(.roundedBorder)
+                    Text("固定 RSA 公钥（PEM，留空则使用内置公钥）").font(WatchTypography.caption)
                     TextEditor(text: store.text(Setting.updatePublicKey)).font(WatchTypography.mono).frame(height: 100)
                     HStack {
                         Button("检查本项目更新") {
@@ -816,6 +818,16 @@ struct SwitcherPage: View {
                                 updateResult = store.failure ? nil : store.message
                             }
                         }.disabled(!store.updateSourceReady || store.hasUnsavedSettings)
+                        if let available = store.updateStatus, available.isAvailable {
+                            Button("下载并安装 \(available.versionLabel)…") {
+                                confirm(
+                                    "下载并安装更新 \(available.versionLabel)",
+                                    "将从已验签发布源下载完整更新并保留全部配置、账号与初始化状态（无需重新初始化）。替换期间将短暂关闭监控窗口，如核心网关组件变动将请求一次管理员授权，完成后自动重开新版。",
+                                    ["update", "--apply", "--detach", "--relaunch"],
+                                    action: "下载并安装更新"
+                                )
+                            }.buttonStyle(.borderedProminent).disabled(store.busy || store.hasUnsavedSettings)
+                        }
                         Button("更新系统辅助组件…") {
                             confirm("更新系统辅助组件", "需要管理员认证，更新本工具固定辅助程序；不会切换时区、语言或原版保镖。", ["services", "refresh-admin", "--apply"], action: "更新辅助组件")
                         }.disabled(store.hasUnsavedSettings)
@@ -883,6 +895,28 @@ struct SwitcherPage: View {
         }
         if store.updateRecoveryRequired {
             Button("恢复未完成升级") { confirm("恢复整包更新", "依据升级事务记录恢复应用与后台组件。", ["update", "--recover", "--apply"], action: "恢复整包更新") }.disabled(store.busy)
+        }
+        if let available = store.updateStatus, available.isAvailable, !store.updateRecoveryRequired {
+            Surface(p) {
+                HStack(alignment: .center, spacing: 12) {
+                    Image(systemName: "arrow.down.circle.fill").foregroundStyle(p.blue)
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text("发现新版本 \(available.versionLabel)").font(WatchTypography.bodyStrong)
+                        Text(available.message ?? "已完成签名校验，可原地升级并保留全部配置与账号（无需重新初始化）。")
+                            .font(WatchTypography.caption).foregroundStyle(p.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    Spacer(minLength: 8)
+                    Button("下载并安装更新…") {
+                        confirm(
+                            "下载并安装更新 \(available.versionLabel)",
+                            "将从已验签发布源下载完整更新并保留全部配置、账号与初始化状态（无需重新初始化）。替换期间将短暂关闭监控窗口，如核心网关组件变动将请求一次管理员授权，完成后自动重开新版。",
+                            ["update", "--apply", "--detach", "--relaunch"],
+                            action: "下载并安装更新"
+                        )
+                    }.buttonStyle(.borderedProminent).disabled(store.busy || store.hasUnsavedSettings)
+                }
+            }
         }
     }
     private var changeReview: some View {

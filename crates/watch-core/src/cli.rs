@@ -96,7 +96,11 @@ impl Request {
                 &["apply"],
                 &[],
             ),
-            "update" => (&[], &["apply", "auto", "recover"], &[]),
+            "update" => (
+                &[],
+                &["apply", "auto", "recover", "relaunch", "detach"],
+                &["install-staged"],
+            ),
             "app-install" => (&[], &["apply"], &["source"]),
             "reinstall" => (&[], &["dry-run"], &["version", "build", "project"]),
             "app-uninstall" => (&[], &["apply"], &[]),
@@ -365,7 +369,7 @@ impl Request {
             "check" | "checkdetail" => &["online", "require-ready", "no-report"],
             "account" => &["apply", "ack-unverified-version"],
             "repair" | "fix" | "set-region" => &["apply"],
-            "update" => &["apply", "auto", "recover"],
+            "update" => &["apply", "auto", "recover", "relaunch", "detach"],
             "uninstall" => &[
                 "apply",
                 "purge-accounts",
@@ -383,6 +387,7 @@ impl Request {
             "environment" => &["mode"],
             "repair" | "fix" | "set-region" => &["plan-id", "allow-country"],
             "logs" | "diagnostic-export" => &["export"],
+            "update" => &["install-staged"],
             _ => &[],
         };
         for key in optional {

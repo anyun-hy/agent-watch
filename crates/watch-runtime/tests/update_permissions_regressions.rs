@@ -23,7 +23,7 @@ impl Fixture {
             writer.write_all(bytes).unwrap();
         }
         writer.finish().unwrap();
-        let release = Release { version: "3.0.0".into(), architecture: "arm64".into(),
+        let release = Release { version: "3.0.0".into(), build: None, architecture: "arm64".into(),
             archive_url: "https://fixture.invalid/release.zip".into(),
             archive_sha256: archive_hash(&archive).unwrap(),
             files: contents.iter().map(|(n, b)| (n.clone(), sha256(b))).collect() };

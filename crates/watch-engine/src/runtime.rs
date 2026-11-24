@@ -397,7 +397,7 @@ pub fn dispatch_read(request: &Request, paths: Paths) -> Result<Option<Value>> {
                 json!({"status":"ok","config":config.value()?,"legacy_openai_force_review":legacy_openai_force_review,"accounts":accounts,"chatgpt_accounts":chatgpt_accounts,"audit":audit,"service_status":service_status,"netcoffee_lookup":audit["netcoffee_lookup"],"source_notices":audit.get("source_notices").unwrap_or(&json!([])),
                 "policy_sync_state": policy_sync_state,
                 "repair":host.storage.read_json(&host.storage.paths.base().join("last-repair.json"),Value::Null)?,"guard":evidence,
-                "update_recovery_required":host.storage.paths.base().join("update-transaction.json").exists(),"setup_recovery_required":host.storage.paths.base().join("setup-transaction.json").exists()||host.storage.paths.base().join("service-transaction.json").exists()||host.storage.paths.watch().join("agent-install-transaction.json").exists(),"proxy_groups":[],
+                "update_recovery_required":host.storage.paths.base().join("update-transaction.json").exists(),"update_status":claude_watch_runtime::update::read_update_status(&host.storage),"setup_recovery_required":host.storage.paths.base().join("setup-transaction.json").exists()||host.storage.paths.base().join("service-transaction.json").exists()||host.storage.paths.watch().join("agent-install-transaction.json").exists(),"proxy_groups":[],
                 "claude_version":claude_version,
                 "claude_build":claude_build,
                 "chatgpt_version":chatgpt_version,

@@ -342,6 +342,23 @@ struct BackgroundServiceRow: Decodable, Identifiable {
     }
 }
 struct PolicyIssue: Decodable, Identifiable { let id, title, detail: String }
+struct UpdateStatusReceipt: Decodable, Equatable {
+    let checked_at: Double?
+    let status: String
+    let version: String?
+    let build: Int?
+    let current_version: String?
+    let current_build: Int?
+    let source_builtin: Bool?
+    let message: String?
+
+    var isAvailable: Bool { status == "available" && !(version ?? "").isEmpty }
+    var versionLabel: String {
+        guard let version, !version.isEmpty else { return "" }
+        if let build { return "v\(version) (Build \(build))" }
+        return "v\(version)"
+    }
+}
 struct BackgroundServiceReceipt: Decodable {
     let observed_at: Double
     let backend_healthy, update_source_ready: Bool
@@ -355,6 +372,7 @@ struct BackgroundServiceReceipt: Decodable {
     var backend_diagnostics: BackendInitializationDiagnostics?
     var backend_alive: Bool? = nil
     var protection_ready: Bool? = nil
+    var update_source_builtin: Bool? = nil
 
     static func samplingLabel(_ state: String) -> String {
         switch state {
@@ -871,6 +889,7 @@ final class SwitcherStore: ObservableObject {
     @Published private(set) var hasUnsavedSettings = false
     @Published private(set) var proxyGroups: [String] = []
     @Published private(set) var updateRecoveryRequired = false
+    @Published private(set) var updateStatus: UpdateStatusReceipt?
     @Published private(set) var environment: EnvironmentObservation?
     @Published private(set) var candidate: EnvironmentCandidate?
     @Published private(set) var setupPlan: EnvironmentSetupPlan?
@@ -1685,7 +1704,12 @@ final class SwitcherStore: ObservableObject {
          "guard_enabled": setupGuard, "timezone_watchdog": setupWatchdog, "auto_update": setupUpdater]
     }
     var updateSourceReady: Bool {
-        !value(Setting.updateURL).isEmpty && !value(Setting.updatePublicKey).isEmpty
+        let custom = !value(Setting.updateURL).isEmpty && !value(Setting.updatePublicKey).isEmpty
+        return custom || (background?.update_source_ready == true)
+    }
+    var updateSourceIsBuiltin: Bool {
+        value(Setting.updateURL).isEmpty && value(Setting.updatePublicKey).isEmpty
+            && background?.update_source_builtin == true
     }
     var setupCanConfirm: Bool {
         guard let setupPlan else { return false }
@@ -1998,6 +2022,9 @@ final class SwitcherStore: ObservableObject {
                     }
                 }
                 if args.first == "logs" { operationLog = raw["message"] as? String ?? "暂无操作记录" }
+                if args.first == "update", let decoded = try? JSONDecoder().decode(UpdateStatusReceipt.self, from: data) {
+                    updateStatus = decoded
+                }
                 if (args.starts(with: ["config", "set"]) || args.starts(with: ["config", "vpn-expectation-save"])) && !failure {
                     guard raw["config"] is [String: Any] else {
                         throw NSError(domain: "Switcher", code: 8, userInfo: [NSLocalizedDescriptionKey:
@@ -2094,6 +2121,13 @@ final class SwitcherStore: ObservableObject {
         }
         proxyGroups = raw["proxy_groups"] as? [String] ?? []
         updateRecoveryRequired = raw["update_recovery_required"] as? Bool ?? false
+        if let object = raw["update_status"], !(object is NSNull),
+           let encoded = try? JSONSerialization.data(withJSONObject: object),
+           let decoded = try? JSONDecoder().decode(UpdateStatusReceipt.self, from: encoded) {
+            updateStatus = decoded
+        } else {
+            updateStatus = nil
+        }
         setupRecoveryRequired = raw["setup_recovery_required"] as? Bool ?? false
         setupGuard = isOn(Setting.guardEnabled)
         setupWatchdog = isOn(Setting.timezoneWatchdog)

@@ -1,0 +1,163 @@
+name: Release macOS Build
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      app_version:
+        description: "Semantic version (e.g. 3.0.1)"
+        required: true
+        type: string
+      build_number:
+        description: "Monotonic positive integer build number (e.g. 446)"
+        required: true
+        type: string
+      prerelease:
+        description: "Mark GitHub Release as prerelease"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    name: Build & Sign arm64 Release (macOS 26)
+    runs-on: macos-26
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Resolve release metadata
+        id: meta
+        shell: bash
+        env:
+          INPUT_VERSION: ${{ inputs.app_version }}
+          INPUT_BUILD: ${{ inputs.build_number }}
+          REF_NAME: ${{ github.ref_name }}
+          RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          set -euo pipefail
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            APP_VERSION="$INPUT_VERSION"
+            BUILD_NUMBER="$INPUT_BUILD"
+            TAG="v${APP_VERSION}"
+          else
+            TAG="$REF_NAME"
+            APP_VERSION="${TAG#v}"
+            # Offset run_number above existing local builds (444+) so tag builds always stay monotonic.
+            BUILD_NUMBER="$((RUN_NUMBER + 500))"
+          fi
+          if [[ ! "$APP_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Invalid semantic version: $APP_VERSION" >&2
+            exit 1
+          fi
+          if [[ ! "$BUILD_NUMBER" =~ ^[1-9][0-9]*$ ]]; then
+            echo "Invalid positive integer build number: $BUILD_NUMBER" >&2
+            exit 1
+          fi
+          echo "app_version=$APP_VERSION" >> "$GITHUB_OUTPUT"
+          echo "build_number=$BUILD_NUMBER" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "update_zip=Claude-Watch-update-${APP_VERSION}-build${BUILD_NUMBER}-arm64.zip" >> "$GITHUB_OUTPUT"
+          echo "dmg_name=Claude-Watch-${APP_VERSION}-build${BUILD_NUMBER}-arm64.dmg" >> "$GITHUB_OUTPUT"
+
+      - name: Validate release signing secret and embedded public key
+        shell: bash
+        env:
+          PRIVATE_KEY_PEM: ${{ secrets.CW_RELEASE_SIGNING_PRIVATE_KEY_PEM }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${PRIVATE_KEY_PEM}" ]]; then
+            echo "Missing required repository secret: CW_RELEASE_SIGNING_PRIVATE_KEY_PEM" >&2
+            exit 1
+          fi
+          PUB_FILE="crates/watch-core/src/default_release_public_key.pem"
+          if ! grep -q "BEGIN PUBLIC KEY" "$PUB_FILE"; then
+            echo "Embedded public key missing in $PUB_FILE" >&2
+            exit 1
+          fi
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run core pre-release checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 tools/generate-ai-policy-swift.py --check
+          cargo test -p claude-watch-core
+          cargo test -p claude-watch-runtime --test update_contracts --test update_permissions_regressions
+
+      - name: Build .app and DMG (Seatbelt arm64)
+        shell: bash
+        env:
+          APP_VERSION: ${{ steps.meta.outputs.app_version }}
+          BUILD_NUMBER: ${{ steps.meta.outputs.build_number }}
+          CW_NETWORK_BACKEND: seatbelt
+          CW_BUILD_ARCH: arm64
+        run: |
+          set -euo pipefail
+          /bin/bash monitor/package-dmg.sh
+
+      - name: Package & RSA-sign auto-update ZIP and manifest
+        shell: bash
+        env:
+          PRIVATE_KEY_PEM: ${{ secrets.CW_RELEASE_SIGNING_PRIVATE_KEY_PEM }}
+          APP_VERSION: ${{ steps.meta.outputs.app_version }}
+          BUILD_NUMBER: ${{ steps.meta.outputs.build_number }}
+          TAG: ${{ steps.meta.outputs.tag }}
+          UPDATE_ZIP: ${{ steps.meta.outputs.update_zip }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          KEY_FILE=$(mktemp "${RUNNER_TEMP}/cw-release-key.XXXXXX.pem")
+          chmod 600 "$KEY_FILE"
+          trap 'rm -f "$KEY_FILE"' EXIT
+          printf '%s\n' "$PRIVATE_KEY_PEM" > "$KEY_FILE"
+          mkdir -p release-assets
+          ARCHIVE_URL="https://github.com/${REPO}/releases/download/${TAG}/${UPDATE_ZIP}"
+          python3 tools/package-release-update.py \
+            --app "monitor/build/Claude Watch Monitor Rust Candidate.app" \
+            --version "$APP_VERSION" \
+            --build "$BUILD_NUMBER" \
+            --architecture arm64 \
+            --archive-url "$ARCHIVE_URL" \
+            --archive-output "release-assets/${UPDATE_ZIP}" \
+            --manifest-output "release-assets/release-manifest.json" \
+            --private-key "$KEY_FILE" \
+            --public-key "crates/watch-core/src/default_release_public_key.pem"
+          cp "monitor/dist/${{ steps.meta.outputs.dmg_name }}" "release-assets/"
+          cp "monitor/dist/${{ steps.meta.outputs.dmg_name }}.sha256" "release-assets/"
+
+      - name: Publish GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.meta.outputs.tag }}
+          APP_VERSION: ${{ steps.meta.outputs.app_version }}
+          BUILD_NUMBER: ${{ steps.meta.outputs.build_number }}
+          PRERELEASE: ${{ inputs.prerelease || false }}
+        run: |
+          set -euo pipefail
+          FLAGS=()
+          if [[ "$PRERELEASE" == "true" ]]; then
+            FLAGS+=(--prerelease)
+          fi
+          NOTES="Claude Watch v${APP_VERSION} (Build ${BUILD_NUMBER}, macOS arm64 Seatbelt)."
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" release-assets/* --clobber
+          else
+            gh release create "$TAG" release-assets/* \
+              --title "Claude Watch v${APP_VERSION} (Build ${BUILD_NUMBER})" \
+              --notes "$NOTES" \
+              "${FLAGS[@]}"
+          fi

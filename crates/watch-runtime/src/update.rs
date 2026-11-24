@@ -34,6 +34,9 @@ pub trait UpdateOs {
             "更新适配器未提供已装版本",
         ))
     }
+    fn installed_build(&mut self, _app: &Path) -> Result<Option<u64>> {
+        Ok(None)
+    }
     fn macos_version(&mut self) -> Result<(u64, u64)> {
         Err(err(
             "update_adapter_unavailable",
@@ -77,10 +80,57 @@ pub trait UpdateOs {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Release {
     pub version: String,
+    pub build: Option<u64>,
     pub archive_url: String,
     pub archive_sha256: String,
     pub architecture: String,
     pub files: std::collections::BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone)]
+pub enum VerifiedUpdateStage {
+    Current {
+        current_version: String,
+        current_build: Option<u64>,
+    },
+    Available {
+        stage_dir: PathBuf,
+        app_path: PathBuf,
+        release: Release,
+        current_version: String,
+        current_build: Option<u64>,
+    },
+}
+
+pub fn update_status_path(storage: &crate::storage::StateStore) -> PathBuf {
+    storage.paths.watch().join("state/update-status.json")
+}
+
+pub fn record_update_status(storage: &crate::storage::StateStore, value: &Value) {
+    let _ = storage.private_dir(&storage.paths.watch().join("state"));
+    let _ = storage.atomic_json(&update_status_path(storage), value);
+}
+
+pub fn read_update_status(storage: &crate::storage::StateStore) -> Value {
+    storage
+        .read_json(&update_status_path(storage), Value::Null)
+        .unwrap_or(Value::Null)
+}
+
+pub fn is_newer_release(
+    current_version: &str,
+    current_build: Option<u64>,
+    incoming_version: &str,
+    incoming_build: Option<u64>,
+) -> Result<bool> {
+    match version_tuple(incoming_version)?.cmp(&version_tuple(current_version)?) {
+        std::cmp::Ordering::Greater => Ok(true),
+        std::cmp::Ordering::Less => Ok(false),
+        std::cmp::Ordering::Equal => match (current_build, incoming_build) {
+            (Some(cur), Some(inc)) => Ok(inc > cur),
+            _ => Ok(false),
+        },
+    }
 }
 pub fn check_configured(url: &str, key: &str) -> Result<()> {
     if url.is_empty() || key.is_empty() {
@@ -130,6 +180,21 @@ pub fn verify_manifest(
         .as_str()
         .ok_or_else(|| err("invalid_release_version", "缺少版本号"))?;
     version_tuple(version)?;
+    let build = match v.get("build") {
+        None | Some(Value::Null) => None,
+        Some(Value::Number(n)) => Some(
+            n.as_u64()
+                .filter(|b| *b > 0)
+                .ok_or_else(|| err("invalid_release_version", "构建号必须为正整数"))?,
+        ),
+        Some(Value::String(s)) => Some(
+            s.parse::<u64>()
+                .ok()
+                .filter(|b| *b > 0)
+                .ok_or_else(|| err("invalid_release_version", "构建号必须为正整数"))?,
+        ),
+        _ => return Err(err("invalid_release_version", "构建号格式无效")),
+    };
     let arch = v["architecture"]
         .as_str()
         .ok_or_else(|| err("invalid_release", "缺少架构"))?;
@@ -162,6 +227,7 @@ pub fn verify_manifest(
         .into();
     Ok(Release {
         version: version.into(),
+        build,
         archive_url,
         archive_sha256,
         architecture: arch.into(),
@@ -303,21 +369,10 @@ pub fn version_tuple(v: &str) -> Result<(u64, u64, u64)> {
     Ok((n[0], n[1], n[2]))
 }
 fn safe_https(v: &str) -> bool {
-    url::Url::parse(v).is_ok_and(|u| {
-        u.scheme() == "https"
-            && u.host_str().is_some()
-            && u.username().is_empty()
-            && u.password().is_none()
-            && u.fragment().is_none()
-    }) && !v.contains(char::is_whitespace)
+    claude_watch_core::release_source::is_safe_https_url(v)
 }
-fn same_origin(a: &str, b: &str) -> bool {
-    safe_https(a)
-        && safe_https(b)
-        && url::Url::parse(a)
-            .ok()
-            .zip(url::Url::parse(b).ok())
-            .is_some_and(|(a, b)| a.origin() == b.origin())
+fn archive_origin_ok(manifest_url: &str, archive_url: &str) -> bool {
+    claude_watch_core::release_source::archive_origin_allowed(manifest_url, archive_url)
 }
 fn safe_member(n: &str) -> Result<String> {
     let p = Path::new(n);
@@ -354,23 +409,78 @@ pub trait Transport {
 pub struct UreqTransport;
 impl Transport for UreqTransport {
     fn get(&mut self, url: &str, limit: u64) -> Result<Vec<u8>> {
-        if !safe_https(url) {
-            return Err(err("unsafe_update_url", "更新地址必须是 HTTPS"));
+        fetch_https_bounded(url, limit, None)
+    }
+}
+
+/// HTTPS transport supporting an optional configured loopback proxy (with
+/// automatic direct fallback) and strictly allowlisted GitHub Releases
+/// redirects. Cryptographic RSA + SHA-256 verification remains mandatory.
+pub struct ConfiguredTransport {
+    pub proxy_url: Option<String>,
+}
+impl Transport for ConfiguredTransport {
+    fn get(&mut self, url: &str, limit: u64) -> Result<Vec<u8>> {
+        if let Some(proxy) = self.proxy_url.as_deref() {
+            match fetch_https_bounded(url, limit, Some(proxy)) {
+                Ok(bytes) => return Ok(bytes),
+                Err(error) if error.code == "update_download_failed" => {}
+                Err(error) => return Err(error),
+            }
         }
-        let agent: ureq::Agent = ureq::Agent::config_builder()
-            .proxy(None)
-            .max_redirects(0)
-            .timeout_global(Some(std::time::Duration::from_secs(
-                if limit <= 3_000_000 { 15 } else { 120 },
-            )))
-            .build()
-            .into();
+        fetch_https_bounded(url, limit, None)
+    }
+}
+
+fn fetch_https_bounded(url: &str, limit: u64, proxy_url: Option<&str>) -> Result<Vec<u8>> {
+    if !safe_https(url) {
+        return Err(err("unsafe_update_url", "更新地址必须是 HTTPS"));
+    }
+    let timeout = std::time::Duration::from_secs(if limit <= 3_000_000 { 20 } else { 180 });
+    let mut builder = ureq::Agent::config_builder()
+        .max_redirects(0)
+        .http_status_as_error(false)
+        .timeout_global(Some(timeout));
+    if let Some(proxy_raw) = proxy_url {
+        let proxy = ureq::Proxy::new(proxy_raw)
+            .map_err(|_| err("update_download_failed", "本地更新代理配置无效"))?;
+        builder = builder.proxy(Some(proxy));
+    } else {
+        builder = builder.proxy(None);
+    }
+    let agent: ureq::Agent = builder.build().into();
+    let mut current = url.to_string();
+    for hop in 0..=3 {
         let response = agent
-            .get(url)
+            .get(&current)
             .header("Accept-Encoding", "identity")
+            .header("User-Agent", "ClaudeWatchUpdater/1")
             .call()
             .map_err(|_| err("update_download_failed", "更新下载失败"))?;
-        if response.status().as_u16() != 200 {
+        let status = response.status().as_u16();
+        if matches!(status, 301 | 302 | 303 | 307 | 308) {
+            if hop == 3 {
+                return Err(err("unsafe_update_redirect", "更新源跳转次数超出上限"));
+            }
+            let location = response
+                .headers()
+                .get("location")
+                .and_then(|v| v.to_str().ok())
+                .ok_or_else(|| err("unsafe_update_redirect", "更新源跳转缺少目标地址"))?;
+            let resolved = url::Url::parse(&current)
+                .and_then(|base| base.join(location))
+                .map_err(|_| err("unsafe_update_redirect", "更新源跳转地址无效"))?
+                .to_string();
+            if !claude_watch_core::release_source::redirect_allowed(&current, &resolved) {
+                return Err(err(
+                    "unsafe_update_redirect",
+                    "更新源跳转目标不在受控白名单中",
+                ));
+            }
+            current = resolved;
+            continue;
+        }
+        if status != 200 {
             return Err(err("update_download_failed", "更新源未返回完整内容"));
         }
         let r = response.into_body().into_reader();
@@ -379,8 +489,9 @@ impl Transport for UreqTransport {
         if v.len() as u64 > limit {
             return Err(err("oversize_release", "下载内容过大"));
         }
-        Ok(v)
+        return Ok(v);
     }
+    Err(err("update_download_failed", "更新下载失败"))
 }
 #[derive(Debug, Clone)]
 pub struct UpdatePaths {
@@ -397,7 +508,7 @@ pub struct Updater<O, T> {
     pub transport: T,
 }
 impl<O: UpdateOs, T: Transport> Updater<O, T> {
-    pub fn check(&mut self, url: &str, key: &str, apply: bool) -> Result<Value> {
+    fn fetch_verified_manifest(&mut self, url: &str, key: &str) -> Result<Release> {
         check_configured(url, key)?;
         let envelope = self.transport.get(url, 3_000_000)?;
         let e = crate::storage::strict_json(&envelope)
@@ -419,15 +530,21 @@ impl<O: UpdateOs, T: Transport> Updater<O, T> {
         if payload.len() > 2_000_000 || signature.len() > 8192 {
             return Err(err("invalid_release", "更新清单格式错误"));
         }
-        let release = verify_manifest(&payload, &signature, key, &self.os.architecture()?)?;
+        verify_manifest(&payload, &signature, key, &self.os.architecture()?)
+    }
+
+    /// Downloads, verifies (RSA + archive SHA-256 + per-file SHA-256 + component
+    /// parity), and extracts a newer release into a private staging directory
+    /// under `paths.base` ready for authoritative `AppLifecycle::apply`.
+    pub fn fetch_and_verify_staging(&mut self, url: &str, key: &str) -> Result<VerifiedUpdateStage> {
+        let release = self.fetch_verified_manifest(url, key)?;
         let current = self.os.installed_version(&self.paths.app)?;
-        if version_tuple(&release.version)? <= version_tuple(&current)? {
-            return Ok(serde_json::json!({"status":"current","version":current}));
-        }
-        if !apply {
-            return Ok(
-                serde_json::json!({"status":"available","version":release.version,"apply_required":true}),
-            );
+        let current_build = self.os.installed_build(&self.paths.app)?;
+        if !is_newer_release(&current, current_build, &release.version, release.build)? {
+            return Ok(VerifiedUpdateStage::Current {
+                current_version: current,
+                current_build,
+            });
         }
         let archive_url = &release.archive_url;
         if !safe_https(archive_url) {
@@ -436,7 +553,81 @@ impl<O: UpdateOs, T: Transport> Updater<O, T> {
                 "更新地址必须是无凭据的 HTTPS 地址",
             ));
         }
-        if !same_origin(url, archive_url) {
+        if !archive_origin_ok(url, archive_url) {
+            return Err(err(
+                "update_origin_mismatch",
+                "清单与更新包必须来自同一已配置发布源",
+            ));
+        }
+        let bytes = self.transport.get(archive_url, MAX_ARCHIVE)?;
+        let stage_dir = self
+            .paths
+            .base
+            .join(format!("update-stage-{}", uuid::Uuid::new_v4().simple()));
+        fs::create_dir_all(&stage_dir).map_err(io)?;
+        let stage_result = (|| -> Result<PathBuf> {
+            let zip = stage_dir.join("release.zip");
+            fs::write(&zip, &bytes).map_err(io)?;
+            if archive_hash(&zip)? != release.archive_sha256 {
+                return Err(err("archive_hash_mismatch", "更新包整体校验失败"));
+            }
+            let payload_dir = stage_dir.join("payload");
+            fs::create_dir(&payload_dir).map_err(io)?;
+            verify_extract(&zip, &payload_dir, &release)?;
+            let _ = fs::remove_file(&zip);
+            let app_path = payload_dir.join("app/Claude Watch Monitor.app");
+            self.os.verify_app(&app_path, &release.version)?;
+            Ok(app_path)
+        })();
+        match stage_result {
+            Ok(app_path) => Ok(VerifiedUpdateStage::Available {
+                stage_dir,
+                app_path,
+                release,
+                current_version: current,
+                current_build,
+            }),
+            Err(error) => {
+                let _ = fs::remove_dir_all(&stage_dir);
+                Err(error)
+            }
+        }
+    }
+
+    pub fn check(&mut self, url: &str, key: &str, apply: bool) -> Result<Value> {
+        let release = self.fetch_verified_manifest(url, key)?;
+        let current = self.os.installed_version(&self.paths.app)?;
+        let current_build = self.os.installed_build(&self.paths.app)?;
+        if !is_newer_release(&current, current_build, &release.version, release.build)? {
+            return Ok(serde_json::json!({
+                "status": "current",
+                "version": current,
+                "build": current_build,
+                "message": "当前已是最新版本"
+            }));
+        }
+        if !apply {
+            return Ok(serde_json::json!({
+                "status": "available",
+                "version": release.version,
+                "build": release.build,
+                "current_version": current,
+                "current_build": current_build,
+                "apply_required": true,
+                "message": match release.build {
+                    Some(b) => format!("发现新版本 {} (Build {})", release.version, b),
+                    None => format!("发现新版本 {}", release.version),
+                }
+            }));
+        }
+        let archive_url = &release.archive_url;
+        if !safe_https(archive_url) {
+            return Err(err(
+                "unsafe_update_url",
+                "更新地址必须是无凭据的 HTTPS 地址",
+            ));
+        }
+        if !archive_origin_ok(url, archive_url) {
             return Err(err(
                 "update_origin_mismatch",
                 "清单与更新包必须来自同一已配置发布源",
@@ -444,7 +635,7 @@ impl<O: UpdateOs, T: Transport> Updater<O, T> {
         }
         if self.os.app_running(&self.paths.app)? {
             return Ok(
-                serde_json::json!({"status":"deferred","version":release.version,"message":"退出监控界面后可应用完整更新"}),
+                serde_json::json!({"status":"deferred","version":release.version,"build":release.build,"message":"退出监控界面后可应用完整更新"}),
             );
         }
         let bytes = self.transport.get(archive_url, MAX_ARCHIVE)?;
@@ -464,14 +655,14 @@ impl<O: UpdateOs, T: Transport> Updater<O, T> {
         if let Some(hash) = self.os.root_helper_hash()? {
             if release.files.get("runtime/watch-admin.sh") != Some(&hash) {
                 return Ok(
-                    serde_json::json!({"status":"administrator_required","version":release.version,"message":"系统组件需要管理员升级；整包尚未应用"}),
+                    serde_json::json!({"status":"administrator_required","version":release.version,"build":release.build,"message":"系统组件需要管理员升级；整包尚未应用"}),
                 );
             }
         }
         self.apply_payload(&payload_dir, &release)?;
         let _ = fs::remove_dir_all(dir);
         Ok(
-            serde_json::json!({"status":"ok","version":release.version,"message":"完整组件已更新并通过组件自检；不代表账号实机验收"}),
+            serde_json::json!({"status":"ok","version":release.version,"build":release.build,"message":"完整组件已更新并通过组件自检；不代表账号实机验收"}),
         )
     }
     pub fn apply_payload(&mut self, source: &Path, release: &Release) -> Result<()> {

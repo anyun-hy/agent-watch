@@ -21,6 +21,7 @@ pub mod process_roots;
 pub mod processes;
 pub mod receipts;
 pub mod region;
+pub mod release_source;
 pub mod risk;
 pub mod session;
 pub mod stun;

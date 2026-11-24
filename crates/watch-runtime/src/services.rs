@@ -151,7 +151,12 @@ pub fn service_status_with_health<S: ServiceSystem>(
     let legacy_tz = job(system, "legacy_watchdog");
     let update = job(system, "updater");
     let clock = job(system, "watchdog");
-    let ready = !config.update_url.is_empty() && !config.update_public_key.is_empty();
+    let resolved_update = claude_watch_core::release_source::resolve_update_source(
+        &config.update_url,
+        &config.update_public_key,
+    );
+    let ready = resolved_update.is_some();
+    let update_source_builtin = resolved_update.as_ref().is_some_and(|s| s.is_builtin);
     // Independent fallback tools are observed only. Their registration does
     // not change Watch policy or add launch requirements to this application.
     let external_services = json!({
@@ -229,7 +234,7 @@ pub fn service_status_with_health<S: ServiceSystem>(
     };
 
     Ok(
-        json!({"status":"ok","observed_at":now,"backend_healthy":health.sampling_healthy,"guard_backend_healthy":health.guard_backend_healthy,"backend_alive":health.guard_backend_healthy,"protection_ready":health.guard_healthy,"backend_diagnostics":health.diagnostics,"backend_sampling_state":sampling_state,"admin_helper":helper,"update_source_ready":ready,"external_services":external_services,"policy_issues":policy_issues(config),"services":[
+        json!({"status":"ok","observed_at":now,"backend_healthy":health.sampling_healthy,"guard_backend_healthy":health.guard_backend_healthy,"backend_alive":health.guard_backend_healthy,"protection_ready":health.guard_healthy,"backend_diagnostics":health.diagnostics,"backend_sampling_state":sampling_state,"admin_helper":helper,"update_source_ready":ready,"update_source_builtin":update_source_builtin,"external_services":external_services,"policy_issues":policy_issues(config),"services":[
           {"id":"guard","title":"Claude Watch 保镖","state":guard_state,"desired":config.guard_enabled,"execution_verified":guard_state == "running","backend_alive":health.guard_backend_healthy,"sampling_state":sampling_state,"protection_ready":health.guard_healthy,"health_basis":"service_liveness_and_protection_evidence","source":"本工具监督循环心跳 / 后台身份 / 独立保护证据","reason_code":guard_reason,"detail":guard_detail,"evidence_observed_at":health.diagnostics["guard"]["evidence_observed_at"]},
           {"id":"original","title":"原版 Claude切换器保镖","state":original_state,"desired":null,"execution_verified":original_verified,"health_basis":if original_verified {"root_execution_receipt"} else {"launchd_registration_only"},"last_success_at":if original_verified {original_receipt["time"].clone()} else {Value::Null},"detail":if original_verified {"原版独立运行，已确认最近巡检回执"} else if original_state == "scheduled" {"原版任务已注册，最近巡检回执尚未确认；由原版独立管理"} else {"原版状态尚未确认；由原版独立管理"},"source":"system/local.claude-bodyguard / 原版只读巡检回执"},
           {"id":"watchdog","title":"时区守护","state":watchdog_state,"desired":config.timezone_watchdog,"actual_target":watchdog["target"],"accepted_target":desired_target,"last_success_at":watchdog_last_success,"execution_verified":watchdog_verified,"health_basis":watchdog_basis,"source":"时区任务注册 / root 管理的目标文件"},
@@ -305,7 +310,11 @@ pub fn protection_preview<S: ServiceSystem>(
     }
     if key == "auto_update"
         && value == true
-        && (cfg.update_url.is_empty() || cfg.update_public_key.is_empty())
+        && claude_watch_core::release_source::resolve_update_source(
+            &cfg.update_url,
+            &cfg.update_public_key,
+        )
+        .is_none()
     {
         return Err(err(
             "update_source_missing",
