@@ -69,7 +69,8 @@ enum ConnectionInventory {
         if process?.runtimeRole == "mcp", ["configured_mcp_entry", "configured_mcp_descendant"].contains(process?.roleEvidence ?? "") { return .mcp }
         let gateway = host(flow.peer) == host(proxyEndpoint)
             && URLComponents(string: "http://" + flow.peer)?.port == URLComponents(string: proxyEndpoint.contains("://") ? proxyEndpoint : "http://" + proxyEndpoint)?.port
-        if flow.association == "local_service" || (loopback(flow.peer) && !gateway) { return .local }
+        let viaControlledGateway = flow.routePath?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "controlled_gateway"
+        if flow.association == "local_service" || (loopback(flow.peer) && !gateway && !viaControlledGateway) { return .local }
         if flow.flowKind == "core_platform" { return .platform }
         let domain = host(flow.host)
         let domains = process?.product == .claude

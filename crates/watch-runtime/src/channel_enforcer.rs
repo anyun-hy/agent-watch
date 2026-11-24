@@ -67,6 +67,26 @@ impl TunnelStream {
             Self::Unix(s) => s.set_write_timeout(dur),
         }
     }
+
+    pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
+        match self {
+            Self::Tcp(s) => s.local_addr(),
+            Self::Unix(_) => Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "unix stream has no TCP socket address",
+            )),
+        }
+    }
+
+    pub fn peer_addr(&self) -> std::io::Result<SocketAddr> {
+        match self {
+            Self::Tcp(s) => s.peer_addr(),
+            Self::Unix(_) => Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "unix stream has no TCP socket address",
+            )),
+        }
+    }
 }
 
 impl Read for TunnelStream {
@@ -180,6 +200,7 @@ struct ActiveSocketFlow {
     process: BoundProcessToken,
     client_stream: Option<TunnelStream>,
     upstream_stream: Option<TunnelStream>,
+    target_destination: String,
     aborted: Arc<AtomicBool>,
     close_requested_at: Option<f64>,
     close_reason: Option<String>,
@@ -2603,6 +2624,7 @@ impl LocalTunnelEnforcer {
                     process: process.clone(),
                     client_stream: Some(client_for_state),
                     upstream_stream: Some(upstream_for_state),
+                    target_destination: target_destination.to_owned(),
                     aborted: aborted.clone(),
                     close_requested_at: None,
                     close_reason: None,
@@ -3358,6 +3380,61 @@ pub fn unregister_production_enforcer(watch_dir: &std::path::Path) {
 }
 
 impl LocalTunnelEnforcer {
+    /// Snapshot active two-hop TCP mappings (client -> gateway -> upstream proxy)
+    /// without blocking forwarding or performing network I/O.
+    pub fn active_gateway_hops(
+        &self,
+        gateway_pid: u32,
+        gateway_start: Option<f64>,
+    ) -> Vec<claude_watch_core::tag_flow::ControlledGatewayHop> {
+        let format_addr = |addr: SocketAddr| -> (String, u16) {
+            let ip = match addr.ip() {
+                std::net::IpAddr::V6(v6) => v6
+                    .to_ipv4_mapped()
+                    .map(|v4| v4.to_string())
+                    .unwrap_or_else(|| v6.to_string()),
+                ip => ip.to_string(),
+            };
+            (ip, addr.port())
+        };
+        let Ok(guard) = self.lock() else {
+            return Vec::new();
+        };
+        let mut hops = Vec::new();
+        for family in guard.families.values() {
+            for active in family.active_flows.values() {
+                if active.aborted.load(Ordering::Acquire) {
+                    continue;
+                }
+                let (Some(client), Some(upstream)) =
+                    (active.client_stream.as_ref(), active.upstream_stream.as_ref())
+                else {
+                    continue;
+                };
+                let (Ok(client_local), Ok(gateway_listen), Ok(upstream_local), Ok(upstream_peer)) = (
+                    client.peer_addr(),
+                    client.local_addr(),
+                    upstream.local_addr(),
+                    upstream.peer_addr(),
+                ) else {
+                    continue;
+                };
+                hops.push(claude_watch_core::tag_flow::ControlledGatewayHop {
+                    client_pid: active.process.pid,
+                    client_local: format_addr(client_local),
+                    gateway_listen: format_addr(gateway_listen),
+                    gateway_pid,
+                    gateway_start,
+                    upstream_local: format_addr(upstream_local),
+                    upstream_peer: format_addr(upstream_peer),
+                    target_destination: (!active.target_destination.is_empty())
+                        .then(|| active.target_destination.clone()),
+                });
+            }
+        }
+        hops
+    }
+
     /// Reports only the controlled-instance network boundary; no system-wide capture is claimed.
     pub fn publish_protocol_coverage(&self, store: &crate::storage::StateStore) -> Result<()> {
         let _lock = store.lock("channel-protocol-coverage", None)?;

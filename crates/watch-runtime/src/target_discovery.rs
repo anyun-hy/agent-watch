@@ -1039,6 +1039,42 @@ impl<R: ReadRunner + ?Sized> Scan<'_, R> {
             error_code: None,
         }
     }
+    fn read_bundle_info_plist(&self, plist: &Path) -> Option<serde_json::Value> {
+        let out = self
+            .reader
+            .run(
+                ReadCommand::Plist(plist.to_path_buf()),
+                &[],
+                Duration::from_secs(3),
+                128 * 1024,
+            )
+            .ok()?;
+        if out.status == 0 && out.stderr.is_empty() {
+            return crate::storage::strict_json(&out.stdout)
+                .ok()
+                .filter(serde_json::Value::is_object);
+        }
+        // Apple system app plists (e.g. Stocks.app) legitimately embed `<data>` or `<date>`
+        // values that `plutil -convert json` rejects with "Invalid object in plist for JSON format".
+        // Fall back to `plutil -convert xml1` and extract only the 4 top-level bundle strings;
+        // truly corrupt plists still fail `plutil -convert xml1` and remain fail-closed.
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if !stderr.contains("JSON") && !stderr.contains("json") {
+            return None;
+        }
+        let xml = self
+            .reader
+            .run(
+                ReadCommand::PlistXml(plist.to_path_buf()),
+                &[],
+                Duration::from_secs(3),
+                512 * 1024,
+            )
+            .ok()
+            .filter(|v| v.status == 0 && v.stderr.is_empty())?;
+        parse_xml_plist_bundle_strings(&xml.stdout)
+    }
+
     fn desktop(
         &mut self,
         path: PathBuf,
@@ -1063,17 +1099,7 @@ impl<R: ReadRunner + ?Sized> Scan<'_, R> {
             return self.pending_desktop(path, source, expected);
         }
         self.counters.plist_reads += 1;
-        let info = self
-            .reader
-            .run(
-                ReadCommand::Plist(plist),
-                &[],
-                Duration::from_secs(3),
-                128 * 1024,
-            )
-            .ok()
-            .filter(|v| v.status == 0 && v.stderr.is_empty())
-            .and_then(|v| crate::storage::strict_json(&v.stdout).ok());
+        let info = self.read_bundle_info_plist(&plist);
         let Some(info) = info else {
             self.issues.push("bundle_metadata_unreadable".into());
             return self.pending_desktop(path, source, expected);
@@ -2459,4 +2485,197 @@ fn make_spec(
             ProxyAdaptationKind::EnvOnly
         },
     })
+}
+
+fn unescape_xml_entities(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+    while let Some(amp) = rest.find('&') {
+        out.push_str(&rest[..amp]);
+        let after = &rest[amp + 1..];
+        let Some(semi) = after.find(';') else {
+            out.push_str(&rest[amp..]);
+            return out;
+        };
+        let entity = &after[..semi];
+        match entity {
+            "amp" => out.push('&'),
+            "lt" => out.push('<'),
+            "gt" => out.push('>'),
+            "quot" => out.push('"'),
+            "apos" => out.push('\''),
+            num if num.starts_with("#x") || num.starts_with("#X") => {
+                if let Some(ch) = u32::from_str_radix(&num[2..], 16).ok().and_then(char::from_u32) {
+                    out.push(ch);
+                }
+            }
+            num if num.starts_with('#') => {
+                if let Some(ch) = num[1..].parse::<u32>().ok().and_then(char::from_u32) {
+                    out.push(ch);
+                }
+            }
+            _ => {
+                out.push('&');
+                out.push_str(entity);
+                out.push(';');
+            }
+        }
+        rest = &after[semi + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Extract only the 4 top-level `<string>` keys needed for desktop bundle
+/// identification from Apple XML1 plist output (`plutil -convert xml1`).
+/// Returns `None` if the XML structure is malformed or truncated so corrupt
+/// plists still fail closed.
+fn parse_xml_plist_bundle_strings(xml: &[u8]) -> Option<serde_json::Value> {
+    const WANTED: [&str; 4] = [
+        "CFBundleIdentifier",
+        "CFBundleExecutable",
+        "CFBundleShortVersionString",
+        "CFBundleVersion",
+    ];
+    let text = std::str::from_utf8(xml).ok()?;
+    let plist_start = text.find("<plist")?;
+    let mut rest = &text[plist_start..];
+    let mut saw_root_dict = false;
+    let mut dict_depth: usize = 0;
+    let mut array_depth: usize = 0;
+    let mut pending_key: Option<String> = None;
+    let mut map = serde_json::Map::new();
+
+    while let Some(lt) = rest.find('<') {
+        rest = &rest[lt..];
+        if rest.starts_with("<!--") {
+            let end = rest.find("-->")?;
+            rest = &rest[end + 3..];
+            continue;
+        }
+        if rest.starts_with("<?") || rest.starts_with("<!") {
+            let end = rest.find('>')?;
+            rest = &rest[end + 1..];
+            continue;
+        }
+        let gt = rest.find('>')?;
+        let raw_tag = rest[1..gt].trim();
+        rest = &rest[gt + 1..];
+        if raw_tag.is_empty() {
+            return None;
+        }
+        let closing = raw_tag.starts_with('/');
+        let self_closing = !closing && raw_tag.ends_with('/');
+        let name = raw_tag
+            .trim_start_matches('/')
+            .trim_end_matches('/')
+            .split_whitespace()
+            .next()?;
+
+        if !saw_root_dict {
+            if !closing && name == "dict" {
+                saw_root_dict = true;
+                if !self_closing {
+                    dict_depth = 1;
+                }
+            }
+            continue;
+        }
+        if dict_depth == 0 {
+            // Root dict already closed; ignore trailing `</plist>` etc.
+            continue;
+        }
+
+        let at_top_level = dict_depth == 1 && array_depth == 0;
+        match (closing, self_closing, name) {
+            (false, false, "dict") => {
+                if at_top_level {
+                    pending_key = None;
+                }
+                dict_depth += 1;
+            }
+            (false, true, "dict") => {
+                if at_top_level {
+                    pending_key = None;
+                }
+            }
+            (true, false, "dict") => {
+                if dict_depth == 0 {
+                    return None;
+                }
+                dict_depth -= 1;
+            }
+            (false, false, "array") => {
+                if at_top_level {
+                    pending_key = None;
+                }
+                array_depth += 1;
+            }
+            (false, true, "array") => {
+                if at_top_level {
+                    pending_key = None;
+                }
+            }
+            (true, false, "array") => {
+                if array_depth == 0 {
+                    return None;
+                }
+                array_depth -= 1;
+            }
+            (false, true, "key") => {
+                if at_top_level {
+                    pending_key = Some(String::new());
+                }
+            }
+            (false, false, "key") => {
+                let end = rest.find("</key>")?;
+                let inner = &rest[..end];
+                rest = &rest[end + "</key>".len()..];
+                if at_top_level {
+                    pending_key = Some(unescape_xml_entities(inner));
+                }
+            }
+            (false, true, "string") => {
+                if at_top_level {
+                    if let Some(key) = pending_key.take() {
+                        if WANTED.contains(&key.as_str()) {
+                            map.insert(key, json!(""));
+                        }
+                    }
+                }
+            }
+            (false, false, "string") => {
+                let end = rest.find("</string>")?;
+                let inner = &rest[..end];
+                rest = &rest[end + "</string>".len()..];
+                if at_top_level {
+                    if let Some(key) = pending_key.take() {
+                        if WANTED.contains(&key.as_str()) {
+                            map.insert(key, json!(unescape_xml_entities(inner)));
+                        }
+                    }
+                }
+            }
+            (false, true, "true" | "false" | "data" | "date" | "integer" | "real") => {
+                if at_top_level {
+                    pending_key = None;
+                }
+            }
+            (false, false, tag @ ("data" | "date" | "integer" | "real")) => {
+                let close = format!("</{tag}>");
+                let end = rest.find(&close)?;
+                rest = &rest[end + close.len()..];
+                if at_top_level {
+                    pending_key = None;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if saw_root_dict && dict_depth == 0 && array_depth == 0 {
+        Some(serde_json::Value::Object(map))
+    } else {
+        None
+    }
 }

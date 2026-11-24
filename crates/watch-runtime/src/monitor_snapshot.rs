@@ -153,7 +153,7 @@ pub fn proxy(raw: &Value) -> Option<Value> {
             .collect();
         flows.push(json!({"id":format!("{pid}|{}",&sha256(&id)[..20]),"pid":pid,"host":flow["host"].as_str().filter(|v|!v.is_empty()).unwrap_or(&peer),"peer":peer,"local":local,"protocol":protocol,
             "path":flow["path"].as_str().unwrap_or(""),"interface":flow["interface"].as_str().unwrap_or(""),"destinationIP":destination[0],"destinationPort":destination[1],"destinationIPState":destination[2],"destinationCountry":destination[3],
-            "association":flow["association"].as_str().unwrap_or("unconfirmed"),"policy":flow["policy"].as_str().unwrap_or("unconfirmed"),"reason":flow["reason"].as_str().unwrap_or(""),"chains":chains}));
+            "flow_kind":flow["flow_kind"].as_str(),"association":flow["association"].as_str().unwrap_or("unconfirmed"),"policy":flow["policy"].as_str().unwrap_or("unconfirmed"),"reason":flow["reason"].as_str().unwrap_or(""),"chains":chains}));
     }
     Some(
         json!({"backendVersion":raw.get("monitor_version").unwrap_or(&json!(VERSION)),"monitoredApps":raw.get("monitored_apps").unwrap_or(&json!(MONITORED)),"observedAt":observed,
@@ -786,5 +786,38 @@ mod guard_history_presentation_tests {
         assert!(detail.contains("先前状态：待核验"));
         assert!(detail.contains("等待首次审计"));
         assert_eq!(rendered["severity"], "info");
+    }
+
+    #[test]
+    fn present_proxy_preserves_flow_kind_and_controlled_gateway_path() {
+        let raw = json!({
+            "schema": 1,
+            "observed_epoch": 1000.0,
+            "entry": {"state": "verified", "endpoint": "http://127.0.0.1:7890", "owners": []},
+            "api": {"state": "available", "covers_7890": true, "mode": "rule"},
+            "flows": [{
+                "pid": 44,
+                "protocol": "tcp",
+                "local": ["127.0.0.1", 50213],
+                "peer": ["127.0.0.1", 1023],
+                "host": "chatgpt.com",
+                "path": "controlled_gateway",
+                "flow_kind": "core_platform",
+                "association": "correlated",
+                "policy": "match",
+                "chains": ["JP11", "海外AI"],
+                "connection_id": "conn-1",
+                "destination_ip": "104.18.32.47",
+                "destination_port": 443,
+                "destination_country": "US"
+            }],
+            "connection_observation": {"schema": 1, "round_id": "r1", "observed_at": 1000.0, "collector_state": "ok"}
+        });
+        let presented = proxy(&raw).expect("presented proxy");
+        let flow = &presented["flows"][0];
+        assert_eq!(flow["path"], "controlled_gateway");
+        assert_eq!(flow["flow_kind"], "core_platform");
+        assert_eq!(flow["association"], "correlated");
+        assert_eq!(flow["chains"], json!(["海外AI", "JP11"]));
     }
 }

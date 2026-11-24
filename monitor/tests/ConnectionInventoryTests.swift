@@ -33,6 +33,12 @@ struct ConnectionInventoryTests {
         let local = flow("local", host: "127.0.0.1:9876", peer: "127.0.0.1:9876", policy: "not_applicable", association: "local_service", chains: [])
         let localGroup = grouped([desktop], [local])[0]
         expect(localGroup.purpose == .local && localGroup.status == "本机通信", "local not-applicable never renders pending proxy")
+        let controlledGateway = Flow(id: "gw-platform", pid: 30, host: "chatgpt.com", peer: "127.0.0.1:1023", local: "127.0.0.1:50213",
+                                     transport: "TCP", association: "correlated", policy: "match", reason: "fixture",
+                                     chains: ["海外AI", "日本11"], routePath: "controlled_gateway", interfaceName: nil, flowKind: "core_platform")
+        expect(ConnectionInventory.purpose(controlledGateway, process: network) == .platform, "controlled gateway loopback port is not misclassified as local IPC")
+        expect(ConnectionGraphScope(product: .openAI, processes: [network], flows: [controlledGateway]).platformFlows.map(\.id) == ["gw-platform"], "controlled gateway platform flow drives the graph")
+        expect(grouped([network], [controlledGateway])[0].purpose == .platform, "controlled gateway platform flow groups under AI 平台服务")
         expect(ConnectionInventory.purpose(flow("gateway"), process: desktop) == .platform, "7890 loopback proxy is not a local IPC service")
         expect(ConnectionInventory.purpose(flow("spoof", host: "chatgpt.com.evil.org"), process: desktop) != .platform, "domain boundary respected")
         expect(!ConnectionInventory.loopback("127.evil.org:9876"), "domain prefix cannot impersonate loopback")

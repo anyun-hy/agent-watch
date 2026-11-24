@@ -563,6 +563,67 @@ fn desktop_negative_metadata_and_ambiguous_copies_never_select_by_name() {
 }
 
 #[test]
+fn non_json_apple_plist_with_data_and_date_falls_back_to_xml1_while_corrupt_fails_closed() {
+    let f = Fixture::new();
+    let claude = f.home.join("Applications/Claude.app");
+    f.app(&claude, DESKTOP_IDS[0].0, "Claude");
+    // Simulate an Apple system bundle (like /System/Applications/Stocks.app) whose
+    // valid Info.plist embeds `<data>` and `<date>` values that `plutil -convert json`
+    // rejects with "Invalid object in plist for JSON format".
+    let stocks = f.home.join("Applications/Stocks.app");
+    fs::create_dir_all(stocks.join("Contents/MacOS")).unwrap();
+    Fixture::image(&stocks.join("Contents/MacOS/Stocks"));
+    fs::write(
+        stocks.join("Contents/Info.plist"),
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>NestedMeta</key>
+    <dict>
+        <key>CFBundleIdentifier</key>
+        <string>com.anthropic.claudefordesktop</string>
+    </dict>
+    <key>OpaqueBlob</key>
+    <data>AQIDBA==</data>
+    <key>BuildTimestamp</key>
+    <date>2026-11-23T00:00:00Z</date>
+    <key>CFBundleIdentifier</key>
+    <string>com.apple.stocks</string>
+    <key>CFBundleExecutable</key>
+    <string>Stocks</string>
+    <key>CFBundleShortVersionString</key>
+    <string>4.0</string>
+</dict>
+</plist>"#,
+    )
+    .unwrap();
+
+    let handle = f.handle();
+    let snapshot = handle.refresh(&f.reader, native::now());
+    assert!(
+        snapshot.complete,
+        "valid Apple plist with <data>/<date> must not poison discovery completeness: {:?}",
+        snapshot.issues
+    );
+    assert!(
+        !snapshot.issues.contains(&"bundle_metadata_unreadable".into()),
+        "valid non-JSON plist must fall back to XML1 cleanly"
+    );
+    assert_eq!(
+        snapshot.targets.iter().filter(|r| r.valid()).count(),
+        1,
+        "nested CFBundleIdentifier inside unrelated app must never impersonate a desktop target"
+    );
+
+    // Truly corrupt plist must still fail closed.
+    fs::write(stocks.join("Contents/Info.plist"), b"not-a-valid-plist").unwrap();
+    let corrupt = handle.refresh(&f.reader, native::now());
+    assert!(!corrupt.complete);
+    assert!(corrupt.issues.contains(&"bundle_metadata_unreadable".into()));
+}
+
+#[test]
 fn cli_sources_cover_version_managers_and_keep_script_launchers_explicit() {
     let f = Fixture::new();
     let mut inputs = f.inputs();

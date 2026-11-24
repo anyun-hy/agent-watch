@@ -514,6 +514,8 @@ impl SampleRequests {
     }
 }
 
+const MAX_CONSECUTIVE_RESPONSE_TIMEOUTS: u32 = 3;
+
 pub struct ListenerStream {
     requests: Mutex<Option<SampleRequests>>,
     notifications: Arc<claude_watch_system::network_events::LocalNotifications>,
@@ -524,6 +526,7 @@ pub struct ListenerStream {
     revision: Arc<AtomicU64>,
     last_failure: Mutex<ListenerFailures>,
     published_revision: Mutex<Option<u64>>,
+    consecutive_timeouts: std::sync::atomic::AtomicU32,
     finished: Arc<AtomicBool>,
 }
 impl ListenerStream {
@@ -542,6 +545,7 @@ impl ListenerStream {
             requests: Mutex::default(), root, worker, supervisor, state: Arc::new((Mutex::new(None), Condvar::new())),
             revision: Arc::new(AtomicU64::new(0)), notifications: Arc::default(),
             published_revision: Mutex::new(None), last_failure: Mutex::default(),
+            consecutive_timeouts: std::sync::atomic::AtomicU32::new(0),
             finished: Arc::new(AtomicBool::new(false)),
         });
         let input = stream.clone();
@@ -609,23 +613,29 @@ impl ListenerStream {
     }
 
     fn pending_sample_deadline_at(&self, now: Instant) -> Result<Option<Instant>> {
-        let slot = self.requests.lock().map_err(|_| invalid())?;
+        let mut slot = self.requests.lock().map_err(|_| invalid())?;
         let Some(active) = slot.as_ref() else { return Ok(None); };
         let Some((_, deadline)) = active.outstanding else { return Ok(None); };
         if now < deadline { return Ok(Some(deadline)); }
+        let active = slot.take().expect("checked active request");
         let timeout = error("native_listener_response_timeout", "原生采集器在采样期限内未回复");
-        if !self.finished.swap(true, Ordering::AcqRel) {
-            self.record(Err(timeout.clone()));
-            let _ = active.writer.shutdown(std::net::Shutdown::Both);
+        let streak = self
+            .consecutive_timeouts
+            .fetch_add(1, Ordering::AcqRel)
+            .saturating_add(1);
+        if streak >= MAX_CONSECUTIVE_RESPONSE_TIMEOUTS {
+            self.finished.store(true, Ordering::Release);
         }
+        self.record(Err(timeout.clone()));
+        let _ = active.writer.shutdown(std::net::Shutdown::Both);
         Err(timeout)
     }
 
     fn read_generation(&self, connection: UnixStream, collector: &Identity) {
         let mut reader = BufReader::new(connection);
         let result = self.read_requested_frames(&mut reader, collector);
-        self.requests.lock().unwrap_or_else(|e| e.into_inner()).take();
-        if !self.is_finished() {
+        let was_active = self.requests.lock().unwrap_or_else(|e| e.into_inner()).take().is_some();
+        if was_active && !self.is_finished() {
             if let Err(e) = result { self.record(Err(e)); }
         }
     }
@@ -656,6 +666,9 @@ impl ListenerStream {
             let expected = self.revision.load(Ordering::Acquire) + 1;
             if self.is_finished() || active.outstanding.take().map(|(revision, _)| revision) != Some(expected) {
                 return Err(invalid());
+            }
+            if sample.is_ok() {
+                self.consecutive_timeouts.store(0, Ordering::Release);
             }
             self.record(sample);
             if std::mem::take(&mut active.follow_up) { active.send(expected + 1)?; }
@@ -1047,6 +1060,7 @@ mod tests {
             supervisor: identity(100, 1, 501, "/bin/zsh".into()),
             state: Arc::new((Mutex::new(None), Condvar::new())),
             revision: Arc::new(AtomicU64::new(0)), published_revision: Mutex::new(None),
+            consecutive_timeouts: std::sync::atomic::AtomicU32::new(0),
             finished: Arc::new(AtomicBool::new(false)),
         };
         let started = std::time::Instant::now();
@@ -1085,7 +1099,9 @@ mod tests {
             let source = Arc::new(Source { proof:proof.clone(),job_pid:100,changed:false,extra_supervisor_argument:false });
             let stream = Arc::new(ListenerStream { requests: Mutex::default(), last_failure: Mutex::default(), notifications: Arc::default(), root,worker:proof.worker,supervisor:proof.supervisor,
                 state:Arc::new((Mutex::new(None),Condvar::new())),revision:Arc::new(AtomicU64::new(0)),
-                published_revision:Mutex::new(None),finished:Arc::new(AtomicBool::new(false)) });
+                published_revision:Mutex::new(None),
+                consecutive_timeouts: std::sync::atomic::AtomicU32::new(0),
+                finished:Arc::new(AtomicBool::new(false)) });
             let fixture = Self { home,store,stream,source };
             fixture.frame(1);
             fixture
@@ -1233,10 +1249,49 @@ mod tests {
         assert_eq!(stream.pending_sample_deadline_at(due).unwrap_err().code, "native_listener_response_timeout");
         assert_eq!(peer.read(&mut request).unwrap(), 0);
         worker.join().unwrap();
-        assert!(stream.is_finished());
+        // A single transient timeout fails closed immediately and disconnects the stalled
+        // collector, but keeps the daemon alive so the collector supervisor can reconnect
+        // without changing executor_boot_id and breaking running sandboxed apps.
+        assert!(!stream.is_finished());
         assert_eq!(stream.failure_since(2).unwrap().1.code, "native_listener_response_timeout");
         assert_eq!(stream.latest_with_timeout(Duration::ZERO).err().unwrap().code, "native_listener_response_timeout");
-        assert!(stream.request_sample().is_err());
+        assert_eq!(stream.request_sample().err().unwrap().code, "native_listener_pending");
+
+        // A replacement collector generation recovers cleanly and resets the timeout streak.
+        let replacement_collector = fixture.source.proof.collector.clone();
+        let (mut peer2, input2) = UnixStream::pair().unwrap();
+        peer2.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let stream2 = fixture.stream.clone();
+        let worker2 = thread::spawn(move || stream2.read_generation(input2, &replacement_collector));
+        peer2.read_exact(&mut request).unwrap();
+        assert_eq!(request, *b"S");
+        peer2.write_all(&encoded(&raw())).unwrap();
+        assert_eq!(stream.wait_for_revision(3, Duration::from_secs(2)).unwrap(), 4);
+        assert_eq!(stream.latest_with_timeout(Duration::ZERO).unwrap().sequence, 1);
+        drop(peer2);
+        worker2.join().unwrap();
+
+        // Repeated consecutive timeouts (MAX_CONSECUTIVE_RESPONSE_TIMEOUTS) with no valid
+        // frame eventually mark the stream finished so launchd can restart the daemon.
+        for attempt in 1..=MAX_CONSECUTIVE_RESPONSE_TIMEOUTS {
+            let c = fixture.source.proof.collector.clone();
+            let (mut p, inp) = UnixStream::pair().unwrap();
+            p.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            let s = fixture.stream.clone();
+            let w = thread::spawn(move || s.read_generation(inp, &c));
+            p.read_exact(&mut request).unwrap();
+            assert_eq!(request, *b"S");
+            let d = stream.pending_sample_deadline().unwrap().unwrap();
+            assert_eq!(stream.pending_sample_deadline_at(d).unwrap_err().code, "native_listener_response_timeout");
+            assert_eq!(p.read(&mut request).unwrap(), 0);
+            w.join().unwrap();
+            if attempt < MAX_CONSECUTIVE_RESPONSE_TIMEOUTS {
+                assert!(!stream.is_finished(), "attempt {attempt} must remain recoverable");
+            } else {
+                assert!(stream.is_finished(), "persistent timeout streak must finish stream");
+                assert_eq!(stream.request_sample().err().unwrap().code, "native_listener_worker_failed");
+            }
+        }
     }
 
     #[test]
@@ -1466,7 +1521,9 @@ mod tests {
         let captured_at = frame.finished;
         let stream = ListenerStream { requests: Mutex::default(), last_failure: Mutex::default(), notifications: Arc::default(), root: root.clone(), supervisor: p.supervisor.clone(), worker: p.worker.clone(),
             state: Arc::new((Mutex::new(Some(Ok(frame))), Condvar::new())), revision: Arc::new(AtomicU64::new(1)),
-            published_revision: Mutex::new(None), finished: Arc::new(AtomicBool::new(false)) };
+            published_revision: Mutex::new(None),
+            consecutive_timeouts: std::sync::atomic::AtomicU32::new(0),
+            finished: Arc::new(AtomicBool::new(false)) };
         let counted = Counted { source: &r, calls: std::cell::RefCell::new(Vec::new()) };
         for _ in 0..2 {
             let out = stream.read_with_timeout(&counted, Duration::from_secs(1)).unwrap();

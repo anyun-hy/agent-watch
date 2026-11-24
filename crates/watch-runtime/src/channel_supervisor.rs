@@ -48,6 +48,19 @@ pub const DEFAULT_ASYNC_AUDIT_TIMEOUT_SECONDS: f64 = 30.0;
 /// Proactive renewal lead time before a `Permitted` lease reaches its safety-net
 /// expiry so healthy flows renew seamlessly instead of hitting `permit_lease_expired`.
 pub const PERMIT_RENEWAL_LEAD_SECONDS: f64 = 15.0;
+
+/// Compute the timer wakeup instant for proactive `Permitted` renewal:
+/// 15s before expiry for normal (>=30s) leases, or halfway through compact
+/// (<30s) leases so short leases never schedule a zero-delay timer loop.
+pub fn permit_renewal_wakeup(issued_at: f64, valid_until: f64) -> Option<f64> {
+    if !issued_at.is_finite() || !valid_until.is_finite() || valid_until <= issued_at {
+        return None;
+    }
+    let half = issued_at + (valid_until - issued_at) / 2.0;
+    let lead = valid_until - PERMIT_RENEWAL_LEAD_SECONDS;
+    let renew_at = half.max(lead);
+    (renew_at < valid_until).then_some(renew_at)
+}
 /// Failures before the display transitions from pending to revoked; recovery
 /// continues on a bounded schedule after this threshold.
 pub const MAX_ASYNC_AUDIT_RETRIES: u32 = 3;
@@ -119,6 +132,16 @@ mod logging_tests {
         let supervisor = ChannelSupervisor::new_with_config(storage, Config::default_for_new_install(), None,
             Some(enforcer.clone()), None).unwrap();
         (supervisor, enforcer)
+    }
+
+    #[test]
+    fn permit_renewal_wakeup_avoids_early_half_life_churn_on_normal_leases_and_preserves_short_leases() {
+        assert_eq!(permit_renewal_wakeup(1000.0, 1045.0), Some(1030.0));
+        assert_eq!(permit_renewal_wakeup(1000.0, 1030.0), Some(1015.0));
+        assert_eq!(permit_renewal_wakeup(1000.0, 1010.0), Some(1005.0));
+        assert_eq!(permit_renewal_wakeup(1000.0, 1003.5), Some(1001.75));
+        assert_eq!(permit_renewal_wakeup(1000.0, 1000.0), None);
+        assert_eq!(permit_renewal_wakeup(1000.0, 995.0), None);
     }
 
     #[test]
@@ -1888,9 +1911,7 @@ impl ChannelSupervisor {
                         .and_then(|track| track.current_permit.as_ref())
                         .is_some_and(|p| {
                             p.state == ChannelPermitState::Permitted
-                                && (now >= p.valid_until
-                                    || p.valid_until - now <= PERMIT_RENEWAL_LEAD_SECONDS
-                                    || p.valid_until - now <= (p.valid_until - p.issued_at) / 2.0)
+                                && (now >= p.valid_until || p.valid_until - now <= PERMIT_RENEWAL_LEAD_SECONDS)
                         });
                     if vpn_stale_at_deadline || permit_renewal_due || (recovery_due && !woke_from_sleep) {
                         self.evaluate_family(&family, now)?;
@@ -2943,8 +2964,7 @@ impl ChannelSupervisor {
                     && now >= p.issued_at && (p.state != ChannelPermitState::Permitted
                         || (now < p.valid_until && p.valid_until <= valid_until
                             && (p.valid_until == valid_until
-                                || (p.valid_until - now > (p.valid_until - p.issued_at) / 2.0
-                                    && p.valid_until - now > PERMIT_RENEWAL_LEAD_SECONDS))))
+                                || p.valid_until - now > PERMIT_RENEWAL_LEAD_SECONDS)))
             })
         }) { return Ok(()); }
 
@@ -3069,15 +3089,8 @@ impl ChannelSupervisor {
         for track in self.tracks.values() {
             if let Some(permit) = &track.current_permit {
                 consider(permit.valid_until);
-                if permit.state == ChannelPermitState::Permitted
-                    && permit.valid_until.is_finite()
-                    && permit.issued_at.is_finite()
-                    && permit.valid_until > permit.issued_at
-                {
-                    let half = permit.issued_at + (permit.valid_until - permit.issued_at) / 2.0;
-                    let lead = permit.valid_until - PERMIT_RENEWAL_LEAD_SECONDS;
-                    let renew_at = half.max(lead);
-                    if renew_at < permit.valid_until {
+                if permit.state == ChannelPermitState::Permitted {
+                    if let Some(renew_at) = permit_renewal_wakeup(permit.issued_at, permit.valid_until) {
                         consider(renew_at);
                     }
                 }

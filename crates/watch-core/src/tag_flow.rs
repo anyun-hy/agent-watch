@@ -519,6 +519,17 @@ pub fn destination_evidence(metadata: &Value) -> Value {
     };
     json!([address, port, "public", country])
 }
+#[derive(Clone, Debug, PartialEq)]
+pub struct ControlledGatewayHop {
+    pub client_pid: u32,
+    pub client_local: (String, u16),
+    pub gateway_listen: (String, u16),
+    pub gateway_pid: u32,
+    pub gateway_start: Option<f64>,
+    pub upstream_local: (String, u16),
+    pub upstream_peer: (String, u16),
+    pub target_destination: Option<String>,
+}
 pub struct CorrelationInput<'a> {
     pub flow: &'a Flow,
     pub stamp: &'a str,
@@ -530,6 +541,8 @@ pub struct CorrelationInput<'a> {
     pub now: f64,
     pub fakeip_evidence: &'a Value,
     pub interface: Option<&'a str>,
+    pub gateway_port: Option<u16>,
+    pub gateway_hop: Option<&'a ControlledGatewayHop>,
 }
 pub fn correlate(input: CorrelationInput<'_>) -> Value {
     let CorrelationInput {
@@ -543,47 +556,103 @@ pub fn correlate(input: CorrelationInput<'_>) -> Value {
         now,
         fakeip_evidence,
         interface,
+        gateway_port,
+        gateway_hop,
     } = input;
     let mut result = json!(flow);
     result["association"] = json!("unconfirmed");
     result["policy"] = json!("unconfirmed");
     result["chains"] = json!([]);
-    let is_active_proxy_port = flow.peer.1 == 7890
-        || flow.peer.1 == 7897
-        || api.get("active_ports").and_then(Value::as_array).is_some_and(|ports| {
-            ports.iter().any(|p| p.as_u64() == Some(u64::from(flow.peer.1)))
-        });
-    let via_proxy = flow.peer.0 == "127.0.0.1" && is_active_proxy_port && flow.protocol == "tcp";
-    if flow.peer.0.parse::<IpAddr>().is_ok_and(|v| v.is_loopback()) && !via_proxy {
+    let is_active_proxy_port = |port: u16| {
+        port == 7890
+            || port == 7897
+            || api.get("active_ports").and_then(Value::as_array).is_some_and(|ports| {
+                ports.iter().any(|p| p.as_u64() == Some(u64::from(port)))
+            })
+    };
+    let via_controlled_gateway = flow.peer.0 == "127.0.0.1"
+        && flow.protocol == "tcp"
+        && gateway_port.is_some_and(|port| port != 0 && flow.peer.1 == port);
+    let via_proxy = !via_controlled_gateway
+        && flow.peer.0 == "127.0.0.1"
+        && is_active_proxy_port(flow.peer.1)
+        && flow.protocol == "tcp";
+    if flow.peer.0.parse::<IpAddr>().is_ok_and(|v| v.is_loopback())
+        && !via_proxy
+        && !via_controlled_gateway
+    {
         result["association"] = json!("local_service");
         result["policy"] = json!("not_applicable");
         result["reason"] = json!("其他本机服务连接，不视为代理绕过");
         return result;
     }
     let covers_proxy = truthy(&api["covers_proxy"]) || truthy(&api["covers_7890"]) || truthy(&api["covers_7897"]);
+    let verified_hop = if via_controlled_gateway {
+        result["path"] = json!("controlled_gateway");
+        let Some(hop) = gateway_hop.filter(|hop| {
+            hop.client_pid == flow.pid
+                && hop.client_local == flow.local
+                && hop.gateway_listen == flow.peer
+                && hop.upstream_peer.0 == "127.0.0.1"
+                && is_active_proxy_port(hop.upstream_peer.1)
+        }) else {
+            result["reason"] =
+                json!("受控网关转发记录尚未建立、已结束或上游未指向已核验代理入口，未关联代理链");
+            return result;
+        };
+        if api["state"] != "available" || !covers_proxy {
+            result["reason"] = json!(format!(
+                "控制接口不可用或属于另一内核，不能把受控网关 {} 连接与外层代理链强行对应",
+                flow.peer.1
+            ));
+            return result;
+        }
+        result["gateway_upstream"] =
+            json!(format!("{}:{}", hop.upstream_peer.0, hop.upstream_peer.1));
+        Some(hop)
+    } else {
+        None
+    };
     if via_proxy && (api["state"] != "available" || !covers_proxy) {
         result["reason"] =
             json!(format!("控制接口不可用或属于另一内核，不能把 {} 连接与外层 TUN 链强行对应", flow.peer.1));
         return result;
     }
-    if !via_proxy {
+    let match_via_proxy = via_proxy || verified_hop.is_some();
+    if !match_via_proxy {
         result["interface"] = json!(interface.unwrap_or("unavailable"));
     }
+    let hop2_flow = verified_hop.map(|hop| Flow {
+        pid: hop.gateway_pid,
+        protocol: "tcp".into(),
+        local: hop.upstream_local.clone(),
+        peer: hop.upstream_peer.clone(),
+    });
+    let match_flow = hop2_flow.as_ref().unwrap_or(flow);
+    let match_start = verified_hop.map_or(process_start, |hop| hop.gateway_start);
     let mut candidates = Vec::new();
     let mut unproven = false;
     for record in records {
-        if !source_candidate(record, flow, process_start, now) {
+        if !source_candidate(record, match_flow, match_start, now) {
             continue;
         }
         let metadata = &record["metadata"];
-        if via_proxy {
-            if !["http", "https", "socks", "socks5"]
+        if match_via_proxy {
+            if !["http", "https", "http connect", "mixed", "socks", "socks5"]
                 .contains(&text(metadata, "type").to_lowercase().as_str())
             {
                 continue;
             }
-            if truthy(&metadata["inboundPort"]) && ![Some(7890), Some(7897)].contains(&integer(&metadata["inboundPort"])) {
-                continue;
+            if truthy(&metadata["inboundPort"]) {
+                let inbound = integer(&metadata["inboundPort"])
+                    .and_then(|port| u16::try_from(port).ok());
+                let port_ok = inbound.is_some_and(|port| {
+                    is_active_proxy_port(port)
+                        && verified_hop.is_none_or(|hop| port == hop.upstream_peer.1)
+                });
+                if !port_ok {
+                    continue;
+                }
             }
             if truthy(&metadata["inboundIP"])
                 && !text(metadata, "inboundIP")
@@ -671,7 +740,9 @@ pub fn correlate(input: CorrelationInput<'_>) -> Value {
     result["rule"] = record.get("rule").cloned().unwrap_or(json!(""));
     result["rule_payload"] = record.get("rulePayload").cloned().unwrap_or(json!(""));
     result["connection_id"] = record["id"].clone();
-    result["path"] = if via_proxy {
+    result["path"] = if via_controlled_gateway {
+        json!("controlled_gateway")
+    } else if via_proxy {
         json!("local_proxy")
     } else {
         metadata.get("type").cloned().unwrap_or(json!("unknown"))
@@ -715,7 +786,7 @@ pub fn correlate(input: CorrelationInput<'_>) -> Value {
     result["policy"] = json!(decision.state.as_str());
     let mut reason = decision.reason.detail().to_owned();
     let proof = &fakeip_evidence[text(record, "id")];
-    if !via_proxy && fakeip_destination_matches(proof, record, flow, stamp, now) {
+    if !match_via_proxy && fakeip_destination_matches(proof, record, flow, stamp, now) {
         result["association_evidence"] = proof.clone();
         reason += "；同一 TAG 内核 DNS 映射与本机 fake-IP 已核对";
         if destination[2] != "public" {

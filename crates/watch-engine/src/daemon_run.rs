@@ -346,6 +346,7 @@ mod m5_tests {
             let now=native::now();let mut value=json!({"schema":1,"status":"ok","uid":self.identity.uid,"started_at":now,"finished_at":now});
             match command {
                 ReadCommand::Plist(path)=>return self.metadata.run(ReadCommand::Plist(path),input,timeout,limit),
+                ReadCommand::PlistXml(path)=>return self.metadata.run(ReadCommand::PlistXml(path),input,timeout,limit),
                 ReadCommand::Observer(ObserverAction::Inventory)=>{
                     let mut row=json!(self.identity);row["bundle_path"]=json!(self.bundle);row["bundle_id"]=Value::Null;
                     value["state"]=json!("ok");value["truncated"]=json!(false);value["requested_count"]=json!(1);
@@ -1568,6 +1569,8 @@ impl DiscoveryWorker {
             let mut watcher = NetworkEventWatcher::new(&[]);
             let mut inputs = worker_handle.background_watch_paths();
             watcher.set_watched_files(inputs.clone());
+            let mut last_incomplete_revision: Option<String> = None;
+            let mut incomplete_streak: u32 = 0;
             while !cancelled.load(Ordering::Acquire) {
                 let started = Instant::now();
                 let snapshot = worker_handle.refresh(&runner, native::now());
@@ -1577,9 +1580,25 @@ impl DiscoveryWorker {
                     inputs = updated;
                 }
                 let maximum_age = if snapshot.complete {
+                    last_incomplete_revision = None;
+                    incomplete_streak = 0;
                     claude_watch_runtime::target_discovery::APPLICATION_REGISTRY_MAX_AGE
-                } else { PROCESS_INTERVAL };
-                let (_, ready) = watcher.wait_with_readers(maximum_age.saturating_sub(started.elapsed()), &[requests.as_fd()]);
+                } else {
+                    if last_incomplete_revision.as_deref() == Some(snapshot.revision.as_str()) {
+                        incomplete_streak = incomplete_streak.saturating_add(1).min(4);
+                    } else {
+                        last_incomplete_revision = Some(snapshot.revision.clone());
+                        incomplete_streak = 0;
+                    }
+                    PROCESS_INTERVAL
+                        .saturating_mul(1u32 << incomplete_streak)
+                        .min(claude_watch_runtime::target_discovery::APPLICATION_REGISTRY_MAX_AGE)
+                };
+                let (events, ready) = watcher.wait_with_readers(maximum_age.saturating_sub(started.elapsed()), &[requests.as_fd()]);
+                if events.iter().any(|event| !matches!(event, NetworkEventKind::Timeout)) || ready.is_some() {
+                    last_incomplete_revision = None;
+                    incomplete_streak = 0;
+                }
                 if ready.is_some() {
                     let mut bytes = [0; 1024];
                     while let Ok(n) = requests.read(&mut bytes) {

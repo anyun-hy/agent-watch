@@ -732,8 +732,46 @@ impl<R: ReadRunner> Sampler<R> {
         let mut correlated = 0u64;
         let mut unknown = 0u64;
         let mut flows = Vec::new();
+        let (gateway_port, gateway_hops) =
+            if let Some(enforcer) = crate::channel_enforcer::registered_production_enforcer(&self.paths.watch()) {
+                use crate::channel_enforcer::ChannelEnforcer;
+                let port = enforcer.local_proxy_port();
+                let self_pid = std::process::id();
+                let self_start = native_processes
+                    .get(&self_pid)
+                    .and_then(|row| {
+                        let secs = row["start_seconds"].as_u64()?;
+                        let micros = row["start_microseconds"].as_u64().unwrap_or(0);
+                        Some(secs as f64 + (micros as f64) / 1_000_000.0)
+                    })
+                    .or_else(|| {
+                        self.runner.process_identity(self_pid).map(|id| {
+                            id.start_seconds as f64 + (id.start_microseconds as f64) / 1_000_000.0
+                        })
+                    });
+                let map: BTreeMap<(u32, (String, u16), (String, u16)), tag_flow::ControlledGatewayHop> =
+                    enforcer
+                        .active_gateway_hops(self_pid, self_start)
+                        .into_iter()
+                        .map(|hop| {
+                            (
+                                (hop.client_pid, hop.client_local.clone(), hop.gateway_listen.clone()),
+                                hop,
+                            )
+                        })
+                        .collect();
+                (port, map)
+            } else {
+                (None, BTreeMap::new())
+            };
         for sample in &sockets.flows {
             let interface = source.route_interface(&sample.flow.peer.0).ok();
+            let hop_key = (
+                sample.flow.pid,
+                sample.flow.local.clone(),
+                sample.flow.peer.clone(),
+            );
+            let gateway_hop = gateway_hops.get(&hop_key);
             let flow = tag_flow::correlate(CorrelationInput {
                 flow: &sample.flow,
                 stamp: &sample.stamp,
@@ -745,6 +783,8 @@ impl<R: ReadRunner> Sampler<R> {
                 now: native::now(),
                 fakeip_evidence: &mapping.proofs,
                 interface: interface.as_deref(),
+                gateway_port,
+                gateway_hop,
             });
             if flow["association"] == "correlated" {
                 correlated += 1

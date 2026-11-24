@@ -39,6 +39,7 @@ pub enum ReadCommand {
     ProcessTablePids { pids: Vec<u32> },
     Interfaces,
     Plist(PathBuf),
+    PlistXml(PathBuf),
     Listeners,
     LsofListener,
     /// Read the owner of one caller-selected TCP listening port, never mutate it.
@@ -129,7 +130,7 @@ impl ReadCommand {
             Self::Observer(action) => Key::Observer(*action),
             Self::ProcessTable | Self::ProcessTablePids { .. } => Key::ProcessTable,
             Self::Interfaces => Key::Interfaces,
-            Self::Plist(_) => Key::Plist,
+            Self::Plist(_) | Self::PlistXml(_) => Key::Plist,
             Self::Listeners => Key::Listeners,
             Self::LsofListener => Key::LsofListener,
             Self::LsofTcpListener { .. } => Key::LsofListener,
@@ -182,6 +183,22 @@ impl ReadCommand {
                     vec![
                         "-convert".into(),
                         "json".into(),
+                        "-o".into(),
+                        "-".into(),
+                        "--".into(),
+                        path.as_os_str().into(),
+                    ],
+                )
+            }
+            Self::PlistXml(path) => {
+                if !path.is_absolute() || path.extension().is_none_or(|v| v != "plist") {
+                    return Err(CoreError::new("invalid_plist_path", "系统定义文件路径无效"));
+                }
+                (
+                    "/usr/bin/plutil".into(),
+                    vec![
+                        "-convert".into(),
+                        "xml1".into(),
                         "-o".into(),
                         "-".into(),
                         "--".into(),

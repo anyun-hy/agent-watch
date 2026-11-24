@@ -283,6 +283,7 @@ fn disk_redir_host_requires_live_same_core_mapping_and_unchanged_identities() {
         process_start: good["process_start"].as_f64(), api: &good["api"],
         records: good["records"].as_array().unwrap(), group: "AI", expected_node: "JP11",
         now: NOW, fakeip_evidence: &result.proofs, interface: Some("utun4"),
+        gateway_port: None, gateway_hop: None,
     });
     assert_eq!(correlated["association"], "correlated");
     assert_eq!(correlated["host"], "claude.ai");

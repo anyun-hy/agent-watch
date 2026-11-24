@@ -43,6 +43,8 @@ fn correlate(c: &Value) -> Value {
         now: c["now"].as_f64().unwrap(),
         fakeip_evidence: &c["proofs"],
         interface: c["interface"].as_str(),
+        gateway_port: None,
+        gateway_hop: None,
     })
 }
 #[test]
@@ -735,4 +737,118 @@ fn global_selection_outputs_match_the_python_reference() {
             "第 {index} 组 direct_groups 与 Python 参考不一致"
         );
     }
+}
+
+#[test]
+fn controlled_gateway_two_hop_correlation_preserves_client_identity_and_fails_closed() {
+    let client_flow = Flow {
+        pid: 65390,
+        protocol: "tcp".into(),
+        local: ("127.0.0.1".into(), 50213),
+        peer: ("127.0.0.1".into(), 1023),
+    };
+    let api = json!({
+        "state": "available",
+        "mode": "rule",
+        "covers_7890": true,
+        "active_ports": [7890],
+        "selected_node": "JP11",
+        "global_node": "JP09",
+        "route_chains": {"AI": ["JP11", "AI"], "GLOBAL": ["JP09", "GLOBAL"]}
+    });
+    let hop = tag_flow::ControlledGatewayHop {
+        client_pid: 65390,
+        client_local: ("127.0.0.1".into(), 50213),
+        gateway_listen: ("127.0.0.1".into(), 1023),
+        gateway_pid: 28704,
+        gateway_start: Some(NOW - 60.0),
+        upstream_local: ("127.0.0.1".into(), 54120),
+        upstream_peer: ("127.0.0.1".into(), 7890),
+        target_destination: Some("chatgpt.com:443".into()),
+    };
+    let records = vec![json!({
+        "id": "conn-gw-1",
+        "start": "2023-11-14T22:13:15Z",
+        "metadata": {
+            "sourceIP": "127.0.0.1",
+            "sourcePort": "54120",
+            "processID": 28704,
+            "network": "tcp",
+            "inboundIP": "127.0.0.1",
+            "inboundPort": "7890",
+            "destinationIP": "104.18.32.47",
+            "destinationPort": "443",
+            "destinationGeoIP": "us",
+            "type": "HTTP Connect",
+            "host": "chatgpt.com"
+        },
+        "chains": ["JP11", "AI"],
+        "rule": "DomainSuffix",
+        "rulePayload": "chatgpt.com"
+    })];
+    let matched = tag_flow::correlate(CorrelationInput {
+        flow: &client_flow,
+        stamp: "Tue Nov 14 22:12:50 2023",
+        process_start: Some(NOW - 30.0),
+        api: &api,
+        records: &records,
+        group: "AI",
+        expected_node: "JP11",
+        now: NOW,
+        fakeip_evidence: &json!({}),
+        interface: None,
+        gateway_port: Some(1023),
+        gateway_hop: Some(&hop),
+    });
+    assert_eq!(matched["pid"], 65390);
+    assert_eq!(matched["local"], json!(["127.0.0.1", 50213]));
+    assert_eq!(matched["peer"], json!(["127.0.0.1", 1023]));
+    assert_eq!(matched["association"], "correlated");
+    assert_eq!(matched["policy"], "match");
+    assert_eq!(matched["path"], "controlled_gateway");
+    assert_eq!(matched["flow_kind"], "core_platform");
+    assert_eq!(matched["host"], "chatgpt.com");
+    assert_eq!(matched["chains"], json!(["JP11", "AI"]));
+    assert_eq!(matched["destination_ip"], "104.18.32.47");
+    assert_eq!(matched["gateway_upstream"], "127.0.0.1:7890");
+
+    // Missing hop mapping for a gateway-destined flow must fail closed as unconfirmed,
+    // never downgraded to local_service and never forged as correlated.
+    let missing_hop = tag_flow::correlate(CorrelationInput {
+        flow: &client_flow,
+        stamp: "Tue Nov 14 22:12:50 2023",
+        process_start: Some(NOW - 30.0),
+        api: &api,
+        records: &records,
+        group: "AI",
+        expected_node: "JP11",
+        now: NOW,
+        fakeip_evidence: &json!({}),
+        interface: None,
+        gateway_port: Some(1023),
+        gateway_hop: None,
+    });
+    assert_eq!(missing_hop["association"], "unconfirmed");
+    assert_eq!(missing_hop["policy"], "unconfirmed");
+    assert_eq!(missing_hop["path"], "controlled_gateway");
+
+    // Mismatched client PID in hop must also fail closed.
+    let mut wrong_client = hop.clone();
+    wrong_client.client_pid = 99999;
+    let rejected = tag_flow::correlate(CorrelationInput {
+        flow: &client_flow,
+        stamp: "Tue Nov 14 22:12:50 2023",
+        process_start: Some(NOW - 30.0),
+        api: &api,
+        records: &records,
+        group: "AI",
+        expected_node: "JP11",
+        now: NOW,
+        fakeip_evidence: &json!({}),
+        interface: None,
+        gateway_port: Some(1023),
+        gateway_hop: Some(&wrong_client),
+    });
+    assert_eq!(rejected["association"], "unconfirmed");
+    assert_eq!(rejected["policy"], "unconfirmed");
 }

@@ -163,10 +163,13 @@ struct ConnectionGraphProjection: Sendable {
         let normalizedRoute = selected?.routePath?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         let explicitLocalProxy = normalizedRoute == "local_proxy"
         let peerIsGateway = selected.map { Self.isGatewayPeer($0.peer, endpoint: endpoint) } ?? false
-        // The backend emits either the exact local_proxy path or TAG metadata.type Tun.
+        let explicitControlledGateway = normalizedRoute == "controlled_gateway"
+            && selected.map { Self.isLoopbackPeer($0.peer) } == true
+        // The backend emits either the exact local_proxy path, controlled_gateway, or TAG metadata.type Tun.
         // A route label resembling "tun" and a loopback proxy peer are not TUN evidence.
         let explicitTun = normalizedRoute == "tun" && selected.map { !Self.isLoopbackPeer($0.peer) } == true
         let validLocalProxy = explicitLocalProxy && peerIsGateway
+        let validProxyRoute = validLocalProxy || explicitControlledGateway
         let isLocalService = selected?.association == "local_service"
         if selected == nil {
             routePresentation = "idle"
@@ -174,7 +177,7 @@ struct ConnectionGraphProjection: Sendable {
             routePresentation = "localService"
         } else if explicitTun {
             routePresentation = "tun"
-        } else if validLocalProxy || peerIsGateway {
+        } else if validProxyRoute || peerIsGateway {
             routePresentation = "proxy"
         } else {
             routePresentation = "unresolved"
@@ -201,6 +204,14 @@ struct ConnectionGraphProjection: Sendable {
             gatewayState = .pending
             gatewayDetail = "尚无当前关联路径；没有从配置中推断 HTTP 代理或 TUN 接入。"
             pathState = .pending
+        } else if explicitControlledGateway {
+            gatewayTitle = "受控访问网关"
+            gatewayEndpoint = selected?.peer.nonEmpty ?? endpoint
+            gatewayState = fresh && entryVerified ? .confirmed : .pending
+            gatewayDetail = entryAvailable
+                ? "受控访问网关两跳转发与代理覆盖已核对（上游 \(endpoint)）"
+                : (proxy?.entryReason.nonEmpty ?? "等待受控网关与本机代理入口核对")
+            pathState = entryAvailable ? observedFlowState : .pending
         } else if selected == nil || peerIsGateway {
             gatewayTitle = "7890 本机入口"
             gatewayEndpoint = endpoint
@@ -233,22 +244,22 @@ struct ConnectionGraphProjection: Sendable {
 
         let host = selected?.host.nonEmpty
         let hostIsGateway = host.map { Self.isGatewayPeer($0, endpoint: endpoint) } ?? false
-        let hasTarget = host != nil && !hostIsGateway
+        let hostIsControlledGateway = explicitControlledGateway && host.map { Self.isLoopbackPeer($0) } == true
+        let hasTarget = host != nil && !hostIsGateway && !hostIsControlledGateway
         serviceTitle = hasTarget ? host! : "目标服务待确认"
-        serviceEndpoint = hasTarget && !peerIsGateway
-            ? (selected?.peer.nonEmpty ?? "目标 IP 待确认")
+        let publicDestinationIP = selected?.destinationIPState == "public" ? selected?.destinationIP?.nonEmpty : nil
+        serviceEndpoint = hasTarget
+            ? (publicDestinationIP ?? (!(peerIsGateway || explicitControlledGateway) ? selected?.peer.nonEmpty : nil) ?? "目标 IP 待确认")
             : "目标 IP 待确认"
 
         sourceEdgeState = selected == nil || sourceUnresolved ? .pending : pathState
-        if explicitTun {
-            gatewayEdgeState = pathState
-        } else if validLocalProxy {
+        if explicitTun || validProxyRoute {
             gatewayEdgeState = pathState
         } else {
             gatewayEdgeState = .pending
         }
-        nodeEdgeState = (actualNode != nil && (explicitTun || validLocalProxy)) ? pathState : .pending
-        targetEdgeState = hasTarget && (explicitTun || validLocalProxy) ? pathState : .pending
+        nodeEdgeState = (actualNode != nil && (explicitTun || validProxyRoute)) ? pathState : .pending
+        targetEdgeState = hasTarget && (explicitTun || validProxyRoute) ? pathState : .pending
 
         if !fresh {
             summary = proxy == nil ? "尚无有效网络快照，等待后台更新。" : "路径来自保存的完整样本，仅供回看，不表示连接仍存在。"
@@ -266,6 +277,8 @@ struct ConnectionGraphProjection: Sendable {
             }
         } else if correlatedMismatch && pathState == .mismatch {
             summary = "该连接与预期路径不一致，需要核对实际代理链。"
+        } else if explicitControlledGateway && correlatedMatch && entryAvailable {
+            summary = "已确认此样本经受控访问网关进入代理；节点和目标以本次采样为准。"
         } else if validLocalProxy && correlatedMatch && entryAvailable {
             summary = "已确认此样本经 7890 入口；节点和目标以本次采样为准。"
         } else if explicitTun {

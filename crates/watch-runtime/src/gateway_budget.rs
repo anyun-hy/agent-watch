@@ -37,7 +37,7 @@ pub(crate) struct Limits {
 }
 impl Default for Limits {
     fn default() -> Self {
-        Self { connections: 64, unattributed: 16, lookups: 8, flows: 64, per_source: 16,
+        Self { connections: 256, unattributed: 64, lookups: 32, flows: 256, per_source: 96,
             bytes: 64 * 1024 * 1024, bytes_per_source: 32 * 1024 * 1024 }
     }
 }
@@ -224,5 +224,22 @@ mod tests {
         drop(second);
         assert_eq!(budget.connections_in_use(), 0);
         assert!(budget.used.lock().unwrap().sources.is_empty());
+    }
+
+    #[test]
+    fn default_gateway_budget_accommodates_chromium_multi_stream_burst_while_remaining_bounded() {
+        let budget = Arc::new(GatewayBudget::default());
+        let chromium = BoundProcessToken::with_system_identity(65390, 501, 100, 0, ProcessRole::DesktopHelper);
+        let lookups: Vec<_> = (0..16).map(|_| budget.lookup().expect("burst lookup slot")).collect();
+        assert_eq!(lookups.len(), 16);
+        let flows: Vec<_> = (0..32).map(|_| budget.flow(&chromium).expect("chromium flow slot")).collect();
+        assert_eq!(flows.len(), 32);
+        let more: Vec<_> = (32..96).map(|_| budget.flow(&chromium).expect("up to per_source limit")).collect();
+        assert_eq!(more.len(), 64);
+        assert!(budget.flow(&chromium).is_none(), "single source remains bounded at per_source=96");
+        drop(more);
+        drop(flows);
+        drop(lookups);
+        assert_eq!(budget.connections_in_use(), 0);
     }
 }

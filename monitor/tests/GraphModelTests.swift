@@ -43,6 +43,31 @@ struct GraphModelTests {
         expect(confirmed.nodeTitle == "日本节点", "chains already group to leaf")
         expect(confirmed.routePresentation == "proxy", "explicit local proxy presentation")
         expect(confirmed.supportsPathAnimation, "a fully evidenced proxy path can animate")
+
+        let controlledGatewayFlow = Flow(id: "gw1", pid: 44, host: "chatgpt.com", peer: "127.0.0.1:1023",
+                                         local: "127.0.0.1:50213", transport: "TCP", association: "correlated",
+                                         policy: "match", reason: "sample", chains: ["海外AI", "日本节点"],
+                                         routePath: "controlled_gateway", interfaceName: nil,
+                                         destinationIP: "104.18.32.47", destinationPort: 443,
+                                         destinationIPState: "public", destinationCountry: "US",
+                                         flowKind: "core_platform")
+        let controlledGraph = ConnectionGraphProjection(proxy: proxy([controlledGatewayFlow]), processes: [chatGPTProcess], selectedFlowID: "gw1", fresh: true)
+        expect(controlledGraph.routePresentation == "proxy", "controlled gateway renders as verified proxy route")
+        expect(controlledGraph.gatewayTitle == "受控访问网关", "controlled gateway title shown")
+        expect(controlledGraph.gatewayEndpoint == "127.0.0.1:1023", "controlled gateway endpoint shown")
+        expect(controlledGraph.gatewayEdgeState == .confirmed && controlledGraph.nodeEdgeState == .confirmed && controlledGraph.targetEdgeState == .confirmed,
+               "controlled gateway with verified TAG chain confirms all hops")
+        expect(controlledGraph.serviceEndpoint == "104.18.32.47", "controlled gateway displays public destination IP instead of loopback gateway")
+        expect(controlledGraph.supportsPathAnimation, "fully evidenced controlled gateway path animates")
+        let unconfirmedGateway = Flow(id: "gw2", pid: 44, host: "127.0.0.1:1023", peer: "127.0.0.1:1023",
+                                      local: "127.0.0.1:50214", transport: "TCP", association: "unconfirmed",
+                                      policy: "unconfirmed", reason: "missing hop", chains: [],
+                                      routePath: "controlled_gateway", interfaceName: nil)
+        let unconfirmedGatewayGraph = ConnectionGraphProjection(proxy: proxy([unconfirmedGateway]), processes: [chatGPTProcess], selectedFlowID: "gw2", fresh: true)
+        expect(unconfirmedGatewayGraph.gatewayEdgeState == .pending && !unconfirmedGatewayGraph.supportsPathAnimation,
+               "unconfirmed controlled gateway never animates or fabricates a target")
+        expect(unconfirmedGatewayGraph.serviceTitle == "目标服务待确认" && unconfirmedGatewayGraph.serviceEndpoint == "目标 IP 待确认",
+               "loopback controlled gateway peer is never shown as target host or IP")
         expect(codexProcess.product == .openAI && codexProcess.sourceRole == .cli, "codex cli belongs to unified page with CLI source")
         let managedProcess = WatchedProcess(id: "managed", pid: 52, started: "now", kind: "codex-cli", authorized: nil,
                                             runtimeRole: "codex_managed", serviceName: "Codex 托管后台", roleEvidence: "managed_app_server")

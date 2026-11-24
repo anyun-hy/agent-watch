@@ -313,7 +313,10 @@ struct ConnectionGraphView: View {
         let tint: Color
         if let channelState = store.channelState(for: selectedProduct) {
             let now = store.now.timeIntervalSince1970
-            let disposition = channelState.managedMemberCount > 0 || channelState.process_disposition_action == "force"
+            let showDisposition = channelState.scopedDisplayState == .blocked
+                || channelState.scopedDisplayState == .disconnecting
+                || ["close", "force"].contains(channelState.process_disposition_action ?? "")
+            let disposition = showDisposition && (channelState.managedMemberCount > 0 || channelState.process_disposition_action == "force")
                 ? "（\(channelState.processDispositionLabel(now: now))）" : ""
             let previous = channelState.previousProcessDispositionLabel(now: now).map { "\n\($0)" } ?? ""
             text = "\(channelState.protectionScopeLabel)\(disposition) · \(channelState.scopeSummary)\n\(channelState.gatewayCountsLabel)\(previous)"
