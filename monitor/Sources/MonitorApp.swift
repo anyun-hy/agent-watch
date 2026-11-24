@@ -147,7 +147,7 @@ struct MonitorView: View {
         VStack(spacing: 0) {
             VStack(alignment: .leading, spacing: 7) {
                 HStack(spacing: 8) {
-                    Image(systemName: "shield.lefthalf.filled").font(.system(size: 19)).foregroundStyle(p.mint)
+                    HexAgentCoreMark(size: 19, color: p.mint, lineWidth: 1.7)
                     Text("Agent Watch").font(WatchTypography.section).lineLimit(1)
                     Spacer(minLength: 0)
                 }
@@ -471,10 +471,17 @@ func timeText(_ epoch: Double, date: Bool = false) -> String {
 final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelegate, ObservableObject {
     @Published var notificationTarget: String?
     private var statusBarController: StatusBarController?
+    private weak var boundStore: MonitorStore?
+    private weak var boundInitialization: FirstRunInitialization?
     static func notificationPage(_ target: String?) -> Page? {
         let pages: [String: Page] = ["events": .events, "environment": .environment, "protection": .protection]
         guard let target else { return nil }
         return pages[target]
+    }
+    @MainActor func attachStatusBar(store: MonitorStore, initialization: FirstRunInitialization) {
+        boundStore = store
+        boundInitialization = initialization
+        statusBarController?.bind(store: store, initialization: initialization)
     }
     func applicationWillFinishLaunching(_ notification: Notification) {
         UNUserNotificationCenter.current().delegate = self
@@ -493,7 +500,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
         applyAppearance()
-        statusBarController = StatusBarController()
+        let controller = StatusBarController()
+        if let boundStore, let boundInitialization {
+            controller.bind(store: boundStore, initialization: boundInitialization)
+        }
+        statusBarController = controller
         let center = UNUserNotificationCenter.current()
         center.getNotificationSettings { settings in
             if settings.authorizationStatus == .notDetermined {
@@ -554,6 +565,9 @@ struct ClaudeWatchApp: App {
     var body: some Scene {
         WindowGroup("Agent Watch") {
             MonitorEntryView(store: store, initialization: initialization)
+                .onAppear {
+                    delegate.attachStatusBar(store: store, initialization: initialization)
+                }
                 .onReceive(delegate.$notificationTarget) { target in
                     guard let page = AppDelegate.notificationPage(target) else { return }
                     UserDefaults.standard.set(page.rawValue, forKey: "selectedPage")

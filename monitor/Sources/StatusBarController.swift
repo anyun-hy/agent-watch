@@ -1,30 +1,118 @@
 import AppKit
+import Combine
+import SwiftUI
 
-/// Menu-bar presence for the monitor. The app keeps running with no visible
-/// window; the status item toggles the main window and close collapses into
-/// the menu bar instead of quitting. Minimize keeps the native macOS Dock
-/// thumbnail (a real window snapshot), like other Dock+menu-bar apps
-/// (Docker Desktop, 1Password). Windows that state restoration resurrects
-/// already miniaturized (the phantom blank Dock thumbnails attached to
-/// unrelated screens) are collapsed on adoption.
+/// Visual badge tone projected strictly from authoritative store state.
+enum TrayIconStatus: Equatable {
+    case idle
+    case safe
+    case warning
+    case danger
+
+    var dotColor: NSColor? {
+        switch self {
+        case .idle: return nil
+        case .safe: return NSColor(srgbRed: 0.133, green: 0.773, blue: 0.369, alpha: 1.0)
+        case .warning: return NSColor(srgbRed: 0.961, green: 0.620, blue: 0.043, alpha: 1.0)
+        case .danger: return NSColor(srgbRed: 0.937, green: 0.267, blue: 0.267, alpha: 1.0)
+        }
+    }
+}
+
+/// CoreGraphics renderer for the custom "Hex Agent Core" macOS menu bar icon
+/// (18x18 pt Retina vector: hexagonal Seatbelt boundary + four-point AI core,
+/// with an optional status indicator dot cut cleanly into the bottom-right).
+enum StatusBarIconRenderer {
+    static func render(status: TrayIconStatus, appearance: NSAppearance?) -> NSImage {
+        let size = NSSize(width: 18, height: 18)
+        let image = NSImage(size: size, flipped: true) { _ in
+            let strokeColor: NSColor = (status == .idle) ? .black : .labelColor
+            let drawArtwork = {
+                let hex = NSBezierPath()
+                hex.move(to: NSPoint(x: 9.0, y: 1.8))
+                hex.line(to: NSPoint(x: 15.2, y: 5.4))
+                hex.line(to: NSPoint(x: 15.2, y: 12.6))
+                hex.line(to: NSPoint(x: 9.0, y: 16.2))
+                hex.line(to: NSPoint(x: 2.8, y: 12.6))
+                hex.line(to: NSPoint(x: 2.8, y: 5.4))
+                hex.close()
+                hex.lineWidth = 1.65
+                hex.lineJoinStyle = .round
+                hex.lineCapStyle = .round
+                strokeColor.setStroke()
+                hex.stroke()
+
+                let star = NSBezierPath()
+                star.move(to: NSPoint(x: 9.0, y: 5.3))
+                star.line(to: NSPoint(x: 10.0, y: 8.0))
+                star.line(to: NSPoint(x: 12.7, y: 9.0))
+                star.line(to: NSPoint(x: 10.0, y: 10.0))
+                star.line(to: NSPoint(x: 9.0, y: 12.7))
+                star.line(to: NSPoint(x: 8.0, y: 10.0))
+                star.line(to: NSPoint(x: 5.3, y: 9.0))
+                star.line(to: NSPoint(x: 8.0, y: 8.0))
+                star.close()
+                strokeColor.setFill()
+                star.fill()
+
+                if let dot = status.dotColor, let ctx = NSGraphicsContext.current?.cgContext {
+                    // Punch a crisp transparent halo so the status dot never muddies
+                    // against the hexagon corner on either light or dark menu bars.
+                    ctx.saveGState()
+                    ctx.setBlendMode(.clear)
+                    ctx.fillEllipse(in: CGRect(x: 11.7, y: 11.7, width: 6.2, height: 6.2))
+                    ctx.restoreGState()
+
+                    dot.setFill()
+                    NSBezierPath(ovalIn: NSRect(x: 12.6, y: 12.6, width: 4.4, height: 4.4)).fill()
+                }
+            }
+
+            if let appearance {
+                appearance.performAsCurrentDrawingAppearance(drawArtwork)
+            } else {
+                drawArtwork()
+            }
+            return true
+        }
+        // Monochrome standby uses native macOS template tinting; colored badges
+        // render explicitly against the status button's live appearance.
+        image.isTemplate = (status == .idle)
+        image.accessibilityDescription = "Agent Watch"
+        return image
+    }
+}
+
+/// Menu-bar presence for Agent Watch. Left-click opens a live SwiftUI status
+/// popover; right-click opens a compact native menu. Closing the main window
+/// folds it into the menu bar while background supervision continues.
+@MainActor
 final class StatusBarController: NSObject, NSWindowDelegate {
     private let item: NSStatusItem
+    private let popover = NSPopover()
     private var quitting = false
+    private weak var store: MonitorStore?
+    private weak var initialization: FirstRunInitialization?
+    private var subscriptions = Set<AnyCancellable>()
+    private var appearanceObservation: NSKeyValueObservation?
+    private var currentIconStatus: TrayIconStatus = .idle
 
     override init() {
         item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         super.init()
+        popover.behavior = .transient
+        popover.animates = true
         if let button = item.button {
-            let symbol = NSImage(systemSymbolName: "shield.lefthalf.filled",
-                                  accessibilityDescription: "Agent Watch")
-                ?? NSImage(systemSymbolName: "shield.fill",
-                           accessibilityDescription: "Agent Watch")
-            symbol?.isTemplate = true
-            button.image = symbol
-            button.toolTip = "Agent Watch 正在后台守护（左键开合主窗口，右键菜单）"
+            button.image = StatusBarIconRenderer.render(status: .idle, appearance: button.effectiveAppearance)
+            button.toolTip = "Agent Watch · 正在读取后台状态（左键详情卡片，右键菜单）"
             button.target = self
             button.action = #selector(statusItemClicked)
             button.sendAction(on: [.leftMouseUp, .rightMouseUp])
+            appearanceObservation = button.observe(\.effectiveAppearance, options: [.new]) { [weak self] _, _ in
+                Task { @MainActor [weak self] in
+                    self?.redrawIcon()
+                }
+            }
         }
         NotificationCenter.default.addObserver(
             self, selector: #selector(handleWindowKey(_:)),
@@ -32,14 +120,111 @@ final class StatusBarController: NSObject, NSWindowDelegate {
         adoptWindows()
     }
 
-    deinit { NotificationCenter.default.removeObserver(self) }
+    deinit {
+        NotificationCenter.default.removeObserver(self)
+        appearanceObservation?.invalidate()
+    }
+
+    /// Connects the tray icon and popover to the single authoritative SwiftUI stores.
+    func bind(store: MonitorStore, initialization: FirstRunInitialization) {
+        self.store = store
+        self.initialization = initialization
+        subscriptions.removeAll()
+
+        let content = StatusBarPopoverView(
+            store: store,
+            switcher: store.switcher,
+            initialization: initialization,
+            isMainWindowVisible: { Self.mainWindowVisible() },
+            onOpenPage: { [weak self] page in self?.openPage(page) },
+            onOpenProductConnections: { [weak self] product in self?.openProductConnections(product) },
+            onToggleWindow: { [weak self] in self?.toggleMainWindowFromPopover() },
+            onRefresh: { [weak self] in self?.refreshNow() },
+            onQuit: { [weak self] in self?.quitFromMenu() }
+        )
+        let hosting = NSHostingController(rootView: content)
+        hosting.sizingOptions = .preferredContentSize
+        popover.contentViewController = hosting
+
+        // Re-evaluate tray badge & tooltip whenever authoritative store facts change.
+        store.$snapshot.sink { [weak self] _ in self?.syncTrayStatus() }.store(in: &subscriptions)
+        store.$error.sink { [weak self] _ in self?.syncTrayStatus() }.store(in: &subscriptions)
+        store.switcher.$background.sink { [weak self] _ in self?.syncTrayStatus() }.store(in: &subscriptions)
+        store.switcher.$backgroundError.sink { [weak self] _ in self?.syncTrayStatus() }.store(in: &subscriptions)
+        store.switcher.$updateStatus.sink { [weak self] _ in self?.syncTrayStatus() }.store(in: &subscriptions)
+        store.$channelSubscription.sink { [weak self] _ in self?.syncTrayStatus() }.store(in: &subscriptions)
+
+        syncTrayStatus()
+    }
+
+    private func computeIconStatus() -> (TrayIconStatus, String) {
+        guard let store else {
+            return (.idle, "Agent Watch（左键详情卡片，右键菜单）")
+        }
+        let session = store.switcher.sessionDisplay
+        let anyBlockedOrFailed = MonitoredProduct.allCases.contains { product in
+            guard let state = store.channelState(for: product)?.display_state else { return false }
+            return state == .blocked || state == .failed
+        }
+        let anyForwarding = MonitoredProduct.allCases.contains { product in
+            store.channelState(for: product)?.display_state == .forwarding
+        }
+        let updateAvailable = store.switcher.updateStatus?.isAvailable == true
+
+        let badge: TrayIconStatus
+        if session.tone == "danger" || anyBlockedOrFailed {
+            badge = .danger
+        } else if session.tone == "warning"
+            || store.error != nil
+            || (!store.live && store.snapshot != nil)
+            || store.proxy?.selectionDiffers == true
+            || updateAvailable {
+            badge = .warning
+        } else if session.tone == "success" || (store.live && anyForwarding) {
+            badge = .safe
+        } else {
+            badge = .idle
+        }
+
+        var parts = ["Agent Watch · \(session.title)"]
+        if let ip = store.switcher.background?.session_guard?.current?.ip
+            ?? store.switcher.background?.egress_reference?.ip,
+           !ip.isEmpty {
+            parts.append("出口 \(ip)")
+        }
+        if updateAvailable, let label = store.switcher.updateStatus?.versionLabel, !label.isEmpty {
+            parts.append("有新版 \(label)")
+        }
+        parts.append("左键详情 / 右键菜单")
+        return (badge, parts.joined(separator: " · "))
+    }
+
+    private func syncTrayStatus() {
+        let (status, tooltip) = computeIconStatus()
+        item.button?.toolTip = tooltip
+        if status != currentIconStatus {
+            currentIconStatus = status
+            redrawIcon()
+        }
+    }
+
+    private func redrawIcon() {
+        guard let button = item.button else { return }
+        button.image = StatusBarIconRenderer.render(
+            status: currentIconStatus,
+            appearance: button.effectiveAppearance
+        )
+    }
 
     // MARK: window adoption
 
-    /// The main SwiftUI window is titled and far larger than the 1x1
-    /// offscreen sampling hosts created by the leak runners.
+    /// The main SwiftUI window is titled and far larger than the 1x1 offscreen
+    /// sampling hosts and transient menu bar popover windows.
     static func isMainWindow(_ window: NSWindow) -> Bool {
-        window.canBecomeMain && window.frame.width > 100
+        guard !(window is NSPanel) else { return false }
+        let typeName = NSStringFromClass(type(of: window))
+        if typeName.contains("Popover") || typeName.contains("StatusBar") { return false }
+        return window.canBecomeMain && window.frame.width > 100
     }
 
     static func mainWindowVisible() -> Bool {
@@ -55,46 +240,108 @@ final class StatusBarController: NSObject, NSWindowDelegate {
         for window in NSApp.windows { adopt(window) }
     }
 
-    /// Take over the window delegate so close can be folded into the menu
-    /// bar. The yellow minimize button keeps its native behavior (a real
-    /// Dock thumbnail); the tray can always deminiaturize and recall it.
-    /// SwiftUI assigns its delegate once at window creation, so
-    /// re-asserting on each did-become-key is safe.
     private func adopt(_ window: NSWindow) {
         guard Self.isMainWindow(window) else { return }
         window.delegate = self
         if window.isMiniaturized {
-            // A window restored in miniaturized state shows up as a blank
-            // phantom thumbnail on whatever screen owns the Dock. Collapse
-            // it into the menu bar so only real windows are ever visible.
             window.deminiaturize(nil)
             window.orderOut(nil)
         }
     }
 
-    // MARK: status item
+    // MARK: status item interactions
 
     @objc private func statusItemClicked() {
         guard let event = NSApp.currentEvent else { return }
-        if event.type == .rightMouseUp {
+        let isSecondary = event.type == .rightMouseUp
+            || (event.type == .leftMouseUp && event.modifierFlags.contains(.control))
+        if isSecondary {
+            closePopover()
             buildMenu().popUp(positioning: nil, at: .zero, in: item.button)
         } else {
-            if Self.mainWindowVisible() { hideMainWindow() } else { showMainWindow() }
+            togglePopover()
         }
+    }
+
+    private func togglePopover() {
+        guard let button = item.button else { return }
+        if popover.isShown {
+            closePopover()
+            return
+        }
+        guard popover.contentViewController != nil else {
+            if Self.mainWindowVisible() { hideMainWindow() } else { showMainWindow() }
+            return
+        }
+        NSApp.activate(ignoringOtherApps: true)
+        popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+        popover.contentViewController?.view.window?.makeKey()
+    }
+
+    private func closePopover() {
+        if popover.isShown {
+            popover.performClose(nil)
+        }
+    }
+
+    private func openPage(_ page: Page) {
+        closePopover()
+        if let store, initialization?.entered == true {
+            UserDefaults.standard.set(page.rawValue, forKey: "selectedPage")
+            store.page = page
+        }
+        showMainWindow()
+    }
+
+    private func openProductConnections(_ product: MonitoredProduct) {
+        closePopover()
+        if let store, initialization?.entered == true {
+            store.showConnections(product)
+        }
+        showMainWindow()
+    }
+
+    private func toggleMainWindowFromPopover() {
+        closePopover()
+        if Self.mainWindowVisible() { hideMainWindow() } else { showMainWindow() }
+    }
+
+    @objc private func refreshNow() {
+        store?.refresh(manual: true)
     }
 
     private func buildMenu() -> NSMenu {
         let menu = NSMenu()
-        let status = NSMenuItem(title: "Agent Watch 正在后台守护", action: nil, keyEquivalent: "")
+        let titleText = store.map { "Agent Watch · \($0.switcher.sessionDisplay.title)" }
+            ?? "Agent Watch 正在后台守护"
+        let status = NSMenuItem(title: titleText, action: nil, keyEquivalent: "")
         status.isEnabled = false
         menu.addItem(status)
+
+        if let ip = store?.switcher.background?.session_guard?.current?.ip
+            ?? store?.switcher.background?.egress_reference?.ip,
+           !ip.isEmpty {
+            let egressItem = NSMenuItem(title: "当前出口：\(ip)", action: nil, keyEquivalent: "")
+            egressItem.isEnabled = false
+            menu.addItem(egressItem)
+        }
+
         menu.addItem(.separator())
-        let show = NSMenuItem(title: "打开主窗口", action: #selector(showMainWindow), keyEquivalent: "")
-        show.target = self
-        menu.addItem(show)
-        let hide = NSMenuItem(title: "隐藏主窗口", action: #selector(hideMainWindow), keyEquivalent: "")
-        hide.target = self
-        menu.addItem(hide)
+
+        let refresh = NSMenuItem(title: "立即刷新状态", action: #selector(refreshNow), keyEquivalent: "r")
+        refresh.target = self
+        menu.addItem(refresh)
+
+        if Self.mainWindowVisible() {
+            let hide = NSMenuItem(title: "隐藏主窗口", action: #selector(hideMainWindow), keyEquivalent: "")
+            hide.target = self
+            menu.addItem(hide)
+        } else {
+            let show = NSMenuItem(title: "打开主窗口", action: #selector(showMainWindow), keyEquivalent: "")
+            show.target = self
+            menu.addItem(show)
+        }
+
         menu.addItem(.separator())
         let quit = NSMenuItem(title: "退出 Agent Watch", action: #selector(quitFromMenu), keyEquivalent: "q")
         quit.target = self
@@ -103,6 +350,7 @@ final class StatusBarController: NSObject, NSWindowDelegate {
     }
 
     @objc func showMainWindow() {
+        closePopover()
         guard let window = NSApp.windows.first(where: { Self.isMainWindow($0) }) else { return }
         NSApp.activate(ignoringOtherApps: true)
         if window.isMiniaturized { window.deminiaturize(nil) }
@@ -110,12 +358,14 @@ final class StatusBarController: NSObject, NSWindowDelegate {
     }
 
     @objc func hideMainWindow() {
+        closePopover()
         for window in NSApp.windows where Self.isMainWindow(window) && !window.isMiniaturized {
             window.orderOut(nil)
         }
     }
 
     @objc private func quitFromMenu() {
+        closePopover()
         prepareToQuit()
         NSApp.terminate(nil)
     }
