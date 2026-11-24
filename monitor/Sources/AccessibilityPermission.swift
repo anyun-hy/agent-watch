@@ -3,7 +3,7 @@ import ApplicationServices
 
 enum AccessibilityPermission {
     static let bundleID = "io.local.watchpanel"
-    static let installedPath = "/Applications/Claude Watch Monitor.app"
+    static let installedPath = "/Applications/Agent Watch.app"
     /// Privacy & Security > Accessibility, newest pane identifier first. The
     /// older alias is kept because the renamed pane is not addressable on
     /// every macOS release, and a failed deep link must not be silent.

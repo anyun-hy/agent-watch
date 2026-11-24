@@ -111,13 +111,13 @@ pub trait ServiceSystem {
 pub fn policy_issues(config: &Config) -> Value {
     let mut issues = Vec::new();
     if !config.enabled {
-        issues.push(json!({"id":"policy","title":"启动策略尚未启用","detail":"确认环境并开启 Claude Watch 保护后，再运行启动前检查。"}));
+        issues.push(json!({"id":"policy","title":"启动策略尚未启用","detail":"确认环境并开启 Agent Watch 保护后，再运行启动前检查。"}));
     }
     if !config.online_enabled {
         issues.push(json!({"id":"online","title":"受控启动的联网预检未允许","detail":"此选项只控制启动预检；环境状态页的手动检测会单独请求网络。"}));
     }
     if !config.guard_enabled {
-        issues.push(json!({"id":"guard","title":"Claude Watch 断线保护未启用","detail":"受控启动要求本工具保护后台具有有效心跳。"}));
+        issues.push(json!({"id":"guard","title":"Agent Watch 断线保护未启用","detail":"受控启动要求本工具保护后台具有有效心跳。"}));
     }
     Value::Array(issues)
 }
@@ -235,7 +235,7 @@ pub fn service_status_with_health<S: ServiceSystem>(
 
     Ok(
         json!({"status":"ok","observed_at":now,"backend_healthy":health.sampling_healthy,"guard_backend_healthy":health.guard_backend_healthy,"backend_alive":health.guard_backend_healthy,"protection_ready":health.guard_healthy,"backend_diagnostics":health.diagnostics,"backend_sampling_state":sampling_state,"admin_helper":helper,"update_source_ready":ready,"update_source_builtin":update_source_builtin,"external_services":external_services,"policy_issues":policy_issues(config),"services":[
-          {"id":"guard","title":"Claude Watch 保镖","state":guard_state,"desired":config.guard_enabled,"execution_verified":guard_state == "running","backend_alive":health.guard_backend_healthy,"sampling_state":sampling_state,"protection_ready":health.guard_healthy,"health_basis":"service_liveness_and_protection_evidence","source":"本工具监督循环心跳 / 后台身份 / 独立保护证据","reason_code":guard_reason,"detail":guard_detail,"evidence_observed_at":health.diagnostics["guard"]["evidence_observed_at"]},
+          {"id":"guard","title":"Agent Watch 保镖","state":guard_state,"desired":config.guard_enabled,"execution_verified":guard_state == "running","backend_alive":health.guard_backend_healthy,"sampling_state":sampling_state,"protection_ready":health.guard_healthy,"health_basis":"service_liveness_and_protection_evidence","source":"本工具监督循环心跳 / 后台身份 / 独立保护证据","reason_code":guard_reason,"detail":guard_detail,"evidence_observed_at":health.diagnostics["guard"]["evidence_observed_at"]},
           {"id":"original","title":"原版 Claude切换器保镖","state":original_state,"desired":null,"execution_verified":original_verified,"health_basis":if original_verified {"root_execution_receipt"} else {"launchd_registration_only"},"last_success_at":if original_verified {original_receipt["time"].clone()} else {Value::Null},"detail":if original_verified {"原版独立运行，已确认最近巡检回执"} else if original_state == "scheduled" {"原版任务已注册，最近巡检回执尚未确认；由原版独立管理"} else {"原版状态尚未确认；由原版独立管理"},"source":"system/local.claude-bodyguard / 原版只读巡检回执"},
           {"id":"watchdog","title":"时区守护","state":watchdog_state,"desired":config.timezone_watchdog,"actual_target":watchdog["target"],"accepted_target":desired_target,"last_success_at":watchdog_last_success,"execution_verified":watchdog_verified,"health_basis":watchdog_basis,"source":"时区任务注册 / root 管理的目标文件"},
           {"id":"updater","title":"自动更新","state":update_state,"desired":config.auto_update,"interval_seconds":UPDATE_INTERVAL,"execution_verified":update_state == "scheduled","health_basis":"launchd_registration_and_manifest","source":"本项目发布配置 / 用户更新任务"}
@@ -324,7 +324,7 @@ pub fn protection_preview<S: ServiceSystem>(
     let mut context = Value::Object(Default::default());
     let mut actions = Vec::new();
     if key == "guard_enabled" {
-        actions.push(json!({"id":"guard","title":if value==true {"启用 Claude Watch 断线保护"}else{"停用 Claude Watch 断线保护"},"scope":"watch","before":cfg.guard_enabled&&cfg.enabled,"after":value,"detail":"原版保镖保持独立运行。"}));
+        actions.push(json!({"id":"guard","title":if value==true {"启用 Agent Watch 断线保护"}else{"停用 Agent Watch 断线保护"},"scope":"watch","before":cfg.guard_enabled&&cfg.enabled,"after":value,"detail":"原版保镖保持独立运行。"}));
     } else if key == "timezone_watchdog" {
         // The fixed root helper is installed by the same administrator
         // authorization that applies this change (the mutation runner

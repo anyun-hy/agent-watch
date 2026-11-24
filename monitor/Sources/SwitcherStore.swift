@@ -416,11 +416,11 @@ struct SwitcherAccountState: Decodable {
         var summaryDetail: String {
             var details = [message]
             if let watch = watch_current, !watch.isEmpty, let legacy = legacy_current, !legacy.isEmpty {
-                details.append("Claude Watch 当前记录：\(watch) · 原版切换器记录：\(legacy)")
+                details.append("Agent Watch 当前记录：\(watch) · 原版切换器记录：\(legacy)")
             } else if let legacy = legacy_current, !legacy.isEmpty {
                 details.append("原版切换器当前记录：\(legacy)")
             } else if let watch = watch_current, !watch.isEmpty {
-                details.append("Claude Watch 当前记录：\(watch)")
+                details.append("Agent Watch 当前记录：\(watch)")
             }
             details.append("为防止资料错槽覆盖，Claude 账号切换与保存已暂停；请先核对实际登录资料并重新核对状态。")
             return details.joined(separator: "\n")
@@ -1203,7 +1203,7 @@ final class SwitcherStore: ObservableObject {
         guard !isFixture else { return }
         guard AccessibilityPermission.openSettings() else {
             failure = true
-            message = "系统设置未能自动打开，请手动前往 系统设置 › 隐私与安全性 › 辅助功能，并允许 Claude Watch。"
+            message = "系统设置未能自动打开，请手动前往 系统设置 › 隐私与安全性 › 辅助功能，并允许 Agent Watch。"
             return
         }
     }
@@ -2371,7 +2371,7 @@ final class SwitcherStore: ObservableObject {
             "facts": ["state": "ok", "risks": []],
             "session_guard": session,
             "services": [
-                ["id":"guard", "title":"Claude Watch 保镖", "state":guardOn ? "running" : "inactive", "detail":guardOn ? "后台及保护心跳均有效。" : "保护已停用；后台采集继续运行。", "source":"本工具保护心跳 / 采集后台", "desired":settings[Setting.guardEnabled.key] as? Bool ?? false],
+                ["id":"guard", "title":"Agent Watch 保镖", "state":guardOn ? "running" : "inactive", "detail":guardOn ? "后台及保护心跳均有效。" : "保护已停用；后台采集继续运行。", "source":"本工具保护心跳 / 采集后台", "desired":settings[Setting.guardEnabled.key] as? Bool ?? false],
                 ["id":"original", "title":"原版 Claude切换器保镖", "state":"scheduled", "detail":"已加载，每 10 秒检查；最近退出码：0。", "source":"原版系统任务；独立管理"],
                 ["id":"watchdog", "title":"时区守护", "state":clockOn ? "scheduled" : "inactive", "detail":clockOn ? "实际目标：Asia/Tokyo；已接受目标：Asia/Tokyo。任务按计划运行。" : "实际目标：未设置；已接受目标：未配置。", "source":"系统任务 / 目标文件", "desired":clockOn],
                 ["id":"updater", "title":"自动更新", "state":"unavailable", "detail":"尚未配置本项目发布源与固定公钥。", "source":"发布配置 / 用户任务", "desired":settings[Setting.autoUpdate.key] as? Bool ?? false]]]

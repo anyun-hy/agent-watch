@@ -16,9 +16,9 @@ pub(super) fn validate_entry(is_dir: bool, mode: Option<u32>) -> Result<()> {
 }
 
 fn executable(name: &str) -> bool {
-    if name == "app/Claude Watch Monitor.app/Contents/MacOS/ClaudeWatchMonitor" { return true; }
+    if name == "app/Agent Watch.app/Contents/MacOS/AgentWatch" { return true; }
     let component = name.strip_prefix("runtime/")
-        .or_else(|| name.strip_prefix("app/Claude Watch Monitor.app/Contents/Resources/"));
+        .or_else(|| name.strip_prefix("app/Agent Watch.app/Contents/Resources/"));
     matches!(component, Some("watch-engine" | "watch-native-observer" | "watch-process-control"
         | "watch-sandbox-launcher" | "watch-gateway-broker" | "ControlledEntry" | "watch-admin.sh" | "watch-leak-worker" | "watch-native-collector.zsh"))
 }
@@ -93,18 +93,18 @@ mod tests {
     #[test]
     fn execution_roles_are_exact_paths_not_names_or_extensions() {
         for name in ["runtime/watch-engine", "runtime/watch-leak-worker", "runtime/watch-sandbox-launcher", "runtime/watch-gateway-broker",
-            "app/Claude Watch Monitor.app/Contents/MacOS/ClaudeWatchMonitor",
-            "app/Claude Watch Monitor.app/Contents/Resources/watch-sandbox-launcher",
-            "app/Claude Watch Monitor.app/Contents/Resources/watch-gateway-broker",
-            "app/Claude Watch Monitor.app/Contents/Resources/watch-admin.sh"] {
+            "app/Agent Watch.app/Contents/MacOS/AgentWatch",
+            "app/Agent Watch.app/Contents/Resources/watch-sandbox-launcher",
+            "app/Agent Watch.app/Contents/Resources/watch-gateway-broker",
+            "app/Agent Watch.app/Contents/Resources/watch-admin.sh"] {
             assert!(executable(name), "{name}");
         }
         for name in ["runtime/extra/watch-engine", "runtime/arbitrary.sh", "runtime/BuildInfo.plist",
             "runtime/extra/watch-gateway-broker", "runtime/watch-gateway-broker.sh",
-            "app/Other.app/Contents/MacOS/ClaudeWatchMonitor",
-            "app/Claude Watch Monitor.app/Contents/MacOS/Other",
-            "app/Claude Watch Monitor.app/Contents/Resources/nested/watch-admin.sh",
-            "app/Claude Watch Monitor.app/Contents/Resources/nested/watch-gateway-broker"] {
+            "app/Other.app/Contents/MacOS/AgentWatch",
+            "app/Agent Watch.app/Contents/MacOS/Other",
+            "app/Agent Watch.app/Contents/Resources/nested/watch-admin.sh",
+            "app/Agent Watch.app/Contents/Resources/nested/watch-gateway-broker"] {
             assert!(!executable(name), "{name}");
         }
     }

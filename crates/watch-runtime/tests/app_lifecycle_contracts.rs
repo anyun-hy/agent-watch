@@ -22,7 +22,7 @@ impl LifecycleOs for Fake {
     fn validate_bundle(&mut self, _: &Path) -> Result<AppIdentity> {
         Ok(AppIdentity {
             bundle_id: BUNDLE_ID.into(),
-            executable: "ClaudeWatchMonitor".into(),
+            executable: "AgentWatch".into(),
             version: "1".into(),
             build: "1".into(),
             architecture: "arm64".into(),
@@ -198,7 +198,7 @@ fn failing_to_stop_the_agent_leaves_no_staging_bundle_behind() {
         .unwrap()
         .filter_map(|entry| entry.ok())
         .map(|entry| entry.file_name().to_string_lossy().into_owned())
-        .filter(|name| name.starts_with(".ClaudeWatch-"))
+        .filter(|name| name.starts_with(".AgentWatch-"))
         .collect();
     assert!(
         staged.is_empty(),
@@ -243,10 +243,10 @@ fn a_staging_copy_left_by_a_killed_install_is_swept_by_the_next_one() {
     fs::create_dir(&root).unwrap();
     let app = bundle(&root, "old.app");
     let source = bundle(&root, "source.app");
-    let stale = bundle(&root, &format!(".ClaudeWatch-{}.app", "a".repeat(32)));
+    let stale = bundle(&root, &format!(".AgentWatch-{}.app", "a".repeat(32)));
     // Neither of these is a name this module generates.
-    let foreign = bundle(&root, &format!(".ClaudeWatch-{}.app", "z".repeat(32)));
-    let short = bundle(&root, &format!(".ClaudeWatch-{}.app", "b".repeat(31)));
+    let foreign = bundle(&root, &format!(".AgentWatch-{}.app", "z".repeat(32)));
+    let short = bundle(&root, &format!(".AgentWatch-{}.app", "b".repeat(31)));
     let mut lifecycle = AppLifecycle {
         paths: LifecyclePaths {
             installed: app.clone(),
@@ -268,7 +268,7 @@ fn a_staging_copy_left_by_a_killed_install_is_swept_by_the_next_one() {
 fn uninstall_sweeps_stale_staging_copies_even_without_an_installed_app() {
     let root = std::env::temp_dir().join(format!("cw-life-sweep-rm-{}", Uuid::new_v4()));
     fs::create_dir(&root).unwrap();
-    let stale = bundle(&root, &format!(".ClaudeWatch-{}.app", "c".repeat(32)));
+    let stale = bundle(&root, &format!(".AgentWatch-{}.app", "c".repeat(32)));
     let mut lifecycle = AppLifecycle {
         paths: LifecyclePaths {
             installed: root.join(APP_NAME),
@@ -288,7 +288,7 @@ fn staged_copies(root: &Path) -> Vec<String> {
         .filter_map(|entry| entry.ok())
         .map(|entry| entry.file_name().to_string_lossy().into_owned())
         .filter(|name| {
-            name.strip_prefix(".ClaudeWatch-")
+            name.strip_prefix(".AgentWatch-")
                 .and_then(|rest| rest.strip_suffix(".app"))
                 .is_some_and(|id| {
                     id.len() == 32

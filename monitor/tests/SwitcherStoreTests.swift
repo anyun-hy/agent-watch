@@ -75,7 +75,7 @@ struct SwitcherStoreTests {
             await manager.loadManualAccount(.openAI)
             expect(manager.manualAccounts[.openAI]?.canSave == false, "visible identity without verified process binding cannot enable save")
 
-            let splitBrain = try JSONDecoder().decode(SwitcherAccountState.self, from: Data(#"{"current":"A","recovery_required":false,"detail":"test","accounts":[{"id":"A","stored":true,"current":true},{"id":"B","stored":true,"current":false}],"legacy_conflict":{"code":"external_switcher_conflict","watch_current":"A","legacy_current":"C","message":"原版切换器当前账号与 Claude Watch 不一致"}}"#.utf8))
+            let splitBrain = try JSONDecoder().decode(SwitcherAccountState.self, from: Data(#"{"current":"A","recovery_required":false,"detail":"test","accounts":[{"id":"A","stored":true,"current":true},{"id":"B","stored":true,"current":false}],"legacy_conflict":{"code":"external_switcher_conflict","watch_current":"A","legacy_current":"C","message":"原版切换器当前账号与 Agent Watch 不一致"}}"#.utf8))
             expect(splitBrain.legacy_conflict?.code == "external_switcher_conflict" &&
                    splitBrain.legacy_conflict?.watch_current == "A" &&
                    splitBrain.legacy_conflict?.legacy_current == "C" &&

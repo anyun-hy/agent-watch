@@ -77,7 +77,7 @@ fn install_verified_app(
     stage_dir: &Path,
     relaunch: bool,
 ) -> Result<Value> {
-    let staged_app = stage_dir.join("payload/app/Claude Watch Monitor.app");
+    let staged_app = stage_dir.join("payload/app").join(APP_NAME);
     if !staged_app.is_dir() {
         let _ = fs::remove_dir_all(stage_dir);
         return Err(CoreError::new(
@@ -219,7 +219,7 @@ pub fn dispatch(request: &Request, paths: Paths) -> Result<Option<Value>> {
         let mut updater = Updater {
             paths: UpdatePaths {
                 base: paths.base(),
-                app: "/Applications/Claude Watch Monitor.app".into(),
+                app: PathBuf::from("/Applications").join(APP_NAME),
                 watch: paths.watch(),
                 backend: paths.watch().join("claude-watch.sh"),
             },
@@ -249,7 +249,7 @@ pub fn dispatch(request: &Request, paths: Paths) -> Result<Option<Value>> {
     let mut updater = Updater {
         paths: UpdatePaths {
             base: paths.base(),
-            app: "/Applications/Claude Watch Monitor.app".into(),
+            app: PathBuf::from("/Applications").join(APP_NAME),
             watch: paths.watch(),
             backend: paths.watch().join("claude-watch.sh"),
         },
@@ -268,7 +268,7 @@ pub fn dispatch(request: &Request, paths: Paths) -> Result<Option<Value>> {
         if request.flag("auto") && receipt["status"] == "available" {
             receipt["interactive_install_required"] = json!(true);
             receipt["message"] = json!(format!(
-                "{}；请在 Claude Watch 界面点击「下载并安装更新」完成替换",
+                "{}；请在 Agent Watch 界面点击「下载并安装更新」完成替换",
                 receipt["message"].as_str().unwrap_or("发现新版本")
             ));
         }

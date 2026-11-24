@@ -6,12 +6,12 @@ use std::{
     path::{Path, PathBuf},
 };
 use uuid::Uuid;
-pub const APP_NAME: &str = "Claude Watch Monitor.app";
+pub const APP_NAME: &str = "Agent Watch.app";
 pub const BUNDLE_ID: &str = "io.local.watchpanel";
 /// Staging copies live next to the install target and carry the product's
 /// bundle identifier. They are transport only: a copy that survives the call
 /// that created it becomes a second registration of the same product.
-const STAGE_PREFIX: &str = ".ClaudeWatch-";
+const STAGE_PREFIX: &str = ".AgentWatch-";
 fn err(c: &str, m: &str) -> CoreError {
     CoreError::new(c, m)
 }
@@ -81,7 +81,7 @@ impl<O: LifecycleOs> AppLifecycle<O> {
         if self.paths.installed.exists() {
             let installed = self.paths.installed.clone();
             let identity = self.os.inspect_installed(&installed)?;
-            if identity.bundle_id != BUNDLE_ID || identity.executable != "ClaudeWatchMonitor" {
+            if identity.bundle_id != BUNDLE_ID || identity.executable != "AgentWatch" {
                 return Err(err("release_identity_mismatch", "旧应用身份不匹配"));
             }
         }
@@ -114,10 +114,10 @@ impl<O: LifecycleOs> AppLifecycle<O> {
         let old = self
             .paths
             .trash
-            .join(format!("ClaudeWatch-replaced-{}", Uuid::new_v4().simple()))
+            .join(format!("AgentWatch-replaced-{}", Uuid::new_v4().simple()))
             .join(APP_NAME);
         // Nothing between here and the swap may leak the staging bundle: a
-        // half-copied `.ClaudeWatch-*.app` would otherwise survive in
+        // half-copied `.AgentWatch-*.app` would otherwise survive in
         // /Applications whenever an early step fails.
         if let Err(error) = copy_dir(source, &stage).and_then(|()| self.verify(&stage).map(|_| ()))
         {
@@ -196,7 +196,7 @@ impl<O: LifecycleOs> AppLifecycle<O> {
         let destination = self
             .paths
             .trash
-            .join(format!("ClaudeWatch-removed-{}", Uuid::new_v4().simple()));
+            .join(format!("AgentWatch-removed-{}", Uuid::new_v4().simple()));
         let old = destination.join(APP_NAME);
         let mut moved = false;
         let result = (|| {
@@ -228,7 +228,7 @@ impl<O: LifecycleOs> AppLifecycle<O> {
         }
         let x = self.os.validate_bundle(path)?;
         if x.bundle_id != BUNDLE_ID
-            || x.executable != "ClaudeWatchMonitor"
+            || x.executable != "AgentWatch"
             || x.architecture != "arm64"
         {
             return Err(err(

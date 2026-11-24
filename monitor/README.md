@@ -1,6 +1,6 @@
-# 原生应用开发说明
+# Agent Watch 原生应用开发说明
 
-源码构建版本与 build 号由调用者显式指定；不能用仓库文档推断当前安装版本。日常使用与安装说明见 [项目首页](../README.md)。
+源码构建版本与 build 号由调用者显式指定；不能用仓库文档推断当前安装版本。日常使用与安装说明见 [项目首页（中文）](../README.zh-CN.md) / [README (EN)](../README.md)。
 
 ## 源码入口
 
@@ -28,9 +28,9 @@
 
 ```sh
 # 仅构建 App（值仅为示例）
-APP_VERSION=3.0.0 BUILD_NUMBER=367 CW_BUILD_ARCH=arm64 bash monitor/build.sh
+APP_VERSION=4.1.0 BUILD_NUMBER=505 CW_BUILD_ARCH=arm64 bash monitor/build.sh
 # 打包 DMG 时会自动执行构建，避免再单独运行上一命令：
-APP_VERSION=3.0.0 BUILD_NUMBER=367 CW_BUILD_ARCH=arm64 bash monitor/package-dmg.sh
+APP_VERSION=4.1.0 BUILD_NUMBER=505 CW_BUILD_ARCH=arm64 bash monitor/package-dmg.sh
 ```
 
 策略目录仅在 `crates/watch-core/src/policy.rs` 定义。修改 Rust 策略项、动作或默认值后运行 `python3 tools/generate-ai-policy-swift.py --write` 更新生成文件；构建前会强制执行 `--check`，防止 Swift UI 与 Rust 授权规则不一致。UI 源文件只维护中文展示文字。

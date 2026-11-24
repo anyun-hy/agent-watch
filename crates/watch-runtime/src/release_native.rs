@@ -297,7 +297,7 @@ impl<E: FixedCommandExecutor> NativeRelease<E> {
             .collect())
     }
     fn exact_app_executable(app: &Path) -> PathBuf {
-        app.join("Contents/MacOS/ClaudeWatchMonitor")
+        app.join("Contents/MacOS/AgentWatch")
     }
     fn accessibility(&mut self, app: &Path, bundle: &str) -> Result<()> {
         if bundle != BUNDLE_ID || app != Path::new("/Applications").join(APP_NAME) {
@@ -533,7 +533,7 @@ impl<E: FixedCommandExecutor> LifecycleOs for NativeRelease<E> {
         }
         let info = self.plist_json(&path.join("Contents/Info.plist"))?;
         if info["CFBundleIdentifier"] != BUNDLE_ID
-            || info["CFBundleExecutable"] != "ClaudeWatchMonitor"
+            || info["CFBundleExecutable"] != "AgentWatch"
         {
             return Err(error(
                 "release_identity_mismatch",
@@ -542,7 +542,7 @@ impl<E: FixedCommandExecutor> LifecycleOs for NativeRelease<E> {
         }
         Ok(AppIdentity {
             bundle_id: BUNDLE_ID.into(),
-            executable: "ClaudeWatchMonitor".into(),
+            executable: "AgentWatch".into(),
             version: info["CFBundleShortVersionString"]
                 .as_str()
                 .unwrap_or("unknown")
@@ -598,7 +598,7 @@ impl<E: FixedCommandExecutor> LifecycleOs for NativeRelease<E> {
         let executable = get(&info, "CFBundleExecutable")?;
         let version = get(&info, "CFBundleShortVersionString")?;
         let build = get(&info, "CFBundleVersion")?;
-        if bundle_id != BUNDLE_ID || executable != "ClaudeWatchMonitor" {
+        if bundle_id != BUNDLE_ID || executable != "AgentWatch" {
             return Err(error("release_identity_mismatch", "应用身份不匹配"));
         }
         self.require(

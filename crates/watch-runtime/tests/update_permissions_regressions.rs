@@ -4,8 +4,8 @@ use claude_watch_core::error::{CoreError, Result};
 use claude_watch_runtime::{storage::sha256, update::*};
 use std::{collections::BTreeMap, fs, io::Write, os::unix::fs::{symlink, PermissionsExt}, path::{Path, PathBuf}};
 
-const APP: &str = "app/Claude Watch Monitor.app";
-const BIN: &str = "app/Claude Watch Monitor.app/Contents/MacOS/ClaudeWatchMonitor";
+const APP: &str = "app/Agent Watch.app";
+const BIN: &str = "app/Agent Watch.app/Contents/MacOS/AgentWatch";
 const COMPONENTS: &[&str] = &["watch-engine", "watch-native-observer", "watch-process-control",
     "watch-admin.sh", "watch-native-collector.zsh", "watch-leak-worker"];
 struct Fixture { root: PathBuf }
@@ -71,8 +71,8 @@ fn signed_component_roles_get_execute_bits_even_when_zip_modes_lost_them() {
 #[test]
 fn gateway_broker_update_requires_matching_pair_and_grants_only_exact_execution_roles() {
     const RUNTIME: &str = "runtime/watch-gateway-broker";
-    const BUNDLED: &str = "app/Claude Watch Monitor.app/Contents/Resources/watch-gateway-broker";
-    const NESTED: &str = "app/Claude Watch Monitor.app/Contents/Resources/nested/watch-gateway-broker";
+    const BUNDLED: &str = "app/Agent Watch.app/Contents/Resources/watch-gateway-broker";
+    const NESTED: &str = "app/Agent Watch.app/Contents/Resources/nested/watch-gateway-broker";
     for case in ["absent", "matching", "runtime_only", "app_only", "mismatched"] {
         let fixture = Fixture::new();
         let mut files = contents();
@@ -109,8 +109,8 @@ fn arbitrary_archive_execute_bits_do_not_turn_resources_into_programs() {
     let f = Fixture::new(); let (archive, release) = f.archive(&contents(), 0o777);
     verify_extract(&archive, &f.destination(), &release).unwrap();
     for name in ["runtime/BuildInfo.plist", "runtime/netcoffee_probe.js", "runtime/unknown.sh",
-        "app/Claude Watch Monitor.app/Contents/Info.plist",
-        "app/Claude Watch Monitor.app/Contents/Resources/nested/watch-engine"] {
+        "app/Agent Watch.app/Contents/Info.plist",
+        "app/Agent Watch.app/Contents/Resources/nested/watch-engine"] {
         assert_eq!(mode(&f.destination().join(name)), 0o600, "{name}");
     }
     assert_eq!(mode(&f.destination().join("runtime/watch-engine")), 0o700);
@@ -182,7 +182,7 @@ struct MockOs { engine: PathBuf, fail_health: bool, checks: usize, restarts: usi
 impl UpdateOs for MockOs {
     fn architecture(&mut self) -> Result<String> { Ok("arm64".into()) }
     fn verify_app(&mut self, app: &Path, _: &str) -> Result<()> {
-        assert_eq!(mode(&app.join("Contents/MacOS/ClaudeWatchMonitor")), 0o700); Ok(())
+        assert_eq!(mode(&app.join("Contents/MacOS/AgentWatch")), 0o700); Ok(())
     }
     fn health(&mut self) -> Result<()> {
         self.checks += 1; assert_eq!(mode(&self.engine), 0o700);
@@ -214,7 +214,7 @@ fn failed_mock_health_restores_old_bytes_and_permissions() {
     verify_extract(&archive, &f.destination(), &release).unwrap();
     let mut update = updater(&f, true);
     let engine = update.paths.watch.join("runtime/watch-engine");
-    let main = update.paths.app.join("Contents/MacOS/ClaudeWatchMonitor");
+    let main = update.paths.app.join("Contents/MacOS/AgentWatch");
     put(&engine, b"old engine", 0o750); put(&main, b"old main", 0o750);
     put(&update.paths.backend, b"legacy untouched", 0o640);
     assert_eq!(update.apply_payload(&f.destination(), &release).unwrap_err().code, "fixture_health_failed");

@@ -74,7 +74,7 @@ struct MonitorView: View {
             }.background(p.background)
         }
         .navigationSplitViewStyle(.balanced)
-        .navigationTitle("Claude Watch")
+        .navigationTitle("Agent Watch")
         .toolbar {
             MonitorRefreshToolbar(automatic: $store.automatic, refreshing: store.refreshing, p: p) {
                 if let refreshAction { refreshAction() }
@@ -148,7 +148,7 @@ struct MonitorView: View {
             VStack(alignment: .leading, spacing: 7) {
                 HStack(spacing: 8) {
                     Image(systemName: "shield.lefthalf.filled").font(.system(size: 19)).foregroundStyle(p.mint)
-                    Text("Claude Watch").font(WatchTypography.section).lineLimit(1)
+                    Text("Agent Watch").font(WatchTypography.section).lineLimit(1)
                     Spacer(minLength: 0)
                 }
                 Text("Claude · ChatGPT / Codex").font(WatchTypography.small).foregroundStyle(p.secondary).lineLimit(1).minimumScaleFactor(0.82)
@@ -552,7 +552,7 @@ struct ClaudeWatchApp: App {
             saveCompletion: { try storage.complete() }))
     }
     var body: some Scene {
-        WindowGroup("Claude Watch") {
+        WindowGroup("Agent Watch") {
             MonitorEntryView(store: store, initialization: initialization)
                 .onReceive(delegate.$notificationTarget) { target in
                     guard let page = AppDelegate.notificationPage(target) else { return }

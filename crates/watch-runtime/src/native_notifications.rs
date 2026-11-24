@@ -18,7 +18,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-const WATCH_APP: &str = "/Applications/Claude Watch Monitor.app/Contents/MacOS/ClaudeWatchMonitor";
+const WATCH_APP: &str = "/Applications/Agent Watch.app/Contents/MacOS/AgentWatch";
 const MAX_PENDING: usize = 8;
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(12);
 
@@ -57,7 +57,7 @@ impl<E: FixedCommandExecutor + Send> Notifier for NativeNotifier<E> {
         } else if output.status == 3 {
             Err(NotifyError {
                 code: "notification_not_authorized".into(),
-                detail: "Claude Watch 尚未获得系统通知权限".into(),
+                detail: "Agent Watch 尚未获得系统通知权限".into(),
             })
         } else {
             Err(NotifyError {
@@ -71,8 +71,8 @@ impl<E: FixedCommandExecutor + Send> Notifier for NativeNotifier<E> {
 fn fixed_command(alert: &Alert) -> FixedCommand {
     let message = alert.message.replace(['\r', '\n'], " ");
     let destination = match alert.title.as_str() {
-        "Claude Watch：保护采样异常" => "environment",
-        "Claude Watch：已触发保护" | "Claude Watch：保护状态变化" => "protection",
+        "Agent Watch：保护采样异常" => "environment",
+        "Agent Watch：已触发保护" | "Agent Watch：保护状态变化" => "protection",
         _ => "events",
     };
     FixedCommand {

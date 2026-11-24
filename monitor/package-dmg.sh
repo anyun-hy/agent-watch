@@ -9,10 +9,10 @@ cw_require_seatbelt_backend
 # command or an explicit command line); no built-in default may go stale.
 : "${APP_VERSION:?Set APP_VERSION (for example 3.0.0)}"
 : "${BUILD_NUMBER:?Set BUILD_NUMBER (for example 367)}"
-APP_NAME='Claude Watch Monitor.app'
-APP="${CW_APP_OUTPUT:-$ROOT/build/Claude Watch Monitor Rust Candidate.app}"
+APP_NAME='Agent Watch.app'
+APP="${CW_APP_OUTPUT:-$ROOT/build/Agent Watch.app}"
 DIST="$ROOT/dist"
-DMG_NAME="${DMG_NAME:-Claude-Watch-${APP_VERSION}-build${BUILD_NUMBER}-${CW_BUILD_ARCH:-arm64}.dmg}"
+DMG_NAME="${DMG_NAME:-Agent-Watch-${APP_VERSION}-build${BUILD_NUMBER}-${CW_BUILD_ARCH:-arm64}.dmg}"
 DMG="$DIST/$DMG_NAME"
 SHA_FILE="$DMG.sha256"
 
@@ -92,9 +92,9 @@ chmod 755 "$PAYLOAD/安装或更新后台.command"
 chmod 755 "$PAYLOAD/卸载应用.command"
 
 if [[ "$USE_DISKUTIL_IMAGE" == '1' ]]; then
-  /usr/sbin/diskutil image create from --format UDZO --volumeName "Claude Watch $APP_VERSION" "$PAYLOAD" "$TEMP_DMG" >/dev/null
+  /usr/sbin/diskutil image create from --format UDZO --volumeName "Agent Watch $APP_VERSION" "$PAYLOAD" "$TEMP_DMG" >/dev/null
 else
-  hdiutil create -volname "Claude Watch $APP_VERSION" -srcfolder "$PAYLOAD" -format UDZO -ov "$TEMP_DMG" >/dev/null
+  hdiutil create -volname "Agent Watch $APP_VERSION" -srcfolder "$PAYLOAD" -format UDZO -ov "$TEMP_DMG" >/dev/null
 fi
 hdiutil verify "$TEMP_DMG" >/dev/null
 if [[ "$USE_DISKUTIL_IMAGE" == '1' ]]; then

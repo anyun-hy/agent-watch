@@ -50,7 +50,7 @@ class RustCandidatePackagingTests(unittest.TestCase):
         self.assertIn('"$CW_BACKEND_VARIANT" != rust-candidate', text)
         self.assertIn('"$CW_BUILD_ARCH" != arm64', text)
         self.assertIn('RUST_COMPONENTS_MANIFEST', text)
-        self.assertIn('Claude Watch Monitor Rust Candidate.app', text)
+        self.assertIn('Agent Watch.app', text)
         self.assertIn('Refusing to build into an installed application path.', text)
         self.assertIn('<key>BackendVariant</key><string>$CW_BACKEND_VARIANT</string>', text)
         self.assertIn('BACKGROUND_LEAK_WORKER', text)

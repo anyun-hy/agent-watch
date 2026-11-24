@@ -297,7 +297,7 @@ impl<O: AccountOs> AccountStore<O> {
             )),
             AccountOwnershipState::SplitBrainConflict { .. } => Err(err(
                 "external_switcher_conflict",
-                "原版切换器当前账号与 Claude Watch 不一致，为防止资料错槽覆盖已阻断切换",
+                "原版切换器当前账号与 Agent Watch 不一致，为防止资料错槽覆盖已阻断切换",
             )),
             AccountOwnershipState::UntrackedActiveMutation => Err(err(
                 "external_change",
@@ -330,7 +330,7 @@ impl<O: AccountOs> AccountStore<O> {
                 "code": "external_switcher_conflict",
                 "watch_current": watch_current,
                 "legacy_current": legacy_current,
-                "message": "原版切换器当前账号与 Claude Watch 不一致"
+                "message": "原版切换器当前账号与 Agent Watch 不一致"
             })),
             AccountOwnershipState::UntrackedActiveMutation => Some(json!({
                 "code": "external_change",

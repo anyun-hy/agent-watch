@@ -1,103 +1,147 @@
-# Claude Watch
+<div align="center">
 
-macOS 上的 Claude 受控启动、账号 A/B 切换与环境保护工具，同时观察 Claude、ChatGPT / Codex 的进程和代理连接。
+# Agent Watch
 
-当前源码版本为 **4.0.0（v4.0）**，内容以 Git `main` 提交为准；**应用版本与构建号由构建时显式指定**，仓库不代表当前已安装版本。版本摘要见 [CHANGELOG](CHANGELOG.md)。发行目标为 **Apple Silicon（arm64）**，部署最低版本以 `monitor/macos-minimum.txt` 为准。
+**macOS Seatbelt Network Guard, Leak Protection & Multi-Account Manager for AI Clients**
 
-运行组件采用 Rust `watch-engine`，界面为 SwiftUI。已登记功能缺陷完成对应源码修复与隔离回归，但**尚未完成同一提交上的完整构建、实际安装与持续运行验收**。源码状态与当前已安装版本分开核对。范围与历史验证证据见 [完整迁移清单](docs/RUST_MIGRATION_MATRIX.md)，Force 历史配置迁移见 [迁移说明](docs/OPENAI_FORCE_MIGRATION.md)。
+*Protect **Claude**, **ChatGPT**, and **Codex** (Desktop & CLI) from proxy drops, IP drift, and DNS/WebRTC leaks — built with Rust and native SwiftUI.*
 
-网络接入统一采用 **Rust 网关＋nono/Seatbelt**，打包使用免费的本机 ad-hoc 签名，无需付费开发者会员或 NetworkExtension 权限。旧扩展实现、激活和构建入口已退役；旧配置仍可识别并显式迁移，旧许可和回执不能作为当前保护证据。组件后端信息缺失或配置不合法时保持未就绪，不回退其他后端。
+[![Platform](https://img.shields.io/badge/macOS-26.0%2B%20(Apple%20Silicon)-111827?logo=apple&logoColor=white)](https://github.com/anyun-hy/agent-watch/releases/latest)
+[![Stack](https://img.shields.io/badge/Core-Rust%20%2B%20SwiftUI-EA580C?logo=rust&logoColor=white)](#architecture)
+[![Latest Release](https://img.shields.io/github/v/release/anyun-hy/agent-watch?label=Release&color=2563EB)](https://github.com/anyun-hy/agent-watch/releases/latest)
+[![License](https://img.shields.io/badge/License-Apache_2.0-16A34A)](LICENSE)
 
-## 日常使用
+**English** | [简体中文](README.zh-CN.md)
 
-- **环境状态**：自动识别代理，核对出口、时区、地区与日期格式、DNS、WebRTC 等检测结果。界面语言可以保持英文，无需手填国家、IP 或 DNS 名单。
-- **启动与账号**：通过“检查并启动 Claude”完成完整校验后启动；账号 A/B 保存和载入本地登录资料，空槽显示“未保存”。当前登录识别与本地资料槽分开。
-- **后台保护**：显示 Claude Watch 保镖、原版保镖、时区守护与更新任务的实际状态。
-- **代理与连接**：Claude 与 ChatGPT / Codex 共用连接关联和历史展示逻辑；按 TAG 的实际 GLOBAL / 规则模式核对路径。
-- **事件记录**：Rust 候选版默认显示关键事件，流量采样可单独查看；筛选和搜索覆盖本地当前及上一轮日志。后台持续运行时，流量日志最多每 5 分钟记录一轮，不改变实时采样。DNS、WebRTC 检测摘要仅记录来源、结果、阶段和固定错误类别。环境检测另记录前后的保护判定，以及判定后的心跳附加读取；相同状态最多每 5 分钟重记一次，判定、原因或心跳新鲜度发生变化时会记录。新增摘要不写入地址、节点、登录资料或凭据。完整重置会删除这些日志，排查时先核对需要的证据。
+</div>
 
-Claude 正常关闭后显示“后台保护待命，无需操作”。异常停止会保留原因；恢复使用时通过“检查并启动 Claude”重新完整校验。
+---
 
-## 安装和更新
+## Why Agent Watch?
 
-使用 `monitor/dist/` 中对应版本的 arm64 DMG。运行包内的 `安装或更新后台.command`，统一替换应用和后台。
+Desktop AI apps and coding CLIs frequently bypass system proxy settings, silently fall back to direct connections when a VPN flickers, or switch exit IPs mid-session. **Agent Watch** enforces fail-closed network isolation on macOS without requiring a paid Apple Developer Network Extension entitlement:
 
-安装器校验签名、架构及运行组件哈希，等待旧后台退出后替换；旧应用移入废纸篓，账号和保护设置保留。旧版 Watch 的辅助功能记录会清理，新版首次打开时重新请求系统授权。macOS 的 Touch ID／密码验证由用户完成。
+| Capability | What It Does |
+| :--- | :--- |
+| **Seatbelt Network Isolation** | Launches **Claude**, **ChatGPT**, and **Codex** (desktop & CLI) inside a controlled macOS Seatbelt sandbox routed exclusively through a pinned local gateway. |
+| **Real-Time Egress & Leak Guard** | Automatically inspects your active loopback proxy, exit IP consistency, region posture, and DNS / WebRTC leak evidence. Responds on drift or detachment according to your policy (`warn`, `close`, or `force`). |
+| **Controlled Entry & Pre-Flight Checks** | Opt-in controlled desktop wrappers and CLI entry points with automated pre-launch readiness checks — no manual IP or node configuration required. |
+| **Transactional Account Switching (A/B)** | Archives and switches account profiles with full SHA-256 verification, split-brain guards, and automatic rollback if any step fails. |
+| **Live Connection Graph & Offline Diagnostics** | Groups real-time platform, MCP, and component connections by service; exports one-click, PII-redacted diagnostic JSON bundles for troubleshooting. |
+| **Built-In Signed Auto-Update** | Checks and installs official GitHub Releases directly from inside the app with RSA-4096 signature + SHA-256 payload verification, preserving all accounts, settings, and initialization state. |
 
-卸载使用包内 `卸载应用.command`。它清理本工具应用、后台任务与辅助功能记录，保留账号资料和原版保镖。直接拖拽删除应用不能代替完整卸载流程。
+---
 
-需要完整重置 Watch 数据后重新安装时，按 [重新安装流程](docs/REINSTALL_WORKFLOW.md) 核对清理范围、打包和安装步骤。
+## System Requirements
 
-## 构建与验证
+- **OS**: macOS 26.0 or later
+- **Architecture**: Apple Silicon (`arm64`)
+- **Proxy**: A local loopback proxy (such as TAG, HTTP/HTTPS, or SOCKS5)
+- **Runtime**: Self-contained native Rust engine and SwiftUI app — no Python installation required
 
-依赖本机已有的 Xcode / Swift 和 Python 3.9 以上版本；**当前构建最低目标由 `monitor/macos-minimum.txt` 定义（现为 macOS 26.0）**，不是 macOS 13。构建不会自动安装或改变系统配置。
+---
 
-```sh
-# APP_VERSION 和 BUILD_NUMBER 均须显式指定；以下值仅示例，勿覆盖现有 DMG。
-APP_VERSION=3.0.0 BUILD_NUMBER=367 CW_BUILD_ARCH=arm64 bash monitor/package-dmg.sh
+## Quick Start (Install from Release)
+
+No local compilation is needed. Download the pre-built release directly from GitHub:
+
+1. **Download** the latest `Agent-Watch-<version>-build<n>-arm64.dmg` (and optional `.sha256` checksum file) from [GitHub Releases](https://github.com/anyun-hy/agent-watch/releases/latest).
+2. *(Optional)* Verify the download integrity:
+   ```bash
+   shasum -a 256 -c Agent-Watch-*-arm64.dmg.sha256
+   ```
+3. **Mount the DMG** and double-click **`安装或更新后台.command`**.
+   - Verifies bundle code signature, architecture, and component hashes.
+   - Installs `/Applications/Agent Watch.app` and registers the background supervision agent.
+   - Moves any prior version safely to Trash while preserving all accounts, logs, and settings.
+   - Never launches Claude / ChatGPT / Codex automatically and never edits your proxy/VPN configuration.
+4. **Open Agent Watch** from `/Applications` and complete the **First-Run Wizard**.
+   - Checks active proxy, exit IP, DNS, and WebRTC posture automatically.
+   - Guides you through macOS Accessibility permission and one-time Seatbelt local gateway authorization.
+
+> **Ad-hoc Signing Note**: Releases are signed with a free local ad-hoc signature rather than a paid Apple Developer ID notarization. If macOS Gatekeeper warns on first launch, allow `Agent Watch.app` in **System Settings → Privacy & Security** or right-click → **Open**.
+
+### Updating
+
+Once installed, future updates require **zero manual DMG downloads**:
+- Open **Agent Watch → Background Protection** and click **Check for Updates / Download & Install**.
+- The built-in updater fetches `release-manifest.json` from GitHub Releases, verifies the embedded RSA-4096 signature and every file's SHA-256 digest, replaces the app atomically, and preserves all your data.
+
+---
+
+## Uninstalling & Data Boundaries
+
+Run **`卸载应用.command`** inside the DMG, or run the built-in uninstaller directly:
+
+```bash
+"/Applications/Agent Watch.app/Contents/Resources/watch-engine" app-uninstall --apply
 ```
 
-`package-dmg.sh` **内部会调用 `monitor/build.sh`**，只需执行一次打包命令，避免重复构建。它默认从 Rust 后台清单复制 `watch-process-control`，不再编译并覆盖同名 Swift helper。直接只构建 App 时可使用相同版本环境变量运行 `monitor/build.sh`。两个脚本的默认中间 App 路径统一为 `monitor/build/Claude Watch Monitor Rust Candidate.app`；也可用 `CW_APP_OUTPUT` 自行指定同一个输出路径，例如：
+| Removed by Uninstaller | Strictly Preserved (Never Modified) |
+| :--- | :--- |
+| `/Applications/Agent Watch.app` (moved to Trash) | Native `Claude.app`, `ChatGPT.app`, `Codex` apps |
+| Agent Watch background LaunchAgent | Active Claude / ChatGPT login data & keychains |
+| Agent Watch macOS Accessibility entry | TAG / proxy / VPN software configuration |
+| Optional user-confirmed local state | Independent legacy tools (`Claude Switcher`, etc.) |
 
-```sh
-APP_VERSION=3.0.0 BUILD_NUMBER=367 CW_BUILD_ARCH=arm64 \
-CW_APP_OUTPUT="$PWD/monitor/build/Claude Watch Monitor Rust Candidate.app" \
-bash monitor/package-dmg.sh
+---
+
+## Troubleshooting & Privacy
+
+- **100% Local**: Agent Watch has zero telemetry, analytics, or third-party reporting.
+- **Read-Only Proxy Inspection**: Never overwrites or reloads your VPN/proxy configuration.
+- **Redacted Diagnostic Export**: Need to debug a launch gate or proxy issue? Click **Export Diagnostic Bundle** in the Activity page or First-Run Wizard to save `AgentWatch-diagnostics-*.json`. Credentials, account details, session tokens, and raw IP literals are automatically redacted before writing to disk.
+
+---
+
+## Architecture
+
+Agent Watch separates business authority cleanly from macOS UI adapters:
+
+- **Rust Core & Daemon (`crates/`)** — Single source of truth for all rules, verification, state, and protection:
+  - `watch-core`: Pure policy rules, process/network models, release source & redirect allowlists.
+  - `watch-runtime`: Sampling, evidence verification, fail-closed `ChannelSupervisor`, transactional account switching, lifecycle & signed auto-updater, redacted diagnostic exporter.
+  - `watch-engine`: CLI / IPC protocol and resident daemon orchestration.
+  - `watch-gateway-broker` & `watch-sandbox-launcher`: Root-pinned loopback socket broker and Seatbelt launcher.
+  - `watch-installer`: Clean reset, preflight, and installation workflow.
+- **Native macOS UI (`monitor/`)** — SwiftUI desktop app (`Agent Watch.app`), menu bar controller, live connection graph, WebKit DNS/WebRTC leak probes, and controlled desktop entry wrapper.
+
+### Development & Verification
+
+```bash
+# Verify Rust-to-Swift policy table sync
+python3 tools/generate-ai-policy-swift.py --check
+
+# Run pure core unit & integration tests
+cargo test -p claude-watch-core
+
+# Run updater, lifecycle, and diagnostic contract tests
+cargo test -p claude-watch-runtime --lib diagnostic_bundle
+cargo test -p claude-watch-runtime --test update_contracts --test update_permissions_regressions --test app_lifecycle_contracts
 ```
 
-打包完成会生成带 SHA-256 校验文件的 DMG；脚本拒绝覆盖同名安装包。**打包不会安装**；安装、删除数据或调整系统权限必须单独授权。
+Releases are built and RSA-4096 signed automatically on GitHub Actions (`macos-26`, `arm64`) via [.github/workflows/release.yml](.github/workflows/release.yml) whenever a SemVer tag (`vX.Y.Z`) is pushed.
 
-默认测试入口（Level 1，不要求图形桌面）：
+### Additional Documentation
 
-```sh
-bash tools/test-all.sh
-```
+- [Changelog](CHANGELOG.md)
+- [Architecture & Rust Migration Notes](docs/RUST_MIGRATION.md)
+- [Reinstall Workflow & Boundaries](docs/REINSTALL_WORKFLOW.md)
+- [Monitor UI Module Notes](monitor/README.md)
 
-默认只运行 `watch-core` 的纯 Rust 规则与契约测试，并保存本次运行报告；不代表整个 Rust 工作区、Python/JS 或 Swift 回归通过。
+---
 
-- **Level 2**：`bash tools/test-all.sh --level 2` 单独运行原生网关与 Seatbelt 隔离测试，不安装服务。
-- **Level 3**：`bash tools/test-all.sh --level 3 --list` 只列出实机验收项目，不执行。安装版生命周期、真实账号和保护效果需要另行授权验证。
-- 如需查看跨语言混合夹具的范围，使用 `bash tools/test-all.sh --all-fixtures --list`。列清单不是运行测试；实际执行混合夹具会构建临时应用。
+## License
 
-各层的环境要求、覆盖范围与排除项见[分层测试说明](docs/TESTING.md)。
+Agent Watch is open-source software licensed under the **[Apache License 2.0](LICENSE)**.
 
-只需运行原有选定回归时，仍可使用：
+You are free to use, modify, and distribute this project (including for commercial use) under the terms of Apache-2.0, including its explicit patent grant, provided you retain the license and copyright notices.
 
-```sh
-bash tools/test-final-no-signal.sh
-```
+### Third-Party Open-Source Notices
 
-该旧脚本只覆盖选定集合，不是全工作区测试；其中也会终止自建的测试子进程。测试通过不等同于安装、真实后台保护或真实界面验收。
-
-Swift 测试、隔离界面与真实界面验收说明见 [原生应用开发说明](monitor/README.md)。
-
-## 目录
-
-| 路径 | 内容 |
-| --- | --- |
-| `crates/watch-engine/` | 原生 Rust 命令行、采集后台、只读诊断与受控网关守护进程 |
-| `monitor/Sources/` | SwiftUI 界面、状态模型、连接关联展示 |
-| `monitor/Resources/` | WebView 检测页面、辅助脚本、图标资产（不携带已退役的 Python 后台） |
-| `monitor/Packaging/` | 完整安装、卸载与权限处理 |
-| `monitor/ThirdParty/` | 固定版本的上游源码、来源清单和许可证 |
-| `crates/*/tests/`、`tools/tests/`、`monitor/tests/` | Rust、工具契约、原生界面和集成测试 |
-| `monitor/tools/` | 构建与维护辅助工具 |
-| `crates/`、`Cargo.toml` | 已接入的 Rust 策略核心、运行时、原生引擎和安装组件 |
-| `tools/rust_shadow.py` | 新旧实现的同输入对照与回放验证 |
-| `monitor/build/`、`monitor/dist/` | 可重新生成的构建产物与安装包，不进入 Git |
-| `monitor/reports/` | 本机验收和观测记录，不进入 Git |
-| `local/` | 本地研究资料、历史文档和维护记录，不进入 Git |
-
-本机真实运行数据位于 `~/Library/Application Support/ClaudeWatch`；Claude 登录资料属于 Claude 自身的数据目录，均不应放入源码仓库。
-
-## 保护边界
-
-- 完整启动校验、运行中的 IP 变化／中国风险／DNS 与 WebRTC 风险拦截、异常锁定和事务回滚保持独立。历史数据与界面绿色状态不授予启动许可。
-- 受控实例的通道处置拒绝新连接并关闭已有连接，保留应用进程；已有 `force` 策略仍会另外请求强制退出，不能将它等同于保进程。监控依据实际执行回执更新。Seatbelt 只保护通过受控入口启动且完成核验的进程树，其他入口及已运行的未受控实例不能冒充已保护。VPN 配置由 VPN 软件管理，Watch 只检测并与保存的预期核对。
-- 进程处置记录 PID、UID、启动时间及可执行文件身份；决策层把完整身份传到终止回调，效果适配器在真正调用退出 API 前再次复核。这能阻止已观察到的 PID 复用，但 macOS PID 查验与信号发送并非原子事务，仍无法完全消除检查与发送之间的竞争窗口（C05）。
-- WebRTC 结果仅覆盖当前检测 WebView；路径动画表示观测到的连接，不表示持续传输或所有安全检查通过。
-- 无发布清单和公钥时，自动更新显示不可用，不会从未知来源下载。
-
-实现与模块映射见 [保护与账号设计](monitor/SWITCHER.md)，数据源说明见 [Net.Coffee 接入](monitor/NETCOFFEE.md)，版本摘要见 [CHANGELOG.md](CHANGELOG.md)。
-
-Git 记录从当前源码状态开始建立；安装包、缓存、真实账号、HAR 和本机日志由 `.gitignore` 排除。提交、推送、安装及系统设置修改按各次明确授权执行。
+| Component / Asset | License | Notice File |
+| :--- | :--- | :--- |
+| **nono** (Seatbelt sandboxing) | Apache-2.0 | [monitor/ThirdParty/nono/LICENSE](monitor/ThirdParty/nono/LICENSE) |
+| **Claude Switcher** (upstream account engine) | MIT | [monitor/ThirdParty/ClaudeSwitcher/LICENSE](monitor/ThirdParty/ClaudeSwitcher/LICENSE) |
+| **Lucide Icons** (graph icons) | ISC / MIT | [monitor/Resources/Icons/LICENSE](monitor/Resources/Icons/LICENSE) |
+| **flag-icons** (country flags) | MIT | [monitor/Resources/Identity/FLAG-ICONS-LICENSE.txt](monitor/Resources/Identity/FLAG-ICONS-LICENSE.txt) |

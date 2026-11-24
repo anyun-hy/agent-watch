@@ -52,7 +52,7 @@ final class LeakDiagnosticTrace {
             try openNextFile()
         } catch {
             self.error = "leak_diagnostic_open_failed"
-            NSLog("Claude Watch: leak diagnostic log unavailable (%d).", (error as NSError).code)
+            NSLog("Agent Watch: leak diagnostic log unavailable (%d).", (error as NSError).code)
         }
     }
     deinit { if directoryFD >= 0 { close(directoryFD) } }
@@ -90,7 +90,7 @@ final class LeakDiagnosticTrace {
             count += 1
         } catch {
             self.error = "leak_diagnostic_write_failed"
-            NSLog("Claude Watch: leak diagnostic write failed (%d).", (error as NSError).code)
+            NSLog("Agent Watch: leak diagnostic write failed (%d).", (error as NSError).code)
             try? file?.close(); file = nil
         }
     }

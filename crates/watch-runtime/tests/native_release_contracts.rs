@@ -107,7 +107,7 @@ fn tcc_reset_is_exact_bundle_and_standard_path_only() {
     ]);
     release
         .reset_accessibility(
-            Path::new("/Applications/Claude Watch Monitor.app"),
+            Path::new("/Applications/Agent Watch.app"),
             BUNDLE_ID,
         )
         .unwrap();
@@ -125,9 +125,9 @@ fn tcc_reset_is_exact_bundle_and_standard_path_only() {
 }
 #[test]
 fn running_state_requires_exact_executable_not_substring() {
-    let mut release=native(vec![ok("101 1 501 Mon Oct 26 11:20:30 2026 /Applications/Claude Watch Monitor.app/Contents/MacOS/ClaudeWatchMonitor-helper\n102 1 501 Mon Oct 26 11:20:30 2026 /Applications/Claude Watch Monitor.app/Contents/MacOS/ClaudeWatchMonitor\n")]);
+    let mut release=native(vec![ok("101 1 501 Mon Oct 26 11:20:30 2026 /Applications/Agent Watch.app/Contents/MacOS/AgentWatch-helper\n102 1 501 Mon Oct 26 11:20:30 2026 /Applications/Agent Watch.app/Contents/MacOS/AgentWatch\n")]);
     assert!(release
-        .app_running(Path::new("/Applications/Claude Watch Monitor.app"))
+        .app_running(Path::new("/Applications/Agent Watch.app"))
         .unwrap());
 }
 
@@ -179,7 +179,7 @@ fn plist_values_use_bounded_plutil_json_with_exact_field_matching() {
     )]);
     assert_eq!(
         release
-            .installed_version(Path::new("/unused/Claude Watch Monitor.app"))
+            .installed_version(Path::new("/unused/Agent Watch.app"))
             .unwrap(),
         "2.5.0"
     );
@@ -193,7 +193,7 @@ fn plist_json_does_not_accept_substring_keys() {
     let mut release = native(vec![ok(r#"{"prefixCFBundleShortVersionString":"wrong"}"#)]);
     assert_eq!(
         release
-            .installed_version(Path::new("/unused/Claude Watch Monitor.app"))
+            .installed_version(Path::new("/unused/Agent Watch.app"))
             .unwrap_err()
             .code,
         "invalid_app_bundle"
@@ -201,12 +201,12 @@ fn plist_json_does_not_accept_substring_keys() {
 }
 #[test]
 fn stop_app_keeps_the_complete_executable_path_when_it_contains_spaces() {
-    let target = "/Applications/Claude Watch Monitor.app/Contents/MacOS/ClaudeWatchMonitor";
+    let target = "/Applications/Agent Watch.app/Contents/MacOS/AgentWatch";
     let sample=format!("101 1 501 Mon Oct 26 11:20:30 2026 {target}-helper\n102 1 501 Mon Oct 26 11:20:30 2026 {target}\n");
     let unrelated = "101 1 501 Mon Oct 26 11:20:30 2026 /usr/bin/true\n";
     let mut release = native(vec![ok(&sample), ok(&sample), ok(""), ok(unrelated)]);
     release
-        .stop_app(Path::new("/Applications/Claude Watch Monitor.app"))
+        .stop_app(Path::new("/Applications/Agent Watch.app"))
         .unwrap();
     assert_eq!(release.executor.calls[2].program, Path::new("/bin/kill"));
     assert_eq!(release.executor.calls[2].args, ["-TERM", "102"]);
@@ -218,7 +218,7 @@ fn validate_bundle_uses_plutil_json_for_all_metadata_without_reading_plist_bytes
     let resources = app.join("Contents/Resources");
     fs::create_dir_all(app.join("Contents/MacOS")).unwrap();
     fs::create_dir_all(&resources).unwrap();
-    fs::write(app.join("Contents/MacOS/ClaudeWatchMonitor"), []).unwrap();
+    fs::write(app.join("Contents/MacOS/AgentWatch"), []).unwrap();
     for name in [
         "watch-engine",
         "watch-native-observer",
@@ -229,7 +229,7 @@ fn validate_bundle_uses_plutil_json_for_all_metadata_without_reading_plist_bytes
         fs::write(resources.join(name), []).unwrap();
     }
     let empty_hash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
-    let info = r#"{"CFBundleIdentifier":"io.local.watchpanel","CFBundleExecutable":"ClaudeWatchMonitor","CFBundleShortVersionString":"2.5.0","CFBundleVersion":"250"}"#;
+    let info = r#"{"CFBundleIdentifier":"io.local.watchpanel","CFBundleExecutable":"AgentWatch","CFBundleShortVersionString":"2.5.0","CFBundleVersion":"250"}"#;
     let manifest=serde_json::json!({"Architecture":"arm64","ProductVersion":"2.5.0","BackendVariant":"rust-candidate","RuntimeSchema":2,
         "RuntimeHashes":{"watch-engine":empty_hash,"watch-native-observer":empty_hash,"watch-process-control":empty_hash,"watch-admin.sh":empty_hash,"watch-native-collector.zsh":empty_hash}}).to_string();
     let replies = vec![
@@ -282,7 +282,7 @@ fn background_evidence_bundle_requires_all_nine_hashed_files_and_arm64_worker() 
     let resources = app.join("Contents/Resources");
     fs::create_dir_all(app.join("Contents/MacOS")).unwrap();
     fs::create_dir_all(&resources).unwrap();
-    fs::write(app.join("Contents/MacOS/ClaudeWatchMonitor"), []).unwrap();
+    fs::write(app.join("Contents/MacOS/AgentWatch"), []).unwrap();
     let required = [
         "watch-engine",
         "watch-native-observer",
@@ -302,7 +302,7 @@ fn background_evidence_bundle_requires_all_nine_hashed_files_and_arm64_worker() 
         .into_iter()
         .map(|name| (name.to_owned(), serde_json::json!(empty_hash)))
         .collect::<serde_json::Map<_, _>>();
-    let info = r#"{"CFBundleIdentifier":"io.local.watchpanel","CFBundleExecutable":"ClaudeWatchMonitor","CFBundleShortVersionString":"2.5.0","CFBundleVersion":"250"}"#;
+    let info = r#"{"CFBundleIdentifier":"io.local.watchpanel","CFBundleExecutable":"AgentWatch","CFBundleShortVersionString":"2.5.0","CFBundleVersion":"250"}"#;
     let manifest = serde_json::json!({
         "Architecture":"arm64", "ProductVersion":"2.5.0", "BackendVariant":"rust-candidate",
         "RuntimeSchema":2, "BackgroundEvidenceSchema":1, "RuntimeHashes":hashes,
@@ -392,7 +392,7 @@ fn old_app_identity_remains_inspectable_without_old_runtime_execution() {
     let app = std::env::temp_dir().join(format!("cw-old-identity-{}.app", Uuid::new_v4()));
     fs::create_dir(&app).unwrap();
     let mut release = native(vec![ok(
-        r#"{"CFBundleIdentifier":"io.local.watchpanel","CFBundleExecutable":"ClaudeWatchMonitor"}"#,
+        r#"{"CFBundleIdentifier":"io.local.watchpanel","CFBundleExecutable":"AgentWatch"}"#,
     )]);
     assert_eq!(
         release.inspect_installed(&app).unwrap().bundle_id,
@@ -408,13 +408,13 @@ fn old_app_identity_remains_inspectable_without_old_runtime_execution() {
 
 #[test]
 fn reused_app_pid_is_not_signalled() {
-    let target = "/Applications/Claude Watch Monitor.app/Contents/MacOS/ClaudeWatchMonitor";
+    let target = "/Applications/Agent Watch.app/Contents/MacOS/AgentWatch";
     let first = format!("102 1 501 Mon Oct 26 11:20:30 2026 {target}\n");
     let reused = format!("102 1 501 Mon Oct 26 11:20:31 2026 {target}\n");
     let unrelated = "101 1 501 Mon Oct 26 11:20:30 2026 /usr/bin/true\n";
     let mut release = native(vec![ok(&first), ok(&reused), ok(unrelated)]);
     release
-        .stop_app(Path::new("/Applications/Claude Watch Monitor.app"))
+        .stop_app(Path::new("/Applications/Agent Watch.app"))
         .unwrap();
     assert!(release
         .executor
@@ -429,7 +429,7 @@ fn seatbelt_bundle_requires_hashed_arm64_sandbox_launcher_and_gateway_broker() {
     let resources = app.join("Contents/Resources");
     fs::create_dir_all(app.join("Contents/MacOS")).unwrap();
     fs::create_dir_all(&resources).unwrap();
-    fs::write(app.join("Contents/MacOS/ClaudeWatchMonitor"), []).unwrap();
+    fs::write(app.join("Contents/MacOS/AgentWatch"), []).unwrap();
     let required = [
         "watch-engine",
         "watch-native-observer",
@@ -447,7 +447,7 @@ fn seatbelt_bundle_requires_hashed_arm64_sandbox_launcher_and_gateway_broker() {
         .into_iter()
         .map(|name| (name.to_owned(), serde_json::json!(empty_hash)))
         .collect::<serde_json::Map<_, _>>();
-    let info = r#"{"CFBundleIdentifier":"io.local.watchpanel","CFBundleExecutable":"ClaudeWatchMonitor","CFBundleShortVersionString":"2.5.0","CFBundleVersion":"250"}"#;
+    let info = r#"{"CFBundleIdentifier":"io.local.watchpanel","CFBundleExecutable":"AgentWatch","CFBundleShortVersionString":"2.5.0","CFBundleVersion":"250"}"#;
     let manifest = serde_json::json!({
         "Architecture":"arm64", "ProductVersion":"2.5.0", "BackendVariant":"rust-candidate",
         "NetworkBackend":"seatbelt", "RuntimeSchema":2, "RuntimeHashes":hashes,
@@ -505,7 +505,7 @@ fn packaged_seatbelt_manifest_accepts_pinned_build_identity_and_rejects_unlisted
     let resources = app.0.join("Contents/Resources");
     fs::create_dir_all(app.0.join("Contents/MacOS")).unwrap();
     fs::create_dir_all(&resources).unwrap();
-    fs::write(app.0.join("Contents/MacOS/ClaudeWatchMonitor"), b"owned fixture").unwrap();
+    fs::write(app.0.join("Contents/MacOS/AgentWatch"), b"owned fixture").unwrap();
     // Full current build.sh contract: runtime schema 2, Seatbelt, background
     // evidence v2, native controlled entry, and diagnostic build provenance.
     let required = [
@@ -525,7 +525,7 @@ fn packaged_seatbelt_manifest_accepts_pinned_build_identity_and_rejects_unlisted
     let manifest = serde_json::json!({"Architecture":"arm64","ProductVersion":"4.0.0",
         "BackendVariant":"rust-candidate","NetworkBackend":"seatbelt","RuntimeSchema":2,
         "BackgroundEvidenceSchema":2,"RuntimeHashes":hashes});
-    let info = r#"{"CFBundleIdentifier":"io.local.watchpanel","CFBundleExecutable":"ClaudeWatchMonitor","CFBundleShortVersionString":"4.0.0","CFBundleVersion":"400"}"#;
+    let info = r#"{"CFBundleIdentifier":"io.local.watchpanel","CFBundleExecutable":"AgentWatch","CFBundleShortVersionString":"4.0.0","CFBundleVersion":"400"}"#;
     let validate = |manifest: &serde_json::Value| {
         let replies = vec![ok(info), ok(""), ok("arm64"), ok("arm64"), ok("arm64"), ok("arm64"),
             ok(&manifest.to_string()), ok("arm64"), ok("arm64"), ok("arm64"), ok("arm64")];

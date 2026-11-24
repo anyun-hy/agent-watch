@@ -7,11 +7,11 @@ on:
   workflow_dispatch:
     inputs:
       app_version:
-        description: "Semantic version (e.g. 3.0.1)"
+        description: "Semantic version (e.g. 4.1.0)"
         required: true
         type: string
       build_number:
-        description: "Monotonic positive integer build number (e.g. 446)"
+        description: "Monotonic positive integer build number (e.g. 505)"
         required: true
         type: string
       prerelease:
@@ -62,8 +62,8 @@ jobs:
           echo "app_version=$APP_VERSION" >> "$GITHUB_OUTPUT"
           echo "build_number=$BUILD_NUMBER" >> "$GITHUB_OUTPUT"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "update_zip=Claude-Watch-update-${APP_VERSION}-build${BUILD_NUMBER}-arm64.zip" >> "$GITHUB_OUTPUT"
-          echo "dmg_name=Claude-Watch-${APP_VERSION}-build${BUILD_NUMBER}-arm64.dmg" >> "$GITHUB_OUTPUT"
+          echo "update_zip=Agent-Watch-update-${APP_VERSION}-build${BUILD_NUMBER}-arm64.zip" >> "$GITHUB_OUTPUT"
+          echo "dmg_name=Agent-Watch-${APP_VERSION}-build${BUILD_NUMBER}-arm64.dmg" >> "$GITHUB_OUTPUT"
 
       - name: Validate release signing secret and embedded public key
         shell: bash
@@ -126,7 +126,7 @@ jobs:
           mkdir -p release-assets
           ARCHIVE_URL="https://github.com/${REPO}/releases/download/${TAG}/${UPDATE_ZIP}"
           python3 tools/package-release-update.py \
-            --app "monitor/build/Claude Watch Monitor Rust Candidate.app" \
+            --app "monitor/build/Agent Watch.app" \
             --version "$APP_VERSION" \
             --build "$BUILD_NUMBER" \
             --architecture arm64 \
@@ -148,16 +148,16 @@ jobs:
           PRERELEASE: ${{ inputs.prerelease || false }}
         run: |
           set -euo pipefail
-          NOTES="Claude Watch v${APP_VERSION} (Build ${BUILD_NUMBER}, macOS arm64 Seatbelt)."
+          NOTES="Agent Watch v${APP_VERSION} (Build ${BUILD_NUMBER}, macOS arm64 Seatbelt)."
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release upload "$TAG" release-assets/* --clobber
           elif [[ "$PRERELEASE" == "true" ]]; then
             gh release create "$TAG" release-assets/* \
-              --title "Claude Watch v${APP_VERSION} (Build ${BUILD_NUMBER})" \
+              --title "Agent Watch v${APP_VERSION} (Build ${BUILD_NUMBER})" \
               --notes "$NOTES" \
               --prerelease
           else
             gh release create "$TAG" release-assets/* \
-              --title "Claude Watch v${APP_VERSION} (Build ${BUILD_NUMBER})" \
+              --title "Agent Watch v${APP_VERSION} (Build ${BUILD_NUMBER})" \
               --notes "$NOTES"
           fi

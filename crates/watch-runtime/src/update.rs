@@ -56,7 +56,7 @@ pub trait UpdateOs {
         ))
     }
     fn should_reset_accessibility(&self, app: &Path) -> bool {
-        app == Path::new("/Applications/Claude Watch Monitor.app")
+        app == Path::new("/Applications/Agent Watch.app")
     }
     fn reset_accessibility(&mut self, _app: &Path, _bundle: &str) -> Result<()> {
         Err(err(
@@ -304,7 +304,7 @@ pub fn verify_extract(archive: &Path, destination: &Path, release: &Release) -> 
         "runtime/BuildInfo.plist",
         "runtime/watch-admin.sh",
         "runtime/watch-process-control",
-        "app/Claude Watch Monitor.app/Contents/Info.plist",
+        "app/Agent Watch.app/Contents/Info.plist",
     ] {
         if !release.files.contains_key(required) {
             return Err(err("release_incomplete", "更新包缺少必要组件"));
@@ -318,7 +318,7 @@ pub fn verify_extract(archive: &Path, destination: &Path, release: &Release) -> 
         "BuildInfo.plist",
     ] {
         let runtime = format!("runtime/{name}");
-        let bundled = format!("app/Claude Watch Monitor.app/Contents/Resources/{name}");
+        let bundled = format!("app/Agent Watch.app/Contents/Resources/{name}");
         if !release.files.contains_key(&runtime)
             || release.files.get(&runtime) != release.files.get(&bundled)
         {
@@ -330,7 +330,7 @@ pub fn verify_extract(archive: &Path, destination: &Path, release: &Release) -> 
     }
     for component in ["watch-sandbox-launcher", "watch-gateway-broker", "BuildIdentity.json"] {
         let runtime = format!("runtime/{component}");
-        let bundled = format!("app/Claude Watch Monitor.app/Contents/Resources/{component}");
+        let bundled = format!("app/Agent Watch.app/Contents/Resources/{component}");
         if (release.files.contains_key(&runtime) || release.files.contains_key(&bundled))
             && release.files.get(&runtime) != release.files.get(&bundled) {
             return Err(err(
@@ -454,7 +454,7 @@ fn fetch_https_bounded(url: &str, limit: u64, proxy_url: Option<&str>) -> Result
         let response = agent
             .get(&current)
             .header("Accept-Encoding", "identity")
-            .header("User-Agent", "ClaudeWatchUpdater/1")
+            .header("User-Agent", "AgentWatchUpdater/1")
             .call()
             .map_err(|_| err("update_download_failed", "更新下载失败"))?;
         let status = response.status().as_u16();
@@ -575,7 +575,7 @@ impl<O: UpdateOs, T: Transport> Updater<O, T> {
             fs::create_dir(&payload_dir).map_err(io)?;
             verify_extract(&zip, &payload_dir, &release)?;
             let _ = fs::remove_file(&zip);
-            let app_path = payload_dir.join("app/Claude Watch Monitor.app");
+            let app_path = payload_dir.join("app/Agent Watch.app");
             self.os.verify_app(&app_path, &release.version)?;
             Ok(app_path)
         })();
@@ -668,7 +668,7 @@ impl<O: UpdateOs, T: Transport> Updater<O, T> {
     pub fn apply_payload(&mut self, source: &Path, release: &Release) -> Result<()> {
         let targets = [
             (
-                source.join("app/Claude Watch Monitor.app"),
+                source.join("app/Agent Watch.app"),
                 self.paths.app.clone(),
             ),
             (source.join("runtime"), self.paths.watch.join("runtime")),

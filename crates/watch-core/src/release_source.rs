@@ -6,9 +6,9 @@
 
 use url::Url;
 
-pub const DEFAULT_RELEASE_REPO: &str = "anyun-hy/claude-watch";
+pub const DEFAULT_RELEASE_REPO: &str = "anyun-hy/agent-watch";
 pub const DEFAULT_RELEASE_MANIFEST_URL: &str =
-    "https://github.com/anyun-hy/claude-watch/releases/latest/download/release-manifest.json";
+    "https://github.com/anyun-hy/agent-watch/releases/latest/download/release-manifest.json";
 pub const DEFAULT_RELEASE_PUBLIC_KEY_PEM: &str = include_str!("default_release_public_key.pem");
 
 const GITHUB_RELEASE_HOSTS: [&str; 3] = [
@@ -155,10 +155,10 @@ mod tests {
 
     #[test]
     fn github_redirect_allowlist_permits_release_cdn_and_blocks_arbitrary_hosts_or_http() {
-        let gh = "https://github.com/anyun-hy/claude-watch/releases/latest/download/release-manifest.json";
+        let gh = "https://github.com/anyun-hy/agent-watch/releases/latest/download/release-manifest.json";
         assert!(redirect_allowed(
             gh,
-            "https://github.com/anyun-hy/claude-watch/releases/download/v3.0.1/release-manifest.json"
+            "https://github.com/anyun-hy/agent-watch/releases/download/v4.1.0/release-manifest.json"
         ));
         assert!(redirect_allowed(
             gh,

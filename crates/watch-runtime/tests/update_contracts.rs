@@ -126,7 +126,7 @@ fn native_archives_require_matching_components_and_reject_old_business_resources
         let archive = root.join("release.zip");
         let mut contents = BTreeMap::<String, Vec<u8>>::new();
         contents.insert(
-            "app/Claude Watch Monitor.app/Contents/Info.plist".into(),
+            "app/Agent Watch.app/Contents/Info.plist".into(),
             b"native-app".to_vec(),
         );
         for name in [
@@ -139,7 +139,7 @@ fn native_archives_require_matching_components_and_reject_old_business_resources
         ] {
             for prefix in [
                 "runtime/",
-                "app/Claude Watch Monitor.app/Contents/Resources/",
+                "app/Agent Watch.app/Contents/Resources/",
             ] {
                 contents.insert(format!("{prefix}{name}"), name.as_bytes().to_vec());
             }
@@ -154,7 +154,7 @@ fn native_archives_require_matching_components_and_reject_old_business_resources
             contents.insert("runtime/watch-engine".into(), b"different".to_vec());
         }
         if case.starts_with("build_identity") {
-            contents.insert("app/Claude Watch Monitor.app/Contents/Resources/BuildIdentity.json".into(), b"identity".to_vec());
+            contents.insert("app/Agent Watch.app/Contents/Resources/BuildIdentity.json".into(), b"identity".to_vec());
             if case != "build_identity_missing" {
                 contents.insert("runtime/BuildIdentity.json".into(), if case == "build_identity_mismatch" { b"other".to_vec() } else { b"identity".to_vec() });
             }
@@ -208,7 +208,7 @@ fn new_native_failure_removes_new_roots_and_leaves_legacy_backend_untouched() {
     fs::write(&paths.backend, b"legacy-unchanged").unwrap();
     let source = root.join("source");
     fs::create_dir_all(source.join("app")).unwrap();
-    fs::write(source.join("app/Claude Watch Monitor.app"), b"new-app").unwrap();
+    fs::write(source.join("app/Agent Watch.app"), b"new-app").unwrap();
     fs::write(source.join("runtime"), b"new-runtime").unwrap();
     let release = Release {
         version: "3.0.0".into(),
@@ -442,7 +442,7 @@ fn apply_false_is_unavailable_without_source_and_health_failure_restores_all_com
     .unwrap();
     let source = root.join("payload");
     for p in [
-        source.join("app/Claude Watch Monitor.app"),
+        source.join("app/Agent Watch.app"),
         source.join("runtime"),
         source.join("claude-watch.sh"),
     ] {
@@ -548,7 +548,7 @@ fn failed_update_after_accessibility_reset_reports_required_reauthorization() {
     fs::write(paths.watch.join("runtime"), b"old runtime").unwrap();
     let source = root.join("source");
     fs::create_dir_all(source.join("app")).unwrap();
-    fs::write(source.join("app/Claude Watch Monitor.app"), b"new app").unwrap();
+    fs::write(source.join("app/Agent Watch.app"), b"new app").unwrap();
     fs::write(source.join("runtime"), b"new runtime").unwrap();
     let release = Release {
         version: "3.0.0".into(),
@@ -614,16 +614,16 @@ fn build_number_comparison_and_github_release_cdn_rules_work() {
     assert!(!is_newer_release("3.0.0", Some(444), "3.0.0", None).unwrap());
 
     assert!(claude_watch_core::release_source::archive_origin_allowed(
-        "https://github.com/anyun-hy/claude-watch/releases/latest/download/release-manifest.json",
-        "https://github.com/anyun-hy/claude-watch/releases/download/v3.0.1/Claude-Watch-update.zip"
+        "https://github.com/anyun-hy/agent-watch/releases/latest/download/release-manifest.json",
+        "https://github.com/anyun-hy/agent-watch/releases/download/v3.0.1/Agent-Watch-update.zip"
     ));
     assert!(claude_watch_core::release_source::archive_origin_allowed(
-        "https://github.com/anyun-hy/claude-watch/releases/latest/download/release-manifest.json",
+        "https://github.com/anyun-hy/agent-watch/releases/latest/download/release-manifest.json",
         "https://objects.githubusercontent.com/github-production-release-asset/foo.zip"
     ));
     assert!(!claude_watch_core::release_source::archive_origin_allowed(
-        "https://github.com/anyun-hy/claude-watch/releases/latest/download/release-manifest.json",
-        "https://evil.invalid/Claude-Watch-update.zip"
+        "https://github.com/anyun-hy/agent-watch/releases/latest/download/release-manifest.json",
+        "https://evil.invalid/Agent-Watch-update.zip"
     ));
 }
 
@@ -646,7 +646,7 @@ fn package_release_update_script_output_verifies_end_to_end_in_rust_updater() {
     fs::create_dir_all(&resources).unwrap();
     fs::create_dir_all(&macos).unwrap();
     fs::write(app.join("Contents/Info.plist"), b"synthetic-info-plist").unwrap();
-    fs::write(macos.join("ClaudeWatchMonitor"), b"synthetic-ui-bin").unwrap();
+    fs::write(macos.join("AgentWatch"), b"synthetic-ui-bin").unwrap();
     for name in [
         "watch-engine",
         "watch-native-observer",
@@ -681,10 +681,10 @@ fn package_release_update_script_output_verifies_end_to_end_in_rust_updater() {
         .unwrap()
         .success());
 
-    let archive_out = root.join("out/Claude-Watch-update-3.0.1-build501-arm64.zip");
+    let archive_out = root.join("out/Agent-Watch-update-3.0.1-build501-arm64.zip");
     let manifest_out = root.join("out/release-manifest.json");
     let archive_url =
-        "https://github.com/anyun-hy/claude-watch/releases/download/v3.0.1/Claude-Watch-update-3.0.1-build501-arm64.zip";
+        "https://github.com/anyun-hy/agent-watch/releases/download/v3.0.1/Agent-Watch-update-3.0.1-build501-arm64.zip";
 
     let pkg = Command::new("python3")
         .arg(&script)
@@ -725,7 +725,7 @@ fn package_release_update_script_output_verifies_end_to_end_in_rust_updater() {
 
     let extracted = root.join("extracted");
     verify_extract(&archive_out, &extracted, &release).unwrap();
-    assert!(extracted.join("app/Claude Watch Monitor.app/Contents/Info.plist").is_file());
+    assert!(extracted.join("app/Agent Watch.app/Contents/Info.plist").is_file());
     assert!(extracted.join("runtime/watch-engine").is_file());
     assert!(extracted.join("runtime/watch-gateway-broker").is_file());
 

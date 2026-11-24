@@ -3,8 +3,8 @@
 set -euo pipefail
 PATH='/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin'
 
-PRODUCT_NAME='Claude Watch'
-APP_NAME='Claude Watch Monitor.app'
+PRODUCT_NAME='Agent Watch'
+APP_NAME='Agent Watch.app'
 AGENT_LABEL='io.local.claudewatch.agent'
 
 say() { printf '\n[%s] %s\n' "$PRODUCT_NAME" "$*"; }

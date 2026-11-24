@@ -16,12 +16,12 @@ final class StatusBarController: NSObject, NSWindowDelegate {
         super.init()
         if let button = item.button {
             let symbol = NSImage(systemSymbolName: "shield.lefthalf.filled",
-                                  accessibilityDescription: "Claude Watch")
+                                  accessibilityDescription: "Agent Watch")
                 ?? NSImage(systemSymbolName: "shield.fill",
-                           accessibilityDescription: "Claude Watch")
+                           accessibilityDescription: "Agent Watch")
             symbol?.isTemplate = true
             button.image = symbol
-            button.toolTip = "Claude Watch 正在后台守护（左键开合主窗口，右键菜单）"
+            button.toolTip = "Agent Watch 正在后台守护（左键开合主窗口，右键菜单）"
             button.target = self
             button.action = #selector(statusItemClicked)
             button.sendAction(on: [.leftMouseUp, .rightMouseUp])
@@ -85,7 +85,7 @@ final class StatusBarController: NSObject, NSWindowDelegate {
 
     private func buildMenu() -> NSMenu {
         let menu = NSMenu()
-        let status = NSMenuItem(title: "Claude Watch 正在后台守护", action: nil, keyEquivalent: "")
+        let status = NSMenuItem(title: "Agent Watch 正在后台守护", action: nil, keyEquivalent: "")
         status.isEnabled = false
         menu.addItem(status)
         menu.addItem(.separator())
@@ -96,7 +96,7 @@ final class StatusBarController: NSObject, NSWindowDelegate {
         hide.target = self
         menu.addItem(hide)
         menu.addItem(.separator())
-        let quit = NSMenuItem(title: "退出 Claude Watch", action: #selector(quitFromMenu), keyEquivalent: "q")
+        let quit = NSMenuItem(title: "退出 Agent Watch", action: #selector(quitFromMenu), keyEquivalent: "q")
         quit.target = self
         menu.addItem(quit)
         return menu

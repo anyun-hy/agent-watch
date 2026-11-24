@@ -127,7 +127,7 @@ struct FirstRunView: View {
         .font(WatchTypography.body).fontDesign(.monospaced)
         .preferredColorScheme(dark ? .dark : .light)
         .frame(minWidth: 900, minHeight: 660)
-        .navigationTitle("Claude Watch · 首次初始化")
+        .navigationTitle("Agent Watch · 首次初始化")
         .onChange(of: initialization.approval?.id) {
             if initialization.approval == nil { showingApproval = nil; lastPresentedApproval = nil }
             else { presentApprovalIfNeeded() }
@@ -149,7 +149,7 @@ struct FirstRunView: View {
                 .frame(width: 56, height: 56).background(p.surface, in: RoundedRectangle(cornerRadius: 12))
             VStack(alignment: .leading, spacing: 8) {
                 Text("首次初始化检查").font(WatchTypography.pageTitle)
-                Text("全部项目通过后，才能进入 Claude Watch。需要权限时会说明操作并弹出授权窗口。")
+                Text("全部项目通过后，才能进入 Agent Watch。需要权限时会说明操作并弹出授权窗口。")
                     .font(WatchTypography.body).foregroundStyle(p.secondary)
                 Text("全部通过后，等待期间会自动刷新 DNS、WebRTC 和环境状态。")
                     .font(WatchTypography.caption).foregroundStyle(p.secondary)
@@ -219,7 +219,7 @@ struct FirstRunView: View {
             Spacer()
             Button("重新检查") { Task { await initialization.retry() } }
                 .frame(minHeight: 44).disabled(initialization.running)
-            Button("进入 Claude Watch") { Task { await initialization.enter() } }
+            Button("进入 Agent Watch") { Task { await initialization.enter() } }
                 .buttonStyle(.borderedProminent).tint(p.mint).frame(minHeight: 44)
                 .disabled(!initialization.canEnter(at: Date().timeIntervalSince1970))
         }.padding(.horizontal, 32).padding(.vertical, 12).background(p.surface)
@@ -291,7 +291,7 @@ struct FirstRunView: View {
                 }.frame(minHeight: 44)
                 Button("保存记录…") {
                     let panel = NSSavePanel()
-                    panel.nameFieldStringValue = "ClaudeWatch-initialization.txt"
+                    panel.nameFieldStringValue = "AgentWatch-initialization.txt"
                     if panel.runModal() == .OK, let url = panel.url {
                         do { try initialization.diagnosticReport.write(to: url, atomically: true, encoding: .utf8) }
                         catch { NSAlert(error: error).runModal() }

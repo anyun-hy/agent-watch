@@ -89,7 +89,7 @@ enum ClaudeLoginProbe {
             .init(state: state, observedAt: now, source: source, detail: detail, account: account, appVersion: appVersion, processId: pid)
         }
         guard running else { return result("app_closed", "Claude 未运行；没有把本地资料槽当成登录状态。") }
-        guard trusted else { return result("access_required", "需要允许 Claude Watch 读取 Claude 的账号界面，才能识别当前登录。") }
+        guard trusted else { return result("access_required", "需要允许 Agent Watch 读取 Claude 的账号界面，才能识别当前登录。") }
         guard complete else { return result("unknown", "Claude 界面读取未完整完成或超时；没有据此判断退出登录。") }
         guard nodes.allSatisfy({ $0.parent == nil || nodes.indices.contains($0.parent!) }) else {
             return result("unknown", "Claude 界面结构无效，未推断账号状态。")

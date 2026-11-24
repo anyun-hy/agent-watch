@@ -497,7 +497,7 @@ final class FirstRunInitialization: ObservableObject {
             }
             return "\(row.step.rawValue)\t\(row.status.rawValue)\t\(safe ? row.code : "unknown")\t\(row.checkedAt.map { String(Int($0)) } ?? "-")"
         }
-        let summary = (["Claude Watch 首次初始化检查", "包含步骤、状态、采样时间、PID 与核对结果；不含 IP、节点、账号或凭据。"] + values).joined(separator: "\n")
+        let summary = (["Agent Watch 首次初始化检查", "包含步骤、状态、采样时间、PID 与核对结果；不含 IP、节点、账号或凭据。"] + values).joined(separator: "\n")
         let connection = checks.connectionDiagnosticReport
         return [summary, diagnosticLog?.report ?? "", connection].filter { !$0.isEmpty }.joined(separator: "\n\n")
     }

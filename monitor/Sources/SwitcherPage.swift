@@ -323,7 +323,7 @@ struct SwitcherPage: View {
                 Button("预览具体变更") { Task { await store.previewEnvironment() } }.disabled(store.busy || store.hasUnsavedSettings || store.setupRecoveryRequired)
                 if let plan = store.setupPlan {
                     ForEach(plan.actions) { action in changeRow(action) }
-                    Text("确认后仅应用所列系统变更，并更新对应基线。当前后台意愿：Claude Watch 保镖 \(store.setupGuard ? "开启" : "关闭")；时区守护 \(store.setupWatchdog ? "开启" : "关闭")；自动更新 \(store.setupUpdater ? "开启" : "关闭")。")
+                    Text("确认后仅应用所列系统变更，并更新对应基线。当前后台意愿：Agent Watch 保镖 \(store.setupGuard ? "开启" : "关闭")；时区守护 \(store.setupWatchdog ? "开启" : "关闭")；自动更新 \(store.setupUpdater ? "开启" : "关闭")。")
                         .font(WatchTypography.caption).foregroundStyle(p.secondary)
                     Button("应用所列系统变更") {
                         pendingTitle = "应用环境修复"
@@ -806,7 +806,7 @@ struct SwitcherPage: View {
             DisclosureGroup("发布源与工具维护", isExpanded: $showSource) {
                 VStack(alignment: .leading, spacing: 12) {
                     Text(store.updateSourceIsBuiltin
-                         ? "已内置官方 GitHub 发布源（anyun-hy/claude-watch），无需手动填写即可检查与更新；下方仅在需要自定义测试源时覆盖。"
+                         ? "已内置官方 GitHub 发布源（anyun-hy/agent-watch），无需手动填写即可检查与更新；下方仅在需要自定义测试源时覆盖。"
                          : "此处供本项目发布维护使用。未内置公钥且未手动填写发布源与固定公钥时，自动更新显示尚不可用。")
                     TextField("本项目 HTTPS 发布清单（留空则使用内置源）", text: store.text(Setting.updateURL)).textFieldStyle(.roundedBorder)
                     Text("固定 RSA 公钥（PEM，留空则使用内置公钥）").font(WatchTypography.caption)
@@ -922,7 +922,7 @@ struct SwitcherPage: View {
     private var changeReview: some View {
         VStack(alignment: .leading, spacing: 16) {
             Text("确认具体变更").font(WatchTypography.pageTitle)
-            Text("每项列出修改前后的值和权限范围。Claude Watch 与原版保镖独立管理。")
+            Text("每项列出修改前后的值和权限范围。Agent Watch 与原版保镖独立管理。")
                 .font(WatchTypography.caption).foregroundStyle(p.secondary)
             ScrollView {
                 VStack(alignment: .leading, spacing: 14) {

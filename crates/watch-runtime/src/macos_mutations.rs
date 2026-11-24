@@ -356,9 +356,9 @@ impl NativeMutationRunner {
             .join(" ");
         commands.push(format!("/usr/bin/env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin /bin/bash --noprofile --norc {helper_args}"));
         let prompt = if install || verb == "status" {
-            "Claude Watch：安装或升级固定系统组件并执行已确认操作"
+            "Agent Watch：安装或升级固定系统组件并执行已确认操作"
         } else {
-            "Claude Watch：应用已预览的系统配置变更"
+            "Agent Watch：应用已预览的系统配置变更"
         };
         let script = format!("with timeout of 180 seconds\n do shell script {} with prompt {} with administrator privileges\nend timeout", serde_json::to_string(&commands.join(" && ")).expect("fixed string"), serde_json::to_string(prompt).expect("fixed string"));
         Ok(AdminAuthorizationPlan {

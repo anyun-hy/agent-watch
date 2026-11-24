@@ -237,7 +237,7 @@ fn failed_critical_dialog_reserves_cooldown_before_the_next_tick() {
         ok: false,
     };
     let alert = Alert {
-        title: "Claude Watch：监控异常".into(),
+        title: "Agent Watch：监控异常".into(),
         message: "请查看本轮检测来源。".into(),
         severity: Severity::Critical,
     };

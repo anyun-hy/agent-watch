@@ -191,7 +191,7 @@ pub fn read<R: ReadRunner>(store: &StateStore, runner: &R) -> Result<Value> {
     if uid == 0 {
         return Ok(notice(
             "unknown",
-            "请在当前登录用户的 Claude Watch 中读取账号。",
+            "请在当前登录用户的 Agent Watch 中读取账号。",
         ));
     }
     store.paths.require_owner(uid)?;

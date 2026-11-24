@@ -51,13 +51,13 @@ fn utc_timestamp(value: f64) -> String {
 
 fn har_value(receipt: &Receipt) -> Value {
     let raw_bytes = receipt.raw.len();
-    json!({"log":{"version":"1.2","creator":{"name":"Claude Watch HTTP receipt exporter","version":"1"},"entries":[{
+    json!({"log":{"version":"1.2","creator":{"name":"Agent Watch HTTP receipt exporter","version":"1"},"entries":[{
         "startedDateTime":utc_timestamp(receipt.queried_at),
         "time":((receipt.finished_at-receipt.queried_at).max(0.0))*1000.0,
         "request":{"method":"GET","url":receipt.source_url,"httpVersion":"HTTP/1.1","headers":[],"queryString":[],"cookies":[],"headersSize":-1,"bodySize":0},
         "response":{"status":receipt.http_status.unwrap_or(0),"statusText":"","httpVersion":"HTTP/1.1","headers":[],"cookies":[],"content":{"size":raw_bytes,"mimeType":if receipt.kind=="trace"{"text/plain"}else{"application/json"},"text":receipt.raw},"redirectURL":"","headersSize":-1,"bodySize":raw_bytes},
         "cache":{},"timings":{"send":0,"wait":((receipt.finished_at-receipt.queried_at).max(0.0))*1000.0,"receive":0},
-        "_provenance":"Claude Watch own HTTP client response; not a packet/browser capture"
+        "_provenance":"Agent Watch own HTTP client response; not a packet/browser capture"
     }]}})
 }
 
@@ -259,7 +259,7 @@ mod tests {
         assert_eq!(entry["response"]["cookies"], json!([]));
         assert_eq!(
             entry["_provenance"],
-            "Claude Watch own HTTP client response; not a packet/browser capture"
+            "Agent Watch own HTTP client response; not a packet/browser capture"
         );
         let _ = fs::remove_dir_all(directory);
     }

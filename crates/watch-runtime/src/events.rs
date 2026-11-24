@@ -229,10 +229,10 @@ pub struct NotifyError {
 }
 fn alert_purpose(title: &str) -> &'static str {
     match title {
-        "Claude Watch：已触发保护" | "Claude Watch：保护状态变化" => "guard_stop",
-        "Claude Watch：保护采样异常" => "guard_sampling",
-        "Claude Watch：监控采样异常" => "monitor_sampling",
-        "Claude Watch：敏感目录文件描述符" => "sensitive_file",
+        "Agent Watch：已触发保护" | "Agent Watch：保护状态变化" => "guard_stop",
+        "Agent Watch：保护采样异常" => "guard_sampling",
+        "Agent Watch：监控采样异常" => "monitor_sampling",
+        "Agent Watch：敏感目录文件描述符" => "sensitive_file",
         _ => "other",
     }
 }
@@ -858,8 +858,8 @@ impl EventStore {
     /// module delegates platform delivery and records a failure when it fails.
     pub fn test_alert<N: Notifier + ?Sized>(&self, notifier: &N, at: f64) -> Result<AlertOutcome> {
         let alert = Alert {
-            title: "Claude-Watch-Test".into(),
-            message: "Claude Watch notification test".into(),
+            title: "Agent-Watch-Test".into(),
+            message: "Agent Watch notification test".into(),
             severity: Severity::Warning,
         };
         self.emit(notifier, &alert, at)

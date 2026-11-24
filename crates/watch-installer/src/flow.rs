@@ -14,7 +14,7 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-const REMOVED_PREFIX: &str = "ClaudeWatch-removed-";
+const REMOVED_PREFIX: &str = "AgentWatch-removed-";
 const ALLOWED_SYSTEM_ENTRIES: [&str; 3] = [
     "claude-watch-admin.sh",
     "timezone.target",
@@ -303,7 +303,7 @@ pub fn app_identity_with(runner: &dyn Runner, app: &Path) -> Result<(String, Str
     let executable = plist::string(&info, "CFBundleExecutable");
     require(
         identity.as_deref() == Some("io.local.watchpanel")
-            && executable.as_deref() == Some("ClaudeWatchMonitor"),
+            && executable.as_deref() == Some("AgentWatch"),
         "已安装应用身份不匹配。",
     )?;
     require(
@@ -465,7 +465,7 @@ fn cleanup_trashed_app(
         .parent()
         .ok_or_else(|| blocked("本次卸载返回的废纸篓路径不匹配。"))?
         .to_path_buf();
-    let name_ok = app.file_name().map(|value| value == "Claude Watch Monitor.app") == Some(true);
+    let name_ok = app.file_name().map(|value| value == "Agent Watch.app") == Some(true);
     let root_ok = parent.parent() == Some(layout.trash().as_path());
     let dir_ok = parent
         .file_name()
@@ -481,7 +481,7 @@ fn cleanup_trashed_app(
     );
     require(
         plist::string(&info, "CFBundleIdentifier").as_deref() == Some("io.local.watchpanel")
-            && plist::string(&info, "CFBundleExecutable").as_deref() == Some("ClaudeWatchMonitor")
+            && plist::string(&info, "CFBundleExecutable").as_deref() == Some("AgentWatch")
             && &identity == old_identity,
         "废纸篓中应用的身份或版本不匹配。",
     )?;
@@ -489,7 +489,7 @@ fn cleanup_trashed_app(
         .map_err(|_| blocked("本次卸载目录包含未知内容。"))?
         .collect::<std::result::Result<Vec<_>, _>>()
         .map_err(|_| blocked("本次卸载目录包含未知内容。"))?;
-    let allowed = ["Claude Watch Monitor.app", "io.local.claudewatch.agent.plist"];
+    let allowed = ["Agent Watch.app", "io.local.claudewatch.agent.plist"];
     for entry in &entries {
         let name = entry.file_name().to_string_lossy().into_owned();
         require(
@@ -518,8 +518,8 @@ fn wait_for_watch_exit(
 ) -> Result<()> {
     use claude_watch_core::processes::{is_watch_runtime_executable, watch_process_rows, WATCH_PROCESS_LIST_FIELDS};
     let runtime = layout.base().join("runtime");
-    let old_gui = old.map(|app| app.join("Contents/MacOS/ClaudeWatchMonitor"));
-    let current_gui = layout.app.join("Contents/MacOS/ClaudeWatchMonitor");
+    let old_gui = old.map(|app| app.join("Contents/MacOS/AgentWatch"));
+    let current_gui = layout.app.join("Contents/MacOS/AgentWatch");
     let mut blocking = Vec::new();
     for attempt in 0..11 {
         let out = runner.run(&["/bin/ps".into(), "-axo".into(), WATCH_PROCESS_LIST_FIELDS.into()], None, RunMode::Capture)?;
@@ -642,7 +642,7 @@ fn clean_data(
         }
     }
     check_transactions(layout)?;
-    let trashed_app = trashed.map(|path| path.join("Claude Watch Monitor.app"));
+    let trashed_app = trashed.map(|path| path.join("Agent Watch.app"));
     wait_for_watch_exit(layout, runner, uid, trashed_app.as_deref(), sleep)?;
     deactivate_owned_entries(layout, runner, uid)?;
     let mut paths = layout.data_paths();
@@ -990,9 +990,9 @@ fn perform_with_environment(
     check_build_inputs(layout, runner, cargo)?;
     let stamp = tag(runner)?;
     let app_out = layout.project.join("monitor/build").join(format!(
-        "Claude Watch Monitor build{build}-{stamp}.app"
+        "Agent Watch build{build}-{stamp}.app"
     ));
-    let dmg_name = format!("Claude-Watch-{version}-build{build}-{stamp}-arm64.dmg");
+    let dmg_name = format!("Agent-Watch-{version}-build{build}-{stamp}-arm64.dmg");
     let dmg = layout.project.join("monitor/dist").join(&dmg_name);
     let sha = PathBuf::from(format!("{}.sha256", dmg.display()));
     if [&app_out, &dmg, &sha].iter().any(|path| exists(path)) {
@@ -1020,7 +1020,7 @@ fn perform_with_environment(
     println!("已安装：{old}");
     println!("系统网关：{}；保留端口 {}；新组件最终落位后将请求管理员授权安装/更新 io.local.claudewatch.gateway。", if plan.gateway_preview["action"] == "upgrade" { "更新已确认属于本用户的 Watch 网关" } else { "首次安装" }, plan.gateway_preview["gateway_port"]);
     println!("使用免费本机 ad-hoc 签名，不需要付费开发者签名；仅修改 Watch 网关及其 launchd 定义，不修改 VPN。旧网关在打包阶段保留端点，安装失败撤回本次网关变更。实际监听句柄验证成功后才启动后台。");
-    println!("将永久删除 Claude Watch 的设置、日志、A/B 快照及其自有后台；保留 Claude 登录、TAG 配置和独立原版工具。");
+    println!("将永久删除 Agent Watch 的设置、日志、A/B 快照及其自有后台；保留 Claude 登录、TAG 配置和独立原版工具。");
     println!("新包通过版本、DMG 校验和签名验证后才会卸载和清理；准备失败时保留旧应用与 Watch 数据。");
     // The confirmation prompt writes to stderr; without flushing stdout the
     // preview can stay in the pipe buffer and the prompt looks like it came

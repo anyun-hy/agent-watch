@@ -455,10 +455,10 @@ final class FirstRunChecks: InitializationChecking {
         return actions.allSatisfy { allowed.contains($0.id) }
     }
     private var accessResult: InitializationResult {
-        if accessibilityTrusted() { return .passed("macOS 已确认 Claude Watch 的辅助功能授权。") }
+        if accessibilityTrusted() { return .passed("macOS 已确认 Agent Watch 的辅助功能授权。") }
         return .approval(.init(id: "accessibility", action: .accessibility, title: "授权辅助功能",
             detail: "用于读取 Claude 界面的登录状态。macOS 只承认在「系统设置 › 隐私与安全性 › 辅助功能」中开启的授权，因此这一步会直接打开该面板；开启后自动核对并继续。",
-            changes: ["在系统设置 › 隐私与安全性 › 辅助功能 中打开 Claude Watch 的开关", "授权状态以 macOS 实际回读为准；密码仅在系统窗口输入"]))
+            changes: ["在系统设置 › 隐私与安全性 › 辅助功能 中打开 Agent Watch 的开关", "授权状态以 macOS 实际回读为准；密码仅在系统窗口输入"]))
     }
     private var contextMatches: Bool { boundContext != nil && boundContext == store.initializationContext }
     static func timeoutDescription(_ stage: String) -> String {

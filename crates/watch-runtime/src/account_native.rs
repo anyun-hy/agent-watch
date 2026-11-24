@@ -69,7 +69,7 @@ impl<R: ReadRunner, T: Transport, S: AuditSystem + ServiceSystem> AccountOs
         }
         .load()?;
         if !c.enabled {
-            return Err(CoreError::new("disabled", "Claude Watch 已禁用"));
+            return Err(CoreError::new("disabled", "Agent Watch 已禁用"));
         }
         let mut r = self.runtime();
         use crate::controlled::DesktopSystem;

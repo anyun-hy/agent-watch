@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Package a built Claude Watch .app bundle into a signed auto-update ZIP and manifest.
+"""Package a built Agent Watch .app bundle into a signed auto-update ZIP and manifest.
 
 Produces two release artifacts strictly matching `crates/watch-runtime/src/update.rs`
 and `crates/watch-runtime/src/update/permissions.rs`:
   1. `<archive-output>`: deterministic ZIP containing:
-       - `app/Claude Watch Monitor.app/...`
+       - `app/Agent Watch.app/...`
        - `runtime/<component>` (byte-identical copies from `Contents/Resources/`)
   2. `<manifest-output>`: RSA-SHA256 signed JSON envelope:
        `{"manifest": "<base64-json>", "signature": "<base64-sig>"}`
@@ -27,7 +27,7 @@ import tempfile
 import zipfile
 from pathlib import Path
 
-APP_BUNDLE_NAME = "Claude Watch Monitor.app"
+APP_BUNDLE_NAME = "Agent Watch.app"
 RUNTIME_COMPONENTS = (
     "watch-engine",
     "watch-native-observer",

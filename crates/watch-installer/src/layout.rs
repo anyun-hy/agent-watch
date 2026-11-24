@@ -42,7 +42,7 @@ impl Layout {
         let home = PathBuf::from(std::env::var_os("HOME").unwrap_or_else(|| "/".into()));
         Self::new(
             home,
-            PathBuf::from("/Applications/Claude Watch Monitor.app"),
+            PathBuf::from("/Applications/Agent Watch.app"),
             PathBuf::from("/Library/Application Support/ClaudeWatch"),
             PathBuf::from("/Library/LaunchDaemons/io.local.claudewatch.timezone.plist"),
             project,

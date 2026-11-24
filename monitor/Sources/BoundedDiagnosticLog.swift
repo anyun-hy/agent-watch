@@ -162,7 +162,7 @@ final class BoundedDiagnosticLog {
             let failure = "diagnostic_write_failed_\((error as NSError).code)"
             if writeError != failure {
                 // Never interpolate the original NSError: it can contain paths.
-                fputs("ClaudeWatch \(component): \(failure)\n", stderr)
+                fputs("AgentWatch \(component): \(failure)\n", stderr)
             }
             writeError = failure
         }

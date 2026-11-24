@@ -76,7 +76,7 @@ enum BackgroundServiceCatalog {
         "original": .init(
             symbol: "link", toggle: nil,
             enableTitle: "", disableTitle: "", syncTitle: "",
-            note: "原版独立管理，与 Claude Watch 保持并行", requiresEnabled: false, requiresSource: false),
+            note: "原版独立管理，与 Agent Watch 保持并行", requiresEnabled: false, requiresSource: false),
     ]
     /// Unknown ids keep the generic shield and get no switch rather than
     /// falling back to a guessed key.

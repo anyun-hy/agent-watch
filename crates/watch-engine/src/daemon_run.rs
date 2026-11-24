@@ -1875,12 +1875,12 @@ pub fn run(request: &Request, paths: Paths) -> Result<Value> {
                                         let message = pending.iter().map(|(_, _, text)| text.as_str())
                                             .collect::<Vec<_>>().join("；");
                                         if alerts.enqueue(Alert {
-                                            title: "Claude Watch：保护状态变化".into(), message,
+                                            title: "Agent Watch：保护状态变化".into(), message,
                                             severity: Severity::Warning,
                                         }) { notices.accept(pending); }
                                     } else if unknown_gate.observe(receipt["status"] == "unknown") {
                                         alerts.enqueue(Alert {
-                                            title: "Claude Watch：保护采样异常".into(),
+                                            title: "Agent Watch：保护采样异常".into(),
                                             message: "保护证据持续未能完整取得，后台正在重试。详情见环境状态。".into(),
                                             severity: Severity::Critical,
                                         });
@@ -2022,7 +2022,7 @@ pub fn run(request: &Request, paths: Paths) -> Result<Value> {
                 // quiet period. The control panel keeps showing live state.
                 if sampling_gate.observe(snapshot["health"]["state"] != "running") {
                     alerts.enqueue(Alert {
-                        title: "Claude Watch：监控采样异常".into(),
+                        title: "Agent Watch：监控采样异常".into(),
                         message:
                             "本轮进程或连接观察未完成，采样仍会继续。请查看事件记录中的具体来源。"
                                 .into(),
@@ -2033,7 +2033,7 @@ pub fn run(request: &Request, paths: Paths) -> Result<Value> {
                 // service-name candidates remain in the event log only.
                 let files_signature = evidence_signature(&snapshot["activity"]["files"]["rows"]);
                 if files_signature.is_some() && files_signature != reported_files {
-                    alerts.enqueue(Alert{title:"Claude Watch：敏感目录文件描述符".into(),message:"未关联会话的进程持有敏感目录文件描述符；这不是完整的文件读取记录。详情见事件记录。".into(),severity:Severity::Warning});
+                    alerts.enqueue(Alert{title:"Agent Watch：敏感目录文件描述符".into(),message:"未关联会话的进程持有敏感目录文件描述符；这不是完整的文件读取记录。详情见事件记录。".into(),severity:Severity::Warning});
                 }
                 reported_files = files_signature;
             }

@@ -45,7 +45,7 @@ fi
 if [[ -n "${CW_APP_OUTPUT:-}" ]]; then
   APP=$CW_APP_OUTPUT
 else
-  APP="$ROOT/build/Claude Watch Monitor Rust Candidate.app"
+  APP="$ROOT/build/Agent Watch.app"
 fi
 case "$APP" in
   /Applications/*) echo 'Refusing to build into an installed application path.' >&2; exit 1;;
@@ -105,7 +105,7 @@ for CW_TARGET_ARCH in $CW_TARGETS; do
   "$SWIFTC" -swift-version 5 -O -parse-as-library -target "$CW_TARGET_ARCH-apple-macosx$CW_MACOS_MINIMUM" \
     -sdk "$SDK" -module-cache-path "$ROOT/build/module-cache" \
     -framework SwiftUI -framework AppKit -framework WebKit "$ROOT"/Sources/*.swift \
-    -o "$ROOT/build/ClaudeWatchMonitor.$CW_TARGET_ARCH"
+    -o "$ROOT/build/AgentWatch.$CW_TARGET_ARCH"
   # The Rust component manifest supplies watch-process-control. Do not build
   # the retired Swift helper: it was overwritten by the Rust staging copy.
   "$SWIFTC" -swift-version 5 -O -parse-as-library -D BACKGROUND_LEAK_WORKER \
@@ -120,7 +120,7 @@ for CW_TARGET_ARCH in $CW_TARGETS; do
     -framework AppKit -framework Foundation "$ROOT/Sources/BoundedDiagnosticLog.swift" "$ROOT/Sources/MonitorPublicationObserver.swift" "$ROOT/ControlledEntry/ControlledEntryApp.swift" \
     -o "$ROOT/build/ControlledEntry.$CW_TARGET_ARCH"
 done
-cp "$ROOT/build/ClaudeWatchMonitor.$CW_BUILD_ARCH" "$APP/Contents/MacOS/ClaudeWatchMonitor"
+cp "$ROOT/build/AgentWatch.$CW_BUILD_ARCH" "$APP/Contents/MacOS/AgentWatch"
 cp "$ROOT/build/watch-leak-worker.$CW_BUILD_ARCH" "$APP/Contents/Resources/watch-leak-worker"
 cp "$ROOT/build/ControlledEntry.$CW_BUILD_ARCH" "$APP/Contents/Resources/ControlledEntry"
 
@@ -181,9 +181,9 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
 <key>CFBundleIdentifier</key><string>io.local.watchpanel</string>
-<key>CFBundleName</key><string>Claude Watch</string>
-<key>CFBundleDisplayName</key><string>Claude Watch</string>
-<key>CFBundleExecutable</key><string>ClaudeWatchMonitor</string>
+<key>CFBundleName</key><string>Agent Watch</string>
+<key>CFBundleDisplayName</key><string>Agent Watch</string>
+<key>CFBundleExecutable</key><string>AgentWatch</string>
 <key>CFBundleIconFile</key><string>AppIcon.icns</string>
 <key>CFBundlePackageType</key><string>APPL</string>
 <key>CFBundleShortVersionString</key><string>$APP_VERSION</string>

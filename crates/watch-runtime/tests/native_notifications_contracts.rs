@@ -64,7 +64,7 @@ fn notifier_uses_the_watch_app_and_positional_data() {
     let command = commands.lock().unwrap()[0].clone();
     assert_eq!(
         command.program.to_string_lossy(),
-        "/Applications/Claude Watch Monitor.app/Contents/MacOS/ClaudeWatchMonitor"
+        "/Applications/Agent Watch.app/Contents/MacOS/AgentWatch"
     );
     assert_eq!(
         command.args,
@@ -92,10 +92,10 @@ fn known_alerts_route_to_the_relevant_watch_pages() {
         gate: None,
     });
     for (title, expected) in [
-        ("Claude Watch：保护采样异常", "environment"),
-        ("Claude Watch：已触发保护", "protection"),
-        ("Claude Watch：保护状态变化", "protection"),
-        ("Claude Watch：敏感目录文件描述符", "events"),
+        ("Agent Watch：保护采样异常", "environment"),
+        ("Agent Watch：已触发保护", "protection"),
+        ("Agent Watch：保护状态变化", "protection"),
+        ("Agent Watch：敏感目录文件描述符", "events"),
     ] {
         notifier.notify(&alert(title, Severity::Warning)).unwrap();
         assert_eq!(commands.lock().unwrap().last().unwrap().args[2], expected);
@@ -121,7 +121,7 @@ fn a_missing_notification_permission_is_not_reported_as_success() {
     let store = storage("denied-purpose");
     let notifier = NativeNotifier::new(Denied);
     let events = claude_watch_runtime::events::EventStore::new(store.clone());
-    let result = events.emit(&notifier, &alert("Claude Watch：保护采样异常", Severity::Warning), 1000.0).unwrap();
+    let result = events.emit(&notifier, &alert("Agent Watch：保护采样异常", Severity::Warning), 1000.0).unwrap();
     assert!(matches!(result, claude_watch_runtime::events::AlertOutcome::Failed(_)));
     let rows = events.history().unwrap().events;
     assert_eq!(rows[0].fields.code.as_deref(), Some("notification_not_authorized"));
@@ -185,7 +185,7 @@ fn failed_notification_log_write_is_visible_to_dispatcher() {
     store.initialize().unwrap();
     fs::create_dir(store.paths.base().join("events.jsonl")).unwrap();
     let dispatcher = AlertDispatcher::new(store.clone(), Arc::new(Denied));
-    assert!(dispatcher.enqueue(alert("Claude Watch：保护采样异常", Severity::Warning)));
+    assert!(dispatcher.enqueue(alert("Agent Watch：保护采样异常", Severity::Warning)));
     for _ in 0..100 {
         if dispatcher.record_failures() > 0 { break; }
         thread::sleep(Duration::from_millis(10));

@@ -39,7 +39,7 @@ fn make_app(path: &Path, version: &str, build: &str) {
         &path.join("Contents/Info.plist"),
         json!({
             "CFBundleIdentifier": "io.local.watchpanel",
-            "CFBundleExecutable": "ClaudeWatchMonitor",
+            "CFBundleExecutable": "AgentWatch",
             "CFBundleShortVersionString": version,
             "CFBundleVersion": build,
         }),
@@ -108,7 +108,7 @@ impl Fake {
         std::fs::create_dir_all(&home).expect("home");
         let layout = Layout::new(
             home,
-            root.join("Applications/Claude Watch Monitor.app"),
+            root.join("Applications/Agent Watch.app"),
             root.join("Library/Application Support/ClaudeWatch"),
             root.join("Library/LaunchDaemons/io.local.claudewatch.timezone.plist"),
             root.join("project"),
@@ -456,9 +456,9 @@ impl Runner for Fake {
                 let removed = self
                     .layout
                     .trash()
-                    .join(format!("ClaudeWatch-removed-{}", "a".repeat(32)));
+                    .join(format!("AgentWatch-removed-{}", "a".repeat(32)));
                 std::fs::create_dir_all(&removed).expect("removed");
-                let old = removed.join("Claude Watch Monitor.app");
+                let old = removed.join("Agent Watch.app");
                 copy_dir(&self.layout.app, &old);
                 std::fs::remove_dir_all(&self.layout.app).expect("remove app");
                 if self.layout.agent().exists() {
@@ -621,7 +621,7 @@ fn full_workflow_removes_only_watch_data_and_installs_requested_build() {
         .fake
         .layout
         .project
-        .join("monitor/build/Claude Watch Monitor build313.app");
+        .join("monitor/build/Agent Watch build313.app");
     std::fs::create_dir_all(&old_artifact).expect("old artifact");
     std::fs::write(old_artifact.join("keep"), "previous output").expect("keep");
     h.perform("3.0.0", "314", false, "y").expect("flow");
@@ -641,7 +641,7 @@ fn full_workflow_removes_only_watch_data_and_installs_requested_build() {
             entry
                 .file_name()
                 .to_string_lossy()
-                .starts_with("ClaudeWatch-removed-")
+                .starts_with("AgentWatch-removed-")
         })
         .collect();
     assert!(removed.is_empty(), "removed directory must be deleted");

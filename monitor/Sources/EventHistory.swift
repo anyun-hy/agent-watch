@@ -70,7 +70,7 @@ enum DiagnosticExportRunner {
         let panel = NSSavePanel()
         panel.title = "导出排障诊断包"
         panel.message = "仅导出经过脱敏筛选的本地运行与状态记录；不会重新检测网络。请选择新文件，已有文件不会被覆盖。"
-        panel.nameFieldStringValue = "ClaudeWatch-diagnostics-\(Int(Date().timeIntervalSince1970)).json"
+        panel.nameFieldStringValue = "AgentWatch-diagnostics-\(Int(Date().timeIntervalSince1970)).json"
         guard panel.runModal() == .OK else { return nil }
         return panel.url
     }

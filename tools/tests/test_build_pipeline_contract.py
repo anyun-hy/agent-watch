@@ -28,7 +28,7 @@ class BuildPipelineContract(unittest.TestCase):
         self.assertIn('candidate.is_symlink()', RUST)
 
     def test_app_path_is_the_same_between_build_and_package(self):
-        name = "Claude Watch Monitor Rust Candidate.app"
+        name = "Agent Watch.app"
         self.assertIn('APP="$ROOT/build/' + name + '"', APP_BUILD)
         self.assertIn('APP="${CW_APP_OUTPUT:-$ROOT/build/' + name + '}"', PACKAGE)
         self.assertIn('APP=$CW_APP_OUTPUT', APP_BUILD)
