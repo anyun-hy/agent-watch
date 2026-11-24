@@ -102,13 +102,27 @@ final class FirstRunChecks: InitializationChecking {
                 && (runtimeMissing || plistMissing || gatewayMissing
                     || (store.switcher.background?.guard_backend_healthy != true
                         && (diag?.launchd_registered == false || diag?.launchd_state == "absent")))
-            if agentNotInstalled {
+            let runtimeMismatch = store.switcher.isFixture ? nil : RuntimeVersionSync.currentMismatch()
+            if agentNotInstalled || runtimeMismatch != nil {
                 let expectedPath = AccessibilityPermission.installedPath
                 let currentPath = Bundle.main.bundleURL.standardizedFileURL.path
                 if currentPath != expectedPath {
                     return finish(.failed(
                         code: "app_not_in_applications",
                         detail: "请先将 Agent Watch.app 拖入「应用程序（/Applications）」文件夹，再从「应用程序」中打开。"
+                    ))
+                }
+                if !agentNotInstalled, let mismatch = runtimeMismatch {
+                    return .approval(.init(
+                        id: "runtime-install",
+                        action: .runtimeInstall,
+                        title: "同步升级后台采集与 Seatbelt 网关",
+                        detail: "\(mismatch.summary) 只需输入一次管理员密码即可完成后台组件与网关的同步升级。",
+                        changes: [
+                            "同步最新原生运行组件并重启后台采集任务（io.local.claudewatch.agent）",
+                            "通过一次 macOS 管理员授权同步更新本地 Seatbelt 网关（io.local.claudewatch.gateway）与系统辅助组件",
+                            "保留已授予的辅助功能授权、账号及配置；不修改 Claude / ChatGPT / TAG 配置"
+                        ]
                     ))
                 }
                 return .approval(.init(
@@ -309,6 +323,7 @@ final class FirstRunChecks: InitializationChecking {
             // Refresh live snapshot & service status immediately, then run the
             // authoritative connection check so `boundContext` is established
             // from live post-install samples before advancing to Step 4.
+            store.refreshRuntimeVersionSync()
             store.refresh(manual: true)
             await store.switcher.refreshBackground(maximumAge: 0)
             return await check(.connection)

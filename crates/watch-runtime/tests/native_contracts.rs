@@ -834,3 +834,154 @@ fn incomplete_process_round_keeps_causes_separate_from_complete_socket_sample() 
     assert_eq!(view["processReasonCounts"]["identity_unavailable"], 1);
     fs::remove_dir_all(home).unwrap();
 }
+
+#[test]
+fn argument_process_exited_row_preserves_round_completeness_while_unexplained_unknown_stays_incomplete() {
+    use std::sync::{
+        atomic::{AtomicU8, Ordering},
+        Arc,
+    };
+    struct ArgumentExitRunner {
+        home: PathBuf,
+        mode: Arc<AtomicU8>, // 0 = process_exited, 1 = identity_changed
+    }
+    impl ReadRunner for ArgumentExitRunner {
+        fn run(
+            &self,
+            command: ReadCommand,
+            input: &[u8],
+            _: Duration,
+            _: usize,
+        ) -> claude_watch_core::error::Result<Output> {
+            let now = native::now();
+            let mut live = identity();
+            live.pid = 71;
+            live.executable = self
+                .home
+                .join("independent-codex-image")
+                .to_string_lossy()
+                .into_owned();
+            let mut short_lived = identity();
+            short_lived.pid = 72;
+            short_lived.executable = self
+                .home
+                .join(".codex/packages/app-server-daemon/releases/v/bin/codex")
+                .to_string_lossy()
+                .into_owned();
+            let mut body = json!({
+                "schema": 1,
+                "status": "ok",
+                "uid": 501,
+                "started_at": now,
+                "finished_at": now
+            });
+            match command {
+                ReadCommand::Observer(ObserverAction::Inventory) => {
+                    body["state"] = json!("ok");
+                    body["truncated"] = json!(false);
+                    body["processes"] = json!([live, short_lived]);
+                    body["unavailable"] = json!([]);
+                    body["exited"] = json!([]);
+                    body["requested_count"] = json!(2);
+                }
+                ReadCommand::Observer(ObserverAction::Arguments) => {
+                    let request: Value = serde_json::from_slice(input).unwrap();
+                    body["round_id"] = request["round_id"].clone();
+                    let unknown_code = if self.mode.load(Ordering::Relaxed) == 0 {
+                        "process_exited"
+                    } else {
+                        "identity_changed"
+                    };
+                    body["argument_prefixes"] = json!([
+                        {
+                            "pid": 71,
+                            "state": "ok",
+                            "identity": live,
+                            "arguments": ["codex"],
+                            "cwd": "/fixture",
+                            "truncated": false
+                        },
+                        {
+                            "pid": 72,
+                            "state": "unknown",
+                            "code": unknown_code
+                        }
+                    ]);
+                }
+                _ => panic!("unexpected command"),
+            }
+            Ok(Output {
+                status: 0,
+                stdout: serde_json::to_vec(&body).unwrap(),
+                stderr: Vec::new(),
+            })
+        }
+    }
+
+    let temp = std::env::temp_dir().join(format!("cw-arg-exit-{}", Uuid::new_v4()));
+    fs::create_dir(&temp).unwrap();
+    let temp = fs::canonicalize(temp).unwrap();
+    use std::os::unix::fs::{symlink, PermissionsExt};
+    fs::create_dir_all(temp.join(".local/bin")).unwrap();
+    let front = temp.join("independent-codex-image");
+    fs::write(&front, b"private independent CLI fixture; never executed").unwrap();
+    fs::set_permissions(&front, fs::Permissions::from_mode(0o755)).unwrap();
+    symlink(&front, temp.join(".local/bin/codex")).unwrap();
+
+    let paths = Paths::new(&temp).unwrap();
+    let mode = Arc::new(AtomicU8::new(0));
+    let mut sampler = Sampler::new(
+        ArgumentExitRunner {
+            home: paths.home.clone(),
+            mode: mode.clone(),
+        },
+        paths,
+    );
+
+    let round = sampler.processes().unwrap();
+    assert!(
+        round.complete,
+        "confirmed process_exited in argument_prefixes must not mark process round incomplete: {:?}",
+        round.diagnostic_reasons
+    );
+    assert_eq!(round.confirmed_exited_count, 1);
+    assert!(
+        round.diagnostic_reasons.get("root_arguments_unavailable").is_none(),
+        "confirmed process_exited must not be billed as root_arguments_unavailable"
+    );
+    assert!(
+        round.targets.iter().any(|t| t.identity.pid == 71),
+        "live target must remain supervised"
+    );
+
+    mode.store(1, Ordering::Relaxed);
+    let incomplete = sampler.processes().unwrap();
+    assert!(
+        !incomplete.complete,
+        "non-exit unknown argument row must remain fail-closed"
+    );
+    assert_eq!(incomplete.confirmed_exited_count, 0);
+    assert_eq!(incomplete.diagnostic_reasons["root_arguments_unavailable"], 1);
+
+    // Contradictory 4-field process_exited payload must be rejected as invalid.
+    let mut id72 = identity();
+    id72.pid = 72;
+    let now = native::now();
+    let contradictory = json!({
+        "schema": 1,
+        "status": "ok",
+        "uid": 501,
+        "round_id": "r1",
+        "started_at": now,
+        "finished_at": now,
+        "argument_prefixes": [
+            {"pid": 72, "state": "unknown", "code": "process_exited", "arguments": ["codex"]}
+        ]
+    });
+    assert!(
+        native::decode_arguments_result(&contradictory, &[id72], "r1", now, now).is_err(),
+        "process_exited row with extra fields must be rejected"
+    );
+
+    fs::remove_dir_all(temp).unwrap();
+}

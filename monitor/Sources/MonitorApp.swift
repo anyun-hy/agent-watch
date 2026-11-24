@@ -42,6 +42,38 @@ struct MonitorView: View {
         } detail: {
             VStack(spacing: 0) {
                 if !store.page.isManualCheck { pageHeader }
+                if let mismatch = store.runtimeVersionMismatch {
+                    HStack(alignment: .center, spacing: 12) {
+                        Image(systemName: "arrow.triangle.2.circlepath.circle.fill")
+                            .font(.system(size: 16, weight: .medium))
+                            .foregroundStyle(p.blue)
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text("检测到新版本应用，需同步升级后台运行组件")
+                                .font(WatchTypography.bodyStrong).foregroundStyle(p.text)
+                            Text(store.runtimeSyncError ?? "\(mismatch.summary) 仅需一次管理员授权即可完成同步，原有账号与策略全部保留。")
+                                .font(WatchTypography.caption)
+                                .foregroundStyle(store.runtimeSyncError == nil ? p.secondary : p.amber)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                        Spacer(minLength: 8)
+                        Button {
+                            Task { await store.syncRuntimeFromBundle() }
+                        } label: {
+                            HStack(spacing: 6) {
+                                if store.syncingRuntime {
+                                    ProgressView().controlSize(.small)
+                                }
+                                Text(store.syncingRuntime ? "正在同步…" : "同步升级后台与网关")
+                            }
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(store.syncingRuntime)
+                    }
+                    .padding(12)
+                    .background(p.blue.opacity(0.08), in: RoundedRectangle(cornerRadius: 9))
+                    .overlay(RoundedRectangle(cornerRadius: 9).stroke(p.blue.opacity(0.25), lineWidth: 1))
+                    .padding(.horizontal, 20).padding(.bottom, 12)
+                }
                 if let error = store.error {
                     InlineNotice(title: "暂时无法同步检测数据", detail: error,
                                  symbol: "exclamationmark.triangle", tint: p.amber, p: p)
@@ -97,6 +129,7 @@ struct MonitorView: View {
             Task { await store.refreshNotificationAccess() }
         }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            store.refreshRuntimeVersionSync()
             Task { await store.refreshNotificationAccess() }
         }
         .onReceive(NotificationCenter.default.publisher(for: .watchNotificationPermissionChanged)) { _ in

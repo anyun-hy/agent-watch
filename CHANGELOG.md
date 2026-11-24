@@ -2,6 +2,15 @@
 
 该摘要根据现有源码和版本发布记录整理。后续版本遵循语义化版本（SemVer）：缺陷修复递增 patch，功能/品牌升级递增 minor，破坏性架构变更递增 major。
 
+## 4.2.2 — 2026-11-24
+
+- **修复网关控制指令误弹多次管理员密码**：修复 `watch-gateway-broker` 在 `CWGWCMT1`（事务提交）与 `CWGWADM1`（白名单管理转发）写入 `OK\n` 后立即关闭 Unix 套接字导致客户端复核 `LOCAL_PEERTOKEN` 触发 `ENOTCONN (os error 57)` 并错误回退 `osascript` 的竞态缺陷；服务端改为等待客户端主动关闭后再释放连接，确保整个安装与初始化流程严格只弹 1 次管理员密码。
+- **大幅优化 Codex / ChatGPT 受控启动速度与稳定性（46 秒阻塞降至约 3 秒）**：
+  - 修复 `decode_arguments` 将短生命周期进程退出行（`{"state":"unknown","code":"process_exited"}`）误计为 `root_arguments_unavailable` 进而触发 `channel_inventory_incomplete` 误杀全部活跃连接并锁死 28 秒的问题；严格仅对 3 字段 `process_exited` 确认放行，其余异常继续 fail-closed。
+  - 打通沙箱注册与首次建连归属（`SandboxLaunchRegistry`）到主采样循环的即时唤醒通道，消除新建受控进程及子进程最长 5 秒的采样盲窗。
+  - 将 `channel_audit` 的两次串行子进程与 5 次完整本地扫描合并为单子进程 `audit-and-egress`（2 次前后一致性校验），并发执行出口、AI 入口、STUN 与受控出口探针，并在网络绑定 DNS/WebRTC 回执已同网有效时跳过冗余 `evidence.sock` IPC。
+- **拖拽覆盖升级后台版本同步**：启动及主界面自动比对 `/Applications/Agent Watch.app` 与已安装 `runtime/BuildIdentity.json` 版本身份，检测到拖拽覆盖升级后直接提供一键同步升级后台采集与 Seatbelt 网关入口。
+
 ## 4.2.1 — 2026-11-24
 
 - **纯拖拽安装与向导内置后台部署**：从 DMG 移除 `安装或更新后台.command`，直接拖入 `/Applications` 打开即可使用；新增 Rust 权威命令 `watch-engine install-runtime`，首次初始化向导第 3 步检测到后台与 Seatbelt 网关未安装时自动弹出图形化一键部署卡片，不重置辅助功能授权。

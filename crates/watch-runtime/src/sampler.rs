@@ -365,7 +365,8 @@ impl<R: ReadRunner> Sampler<R> {
             .filter_map(|pid| identities.get(&pid).cloned())
             .take(2048)
             .collect();
-        let arguments = observer.arguments(&requested, &id)?;
+        let arguments_result = observer.arguments_result(&requested, &id)?;
+        let arguments = arguments_result.arguments;
         let entries=arguments.values().filter(|args|Path::new(&args.identity.executable).file_name().is_some_and(|n|n=="node" || n=="nodejs" || n=="bun"))
             .filter_map(|args|process_roots::node_script_entry(&args.tokens,Some(&args.cwd)))
             .filter_map(|path| {
@@ -383,7 +384,9 @@ impl<R: ReadRunner> Sampler<R> {
         }
         for pid in need_args {
             let Some(args) = arguments.get(&pid) else {
-                unavailable.push(json!({"pid":pid,"code":"root_arguments_unavailable"}));
+                if !arguments_result.confirmed_exited.contains(&pid) {
+                    unavailable.push(json!({"pid":pid,"code":"root_arguments_unavailable"}));
+                }
                 continue;
             };
             let classified = evidence(pid, Some(args), &trusted);
@@ -481,7 +484,9 @@ impl<R: ReadRunner> Sampler<R> {
             match_evidence,
             unavailable,
             diagnostic_reasons,
-            confirmed_exited_count: inventory.confirmed_exited_count,
+            confirmed_exited_count: inventory.confirmed_exited_count.saturating_add(
+                u32::try_from(arguments_result.confirmed_exited.len()).unwrap_or(u32::MAX),
+            ),
             complete,
             observed_at: inventory.finished_at,
             discovery: Some(json!({"revision":discovery_snapshot.revision,"complete":discovery_snapshot.complete,"issues":discovery_snapshot.issues})),

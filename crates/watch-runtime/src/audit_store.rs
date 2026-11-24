@@ -51,6 +51,25 @@ pub trait AuditSystem {
     ) -> Result<Value> {
         self.online(config, local)
     }
+    /// Collects online facts while optionally refreshing STUN concurrently.
+    /// Adapters that can overlap STUN and HTTP probes override this method;
+    /// the default preserves sequential `refresh_stun` then `online_for_target`.
+    fn online_with_fresh_stun(
+        &mut self,
+        config: &Config,
+        local: &Value,
+        target: claude_watch_core::processes::LaunchTarget,
+        refresh_stun: bool,
+    ) -> Result<Value> {
+        if refresh_stun {
+            let context = local
+                .get("context_id")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let _ = self.refresh_stun(context);
+        }
+        self.online_for_target(config, local, target)
+    }
     /// A launch may ask the adapter to refresh a bounded DNS/WebRTC probe. A
     /// missing probe is not made safe; persisted current-context receipts decide.
     fn refresh_leaks(&mut self, _local: &Value, _include_webrtc: bool) -> Result<(Option<Value>, Option<Value>)> {
@@ -154,6 +173,33 @@ impl AuditStore {
     ) -> Result<Value> {
         self.collect_inner(system, zones, AuditScope::Full, target, options, None, false)
     }
+    /// Runs a full target audit while concurrently executing an independent
+    /// controlled-path egress probe inside the exact same before/after local
+    /// context and policy consistency bracket.
+    pub fn collect_target_with_probe<S, P, T>(
+        &self,
+        system: &mut S,
+        zones: &ZoneCatalog,
+        target: claude_watch_core::processes::LaunchTarget,
+        options: AuditOptions,
+        probe: P,
+    ) -> Result<(Value, Option<T>)>
+    where
+        S: AuditSystem,
+        P: FnOnce() -> T + Send,
+        T: Send,
+    {
+        self.collect_inner_with_probe(
+            system,
+            zones,
+            AuditScope::Full,
+            target,
+            options,
+            None,
+            false,
+            Some(probe),
+        )
+    }
     pub fn collect_launch_preview<S: AuditSystem>(
         &self, system: &mut S, zones: &ZoneCatalog, target: LaunchTarget, options: AuditOptions,
     ) -> Result<Value> {
@@ -207,10 +253,38 @@ impl AuditStore {
         zones: &ZoneCatalog,
         scope: AuditScope,
         target: claude_watch_core::processes::LaunchTarget,
+        options: AuditOptions,
+        guard_capture: Option<&mut crate::guard_diagnostics::GuardCapture>,
+        preview: bool,
+    ) -> Result<Value> {
+        self.collect_inner_with_probe(
+            system,
+            zones,
+            scope,
+            target,
+            options,
+            guard_capture,
+            preview,
+            None::<fn()>,
+        )
+        .map(|(audit, _)| audit)
+    }
+    fn collect_inner_with_probe<S, P, T>(
+        &self,
+        system: &mut S,
+        zones: &ZoneCatalog,
+        scope: AuditScope,
+        target: claude_watch_core::processes::LaunchTarget,
         mut options: AuditOptions,
         mut guard_capture: Option<&mut crate::guard_diagnostics::GuardCapture>,
         preview: bool,
-    ) -> Result<Value> {
+        probe: Option<P>,
+    ) -> Result<(Value, Option<T>)>
+    where
+        S: AuditSystem,
+        P: FnOnce() -> T + Send,
+        T: Send,
+    {
         let capture_chatgpt_preview = guard_capture.is_some() && target.protected();
         if !target.protected() {
             options.persist = false;
@@ -239,41 +313,87 @@ impl AuditStore {
         // A launch must not read a cached UDP observation: re-probe first so the
         // gate judges a fresh round.  The periodic environment view skips this
         // and reuses the receipt, which is what keeps the STUN row stable.
-        if options.launch
+        let refresh_stun = options.launch
             && scope == AuditScope::Full
             && options.online
             && config.online_enabled
-            && transport
-        {
-            let context = before
-                .get("context_id")
-                .and_then(Value::as_str)
-                .unwrap_or("");
-            let _ = system.refresh_stun(context);
-        }
-        let mut online = if (scope == AuditScope::Full || scope == AuditScope::Dns)
-            && options.online
-            && config.online_enabled
-            && transport
-        {
-            if guard_capture.is_some() {
-                // A display round reports both services side by side, so the
-                // environment grid can show a ChatGPT card next to the Claude
-                // one. A launch round only measures the service it supervises.
-                system.online(&config, &before)?
-            } else {
-                system.online_for_target(&config, &before, target)?
-            }
-        } else {
-            json!({"query_errors":{"online": {"source":"audit","message":"联网检测未获允许或传输未确认"}}})
-        };
-        let receipts = ReceiptStore {
-            storage: self.storage.clone(),
-        };
-        let dns_refresh_requested = (options.launch || scope == AuditScope::Dns)
+            && transport;
+        let run_online = (scope == AuditScope::Full || scope == AuditScope::Dns)
             && options.online
             && config.online_enabled
             && transport;
+        let (online_result, probe_output) = std::thread::scope(|s| {
+            let probe_handle = run_online.then(|| probe.map(|f| s.spawn(f))).flatten();
+            let online_result = if run_online {
+                if guard_capture.is_some() {
+                    if refresh_stun {
+                        let context = before
+                            .get("context_id")
+                            .and_then(Value::as_str)
+                            .unwrap_or("");
+                        let _ = system.refresh_stun(context);
+                    }
+                    // A display round reports both services side by side, so the
+                    // environment grid can show a ChatGPT card next to the Claude
+                    // one. A launch round only measures the service it supervises.
+                    system.online(&config, &before)
+                } else {
+                    system.online_with_fresh_stun(&config, &before, target, refresh_stun)
+                }
+            } else {
+                Ok(json!({"query_errors":{"online": {"source":"audit","message":"联网检测未获允许或传输未确认"}}}))
+            };
+            let probe_output = probe_handle.and_then(|handle| handle.join().ok());
+            (online_result, probe_output)
+        });
+        let mut online = online_result?;
+        let receipts = ReceiptStore {
+            storage: self.storage.clone(),
+        };
+        let before_context = before
+            .get("context_id")
+            .or_else(|| before.get("context"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let observed_ip = online["trace"]["ip"].as_str();
+        // When both DNS and WebRTC receipts are already complete, passing, and
+        // network-reusable for this exact observed `(context_id, egress_ip)`,
+        // avoid an extra evidence-worker IPC + full local/egress round-trip.
+        let reusable_launch_leaks = scope == AuditScope::Full
+            && options.launch
+            && before["evidence_network_bound"] == true
+            && !before_context.is_empty()
+            && observed_ip.is_some()
+            && {
+                let check_now = system.now();
+                let (dns_receipt, webrtc_receipt) = receipts.probe_receipts();
+                let dns_status = receipts.dns_status_for_network(
+                    before_context,
+                    observed_ip,
+                    true,
+                    check_now,
+                    |v| format!("{v:.0}"),
+                );
+                let webrtc_status =
+                    receipts.webrtc_status_for_network(before_context, observed_ip, check_now);
+                dns_status["state"] == "ok"
+                    && webrtc_status["state"] == "ok"
+                    && claude_watch_core::receipts::network_reusable(
+                        &dns_receipt,
+                        before_context,
+                        observed_ip,
+                    )
+                    && claude_watch_core::receipts::network_reusable(
+                        &webrtc_receipt,
+                        before_context,
+                        observed_ip,
+                    )
+            };
+        let dns_refresh_requested = (options.launch || scope == AuditScope::Dns)
+            && options.online
+            && config.online_enabled
+            && transport
+            && !reusable_launch_leaks;
         let mut dns_refresh_error = None;
         if dns_refresh_requested {
             match system.refresh_leaks(&before, scope == AuditScope::Full && options.launch) {
@@ -440,7 +560,7 @@ impl AuditStore {
             } else {
                 json!({"source":"AuditStore.local；与环境页共用代理、TUN及规则判定", "entry":before.pointer("/tag/entry"), "controller":{"state":before.pointer("/tag/api/state"),"reason":before.pointer("/tag/api/reason")}})
             };
-            return audit::project(scope, output, evidence);
+            return audit::project(scope, output, evidence).map(|v| (v, probe_output));
         }
         // Keep the already captured inputs with the private audit receipt.  The
         // environment page is a presentation of this exact sample; it must not
@@ -455,7 +575,7 @@ impl AuditStore {
             output["display_facts"]["chatgpt_preview"] = preview;
         }
         if !options.persist {
-            return Ok(output);
+            return Ok((output, probe_output));
         }
         let _lock = ReceiptStore { storage: self.storage.clone() }.lock_observations()?;
         if policy
@@ -490,6 +610,6 @@ impl AuditStore {
         }
         self.storage.atomic_json(&self.audit_path(), &output)?;
         self.storage.atomic_json(&self.detection_path(), &output)?;
-        Ok(output)
+        Ok((output, probe_output))
     }
 }

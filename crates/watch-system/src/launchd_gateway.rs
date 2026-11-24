@@ -307,6 +307,7 @@ pub fn commit_gateway_transaction(transaction_id: &str) -> io::Result<()> {
         if after != broker {
             return Err(denied("broker identity changed during transaction commit"));
         }
+        drop(stream);
         if &reply != REPLY_OK {
             return Err(io::Error::other("gateway broker rejected transaction commit"));
         }
@@ -337,11 +338,24 @@ pub fn run_gateway_admin_action(args: &[String]) -> io::Result<()> {
         if after != broker {
             return Err(denied("broker identity changed during admin action"));
         }
+        drop(stream);
         if &reply != REPLY_OK {
             return Err(io::Error::other("gateway broker admin action failed"));
         }
         Ok(())
     }
+}
+
+/// Writes a fixed 3-byte control reply and keeps the server end of the Unix
+/// domain socket open until the client finishes its post-reply kernel identity
+/// recheck (`LOCAL_PEERTOKEN`) and closes the connection. Dropping the server
+/// socket immediately after `write_all` causes macOS `getsockopt(LOCAL_PEERTOKEN)`
+/// to fail with `ENOTCONN` (os error 57) on the client side.
+fn finish_control_reply(stream: &mut UnixStream, reply: &[u8; 3], wait_timeout: Duration) {
+    let _ = stream.write_all(reply);
+    let _ = stream.set_read_timeout(Some(wait_timeout));
+    let mut done = [0u8; 1];
+    let _ = stream.read(&mut done);
 }
 fn wait_for_control_startup<T>(timeout: Duration, mut acquire: impl FnMut() -> io::Result<T>) -> io::Result<T> {
     let deadline = std::time::Instant::now() + timeout;
@@ -666,27 +680,27 @@ pub fn run_gateway_broker_with_handlers(
                     stream.read_exact(&mut raw_id)?;
                     let tx_id = std::str::from_utf8(&raw_id).map_err(|_| invalid("invalid tx utf8"))?;
                     if !is_valid_tx_id(tx_id) {
-                        let _ = stream.write_all(REPLY_ERR);
+                        finish_control_reply(&mut stream, REPLY_ERR, Duration::from_millis(500));
                         return Err(invalid("invalid gateway tx id"));
                     }
                     failure_reason = "peer_identity_changed";
                     let after = platform::verify_peer(&stream, config.engine_uid, &config.engine_executable, &config.engine_sha256, &config.engine_cdhash)?;
                     if after != peer {
-                        let _ = stream.write_all(REPLY_ERR);
+                        finish_control_reply(&mut stream, REPLY_ERR, Duration::from_millis(500));
                         return Err(denied("engine identity changed during commit"));
                     }
                     failure_reason = "commit_failed";
                     let Some(handler) = handlers.on_commit else {
-                        let _ = stream.write_all(REPLY_ERR);
+                        finish_control_reply(&mut stream, REPLY_ERR, Duration::from_millis(500));
                         return Err(denied("commit handler unavailable"));
                     };
                     match handler(tx_id, &config) {
                         Ok(()) => {
-                            let _ = stream.write_all(REPLY_OK);
+                            finish_control_reply(&mut stream, REPLY_OK, Duration::from_secs(3));
                             return Ok(());
                         }
                         Err(error) => {
-                            let _ = stream.write_all(REPLY_ERR);
+                            finish_control_reply(&mut stream, REPLY_ERR, Duration::from_millis(500));
                             return Err(error);
                         }
                     }
@@ -699,35 +713,35 @@ pub fn run_gateway_broker_with_handlers(
                     stream.read_exact(&mut len_bytes)?;
                     let len = u32::from_be_bytes(len_bytes) as usize;
                     if len == 0 || len > MAX_ADMIN_PAYLOAD {
-                        let _ = stream.write_all(REPLY_ERR);
+                        finish_control_reply(&mut stream, REPLY_ERR, Duration::from_millis(500));
                         return Err(invalid("admin payload out of bounds"));
                     }
                     let mut buf = vec![0u8; len];
                     stream.read_exact(&mut buf)?;
                     let args: Vec<String> = serde_json::from_slice(&buf).map_err(|_| invalid("invalid admin json"))?;
                     if validate_gateway_admin_args(&args).is_err() {
-                        let _ = stream.write_all(REPLY_ERR);
+                        finish_control_reply(&mut stream, REPLY_ERR, Duration::from_millis(500));
                         return Err(invalid("admin action rejected by allowlist"));
                     }
                     failure_reason = "peer_identity_changed";
                     let after = platform::verify_peer(&stream, config.engine_uid, &config.engine_executable, &config.engine_sha256, &config.engine_cdhash)?;
                     if after != peer {
-                        let _ = stream.write_all(REPLY_ERR);
+                        finish_control_reply(&mut stream, REPLY_ERR, Duration::from_millis(500));
                         return Err(denied("engine identity changed during admin action"));
                     }
                     failure_reason = "admin_action_failed";
                     let Some(handler) = handlers.on_admin else {
-                        let _ = stream.write_all(REPLY_ERR);
+                        finish_control_reply(&mut stream, REPLY_ERR, Duration::from_millis(500));
                         return Err(denied("admin handler unavailable"));
                     };
                     stream.set_write_timeout(Some(Duration::from_secs(120)))?;
                     match handler(&args) {
                         Ok(()) => {
-                            let _ = stream.write_all(REPLY_OK);
+                            finish_control_reply(&mut stream, REPLY_OK, Duration::from_secs(3));
                             return Ok(());
                         }
                         Err(error) => {
-                            let _ = stream.write_all(REPLY_ERR);
+                            finish_control_reply(&mut stream, REPLY_ERR, Duration::from_millis(500));
                             return Err(error);
                         }
                     }
@@ -924,7 +938,7 @@ mod platform {
         if owned.len() != 1 { return Err(invalid("launchd must supply exactly one named socket")); }
         let fd = owned.pop().unwrap(); set_cloexec(fd.as_raw_fd())?; Ok(fd)
     }
-    fn peer_token(stream: &UnixStream) -> io::Result<[u32; 8]> {
+    pub(super) fn peer_token(stream: &UnixStream) -> io::Result<[u32; 8]> {
         let mut token = [0u32; 8]; let mut len = 32;
         if unsafe { libc::getsockopt(stream.as_raw_fd(), 0, 6, token.as_mut_ptr().cast(), &mut len) } != 0 {
             return Err(io::Error::last_os_error());
@@ -1315,6 +1329,54 @@ mod tests {
         assert!(is_valid_tx_id(&"a".repeat(32)));
         assert!(!is_valid_tx_id(&"A".repeat(32)));
         assert!(!is_valid_tx_id("short"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn gateway_control_reply_eof_wait_preserves_kernel_peer_token_recheck() {
+        let dir = Path::new("/tmp").join(format!("cw-gw-eof-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir(&dir).unwrap();
+        let path = dir.join("control.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+
+        // 1. Reproduce macOS XNU ENOTCONN (57) when the server drops immediately after write_all.
+        let mut client_a = connect_control_socket(&path, Duration::from_secs(1)).unwrap();
+        let (mut server_a, _) = listener.accept().unwrap();
+        server_a.write_all(REPLY_OK).unwrap();
+        drop(server_a);
+        let mut reply = [0u8; 3];
+        client_a.read_exact(&mut reply).unwrap();
+        assert_eq!(&reply, REPLY_OK);
+        let err = platform::peer_token(&client_a).unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::ENOTCONN));
+        drop(client_a);
+
+        // 2. Verify finish_control_reply keeps the socket connected through client LOCAL_PEERTOKEN
+        // recheck and unblocks promptly as soon as the client drops its stream.
+        let mut client_b = connect_control_socket(&path, Duration::from_secs(1)).unwrap();
+        let (mut server_b, _) = listener.accept().unwrap();
+        let reader_b = std::thread::spawn(move || {
+            let mut reply = [0u8; 3];
+            client_b.read_exact(&mut reply).unwrap();
+            assert_eq!(&reply, REPLY_OK);
+            std::thread::sleep(Duration::from_millis(30));
+            let token = platform::peer_token(&client_b)
+                .expect("LOCAL_PEERTOKEN must succeed while server waits for client EOF");
+            assert_eq!(token[5], std::process::id());
+            drop(client_b);
+        });
+        let started = std::time::Instant::now();
+        finish_control_reply(&mut server_b, REPLY_OK, Duration::from_secs(3));
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "server must unblock promptly on client EOF"
+        );
+        reader_b.join().unwrap();
+
+        drop(listener);
+        fs::remove_file(&path).unwrap();
+        fs::remove_dir(&dir).unwrap();
     }
 
     #[test]

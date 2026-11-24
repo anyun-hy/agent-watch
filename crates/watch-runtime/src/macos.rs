@@ -857,217 +857,240 @@ impl<R: ReadRunner, T: Transport, M: Mutator> Macos<R, T, M> {
         local: &Value,
         include_claude: bool,
         include_chatgpt: bool,
+        refresh_stun: bool,
     ) -> Result<Value> {
         let context = local
             .get("context_id")
             .and_then(Value::as_str)
             .unwrap_or("");
-        let egress = self.network.fast_egress();
-        let raw_trace = egress.data.clone().unwrap_or(Value::Null);
-        let trace = json!({"ip":raw_trace["ip"],"loc":raw_trace["country"],"observed_at":raw_trace["observed_at"]});
-        let ip = trace.get("ip").and_then(Value::as_str).unwrap_or("");
-        let measured_at = trace
-            .get("observed_at")
-            .and_then(Value::as_f64)
-            .unwrap_or(0.);
-        let lookup_receipt = (!ip.is_empty()).then(|| {
-            self.network
-                .metadata_for_context("lookup", context, ip, measured_at)
-        });
-        let lookup = lookup_receipt
-            .as_ref()
-            .map(crate::network_client::Receipt::display_value)
-            .unwrap_or(Value::Null);
-        let mut query_errors = if egress.status == "complete" {
-            json!({})
-        } else {
-            json!({"egress":{"source":egress.source_url,"message":egress.error}})
-        };
-        let mut geo = json!({"ip":ip,"country":Value::Null,"timezone":Value::Null});
-        let mut geo_sampled_at = None;
-        let lookup_data = lookup_receipt.as_ref().and_then(|receipt| {
-            (receipt.status == "complete" && receipt.http_status == Some(200))
-                .then_some(receipt.data.as_ref())
-                .flatten()
-                .filter(|data| data.is_object())
-        });
-        let lookup_bound = lookup_data.is_some_and(|data| {
-            lookup_receipt
-                .as_ref()
-                .is_some_and(|receipt| receipt.query == ip)
-                && data
-                    .get("ip")
-                    .and_then(Value::as_str)
-                    .and_then(claude_watch_core::network::public_unicast)
-                    .as_deref()
-                    == Some(ip)
-        });
-        let mut conflict = false;
-        if let Some(data) = lookup_data.filter(|_| lookup_bound) {
-            let country = data
-                .get("countryCode")
-                .or_else(|| data.get("country_code"))
-                .and_then(Value::as_str)
-                .map(|country| country.to_ascii_uppercase())
-                .filter(|country| {
-                    country.len() == 2 && country.bytes().all(|byte| byte.is_ascii_uppercase())
+        let network = &self.network;
+        let storage = &self.storage;
+        let (egress, services, openai_services, fresh_stun, trace, geo, geo_sampled_at, lookup, lookup_receipt, lookup_bound, asn, organization, mut query_errors, asn_value) =
+            std::thread::scope(|scope| {
+                let claude_task = include_claude.then(|| {
+                    (
+                        scope.spawn(move || network.claude_homepage()),
+                        scope.spawn(move || network.service_metadata("api")),
+                    )
                 });
-            let timezone = data
-                .get("timezone")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-                .or_else(|| {
-                    let zones = data
-                        .get("geo_sources")?
-                        .as_array()?
-                        .iter()
-                        .filter_map(|row| row.get("timezone").and_then(Value::as_str))
-                        .collect::<std::collections::BTreeSet<_>>();
-                    (zones.len() == 1).then(|| zones.into_iter().next().unwrap().to_owned())
+                let openai_task = include_chatgpt.then(|| {
+                    (
+                        scope.spawn(move || network.chatgpt_homepage()),
+                        scope.spawn(move || network.service_metadata("openai_api")),
+                    )
                 });
-            if country
-                .as_deref()
-                .is_some_and(|country| country != trace["loc"].as_str().unwrap_or(""))
-            {
-                conflict = true;
-                query_errors["egress_consistency"] = json!({"source":"Cloudflare trace / Net.Coffee","message":"Cloudflare 与 Net.Coffee 出口国家不一致"});
-            }
-            geo = json!({"ip":ip,"country":country,"timezone":timezone,
-                "country_source":"Net.Coffee lookup","timezone_source":"Net.Coffee lookup"});
-            geo_sampled_at = lookup_receipt.as_ref().map(|value| value.finished_at);
-        } else if lookup_receipt.is_some() {
-            // A positive mismatch rejected by NetworkClient must not disappear
-            // when the display data is cleared; malformed fields are different.
-            let returned = lookup_receipt
-                .as_ref()
-                .filter(|r| r.http_status == Some(200))
-                .and_then(|r| crate::storage::strict_json(r.raw.as_bytes()).ok());
-            let other_ip = lookup_data
-                .or(returned.as_ref())
-                .and_then(|data| data["ip"].as_str())
-                .and_then(claude_watch_core::network::public_unicast);
-            let actual_conflict = other_ip.as_deref().is_some_and(|other| other != ip);
-            let (source, message) = if actual_conflict {
-                (
-                    "Cloudflare trace / Net.Coffee",
-                    "Cloudflare 与 Net.Coffee 出口 IP 不一致",
-                )
-            } else {
-                ("Net.Coffee lookup", "Net.Coffee 查询未完成")
-            };
-            query_errors[if actual_conflict {
-                "egress_consistency"
-            } else {
-                "netcoffee"
-            }] = json!({"source":source,"message":message});
-            conflict = actual_conflict;
-        }
-        // A valid primary lookup is authoritative. Only genuinely absent geo
-        // fields may use the cached geoip fallback; a known IP/country conflict
-        // remains visible and cannot be overwritten by another source.
-        // A country with exactly one IANA zone already resolves the timezone
-        // (same rule as 2.9.5), so a missing `timezone` there is not a gap and
-        // must not trigger a fallback.
-        let single_zone_country = geo["country"].as_str().is_some_and(|country| {
-            crate::region_catalog::system_catalog()
-                .get(country)
-                .is_some_and(|zones| zones.len() == 1)
-        });
-        if !ip.is_empty()
-            && !conflict
-            && (geo["country"].is_null() || (geo["timezone"].is_null() && !single_zone_country))
-        {
-            let fallback = self
-                .network
-                .metadata_for_context("geoip", context, ip, measured_at);
-            if let Some(data) = fallback.data.as_ref().filter(|data| data.is_object()) {
-                // `/api/geoip/` answers for the IP in the path and returns no
-                // `ip` field, so provenance comes from the receipt query.  A
-                // returned `ip` still has to match when the source provides it.
-                let returned_ip = data
-                    .get("ip")
-                    .and_then(Value::as_str)
-                    .and_then(claude_watch_core::network::public_unicast);
-                let ip_bound = match returned_ip.as_deref() {
-                    Some(value) => value == ip,
-                    None => fallback.query == ip,
-                };
-                let bound =
-                    fallback.status == "complete" && fallback.http_status == Some(200) && ip_bound;
-                // `/api/geoip/` reports the full country name in `country` and
-                // the ISO code in `country_code`, so the code wins; a
-                // name-shaped value must never be read as a country code.
-                let country = ["countryCode", "country_code", "country"]
-                    .iter()
-                    .filter_map(|key| data.get(*key).and_then(Value::as_str))
-                    .map(|country| country.trim().to_ascii_uppercase())
-                    .find(|country| {
-                        country.len() == 2 && country.bytes().all(|byte| byte.is_ascii_uppercase())
-                    });
-                if bound && country.as_deref() == trace["loc"].as_str() {
-                    geo = json!({"ip":ip,"country":country,"timezone":data.get("timezone").cloned().unwrap_or(Value::Null),
-                        "country_source":"Net.Coffee geoip fallback","timezone_source":"Net.Coffee geoip fallback"});
-                    geo_sampled_at = Some(fallback.finished_at);
-                } else if country.is_some() && returned_ip.is_some() {
-                    query_errors["egress_consistency"] = json!({"source":"Cloudflare trace / Net.Coffee geoip","message":"Cloudflare 与 Net.Coffee 备用出口资料不一致"});
-                } else {
-                    query_errors["geo"] = json!({"source":"Net.Coffee geoip","message":"备用地理响应缺少有效 IP 或国家字段"});
-                }
-            } else {
-                query_errors["geo"] =
-                    json!({"source":"Net.Coffee geoip","message":"备用地理查询未完成"});
-            }
-        }
-        let asn = lookup_receipt
-            .as_ref()
-            .filter(|_| lookup_bound)
-            .and_then(crate::network_client::lookup_asn);
-        let organization = lookup_data
-            .filter(|_| lookup_bound)
-            .and_then(|data| {
-                data.get("asOrganization")
-                    .or_else(|| data.get("asn_org"))
-                    .or_else(|| data.get("org"))
-            })
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        let mut asn_value =
-            json!({"number":asn,"organization":organization,"source":"Net.Coffee lookup"});
-        if let Some(receipt) = lookup_receipt.as_ref().filter(|_| asn.is_some()) {
-            asn_value["queried_at"] = json!(receipt.finished_at);
-            let number = asn.unwrap();
-            let registration = self.network.ripe_asn(number);
-            if let Some(country) =
-                crate::network_client::ripe_registered_country(&registration, number)
-            {
-                asn_value["registered_country"] = json!(country);
-                asn_value["registered_queried_at"] = json!(registration.finished_at);
-                asn_value["result_time"] = json!(registration
-                    .data
+                let stun_task = refresh_stun.then(|| {
+                    scope.spawn(move || {
+                        let probe = crate::online_probes::default_stun_value();
+                        let store = crate::receipt_store::ReceiptStore {
+                            storage: storage.clone(),
+                        };
+                        let _ = store.record_stun(&probe, context, native::now());
+                        probe
+                    })
+                });
+                let egress = network.fast_egress();
+                let raw_trace = egress.data.clone().unwrap_or(Value::Null);
+                let trace = json!({"ip":raw_trace["ip"],"loc":raw_trace["country"],"observed_at":raw_trace["observed_at"]});
+                let ip = trace.get("ip").and_then(Value::as_str).unwrap_or("");
+                let measured_at = trace
+                    .get("observed_at")
+                    .and_then(Value::as_f64)
+                    .unwrap_or(0.);
+                let lookup_receipt = (!ip.is_empty()).then(|| {
+                    self.network
+                        .metadata_for_context("lookup", context, ip, measured_at)
+                });
+                let lookup = lookup_receipt
                     .as_ref()
-                    .and_then(|v| v.pointer("/data/result_time"))
+                    .map(crate::network_client::Receipt::display_value)
+                    .unwrap_or(Value::Null);
+                let mut query_errors = if egress.status == "complete" {
+                    json!({})
+                } else {
+                    json!({"egress":{"source":egress.source_url,"message":egress.error}})
+                };
+                let mut geo = json!({"ip":ip,"country":Value::Null,"timezone":Value::Null});
+                let mut geo_sampled_at = None;
+                let lookup_data = lookup_receipt.as_ref().and_then(|receipt| {
+                    (receipt.status == "complete" && receipt.http_status == Some(200))
+                        .then_some(receipt.data.as_ref())
+                        .flatten()
+                        .filter(|data| data.is_object())
+                });
+                let lookup_bound = lookup_data.is_some_and(|data| {
+                    lookup_receipt
+                        .as_ref()
+                        .is_some_and(|receipt| receipt.query == ip)
+                        && data
+                            .get("ip")
+                            .and_then(Value::as_str)
+                            .and_then(claude_watch_core::network::public_unicast)
+                            .as_deref()
+                            == Some(ip)
+                });
+                let mut conflict = false;
+                if let Some(data) = lookup_data.filter(|_| lookup_bound) {
+                    let country = data
+                        .get("countryCode")
+                        .or_else(|| data.get("country_code"))
+                        .and_then(Value::as_str)
+                        .map(|country| country.to_ascii_uppercase())
+                        .filter(|country| {
+                            country.len() == 2 && country.bytes().all(|byte| byte.is_ascii_uppercase())
+                        });
+                    let timezone = data
+                        .get("timezone")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                        .or_else(|| {
+                            let zones = data
+                                .get("geo_sources")?
+                                .as_array()?
+                                .iter()
+                                .filter_map(|row| row.get("timezone").and_then(Value::as_str))
+                                .collect::<std::collections::BTreeSet<_>>();
+                            (zones.len() == 1).then(|| zones.into_iter().next().unwrap().to_owned())
+                        });
+                    if country
+                        .as_deref()
+                        .is_some_and(|country| country != trace["loc"].as_str().unwrap_or(""))
+                    {
+                        conflict = true;
+                        query_errors["egress_consistency"] = json!({"source":"Cloudflare trace / Net.Coffee","message":"Cloudflare 与 Net.Coffee 出口国家不一致"});
+                    }
+                    geo = json!({"ip":ip,"country":country,"timezone":timezone,
+                        "country_source":"Net.Coffee lookup","timezone_source":"Net.Coffee lookup"});
+                    geo_sampled_at = lookup_receipt.as_ref().map(|value| value.finished_at);
+                } else if lookup_receipt.is_some() {
+                    let returned = lookup_receipt
+                        .as_ref()
+                        .filter(|r| r.http_status == Some(200))
+                        .and_then(|r| crate::storage::strict_json(r.raw.as_bytes()).ok());
+                    let other_ip = lookup_data
+                        .or(returned.as_ref())
+                        .and_then(|data| data["ip"].as_str())
+                        .and_then(claude_watch_core::network::public_unicast);
+                    let actual_conflict = other_ip.as_deref().is_some_and(|other| other != ip);
+                    let (source, message) = if actual_conflict {
+                        (
+                            "Cloudflare trace / Net.Coffee",
+                            "Cloudflare 与 Net.Coffee 出口 IP 不一致",
+                        )
+                    } else {
+                        ("Net.Coffee lookup", "Net.Coffee 查询未完成")
+                    };
+                    query_errors[if actual_conflict {
+                        "egress_consistency"
+                    } else {
+                        "netcoffee"
+                    }] = json!({"source":source,"message":message});
+                    conflict = actual_conflict;
+                }
+                let single_zone_country = geo["country"].as_str().is_some_and(|country| {
+                    crate::region_catalog::system_catalog()
+                        .get(country)
+                        .is_some_and(|zones| zones.len() == 1)
+                });
+                if !ip.is_empty()
+                    && !conflict
+                    && (geo["country"].is_null() || (geo["timezone"].is_null() && !single_zone_country))
+                {
+                    let fallback = self
+                        .network
+                        .metadata_for_context("geoip", context, ip, measured_at);
+                    if let Some(data) = fallback.data.as_ref().filter(|data| data.is_object()) {
+                        let returned_ip = data
+                            .get("ip")
+                            .and_then(Value::as_str)
+                            .and_then(claude_watch_core::network::public_unicast);
+                        let ip_bound = match returned_ip.as_deref() {
+                            Some(value) => value == ip,
+                            None => fallback.query == ip,
+                        };
+                        let bound =
+                            fallback.status == "complete" && fallback.http_status == Some(200) && ip_bound;
+                        let country = ["countryCode", "country_code", "country"]
+                            .iter()
+                            .filter_map(|key| data.get(*key).and_then(Value::as_str))
+                            .map(|country| country.trim().to_ascii_uppercase())
+                            .find(|country| {
+                                country.len() == 2 && country.bytes().all(|byte| byte.is_ascii_uppercase())
+                            });
+                        if bound && country.as_deref() == trace["loc"].as_str() {
+                            geo = json!({"ip":ip,"country":country,"timezone":data.get("timezone").cloned().unwrap_or(Value::Null),
+                                "country_source":"Net.Coffee geoip fallback","timezone_source":"Net.Coffee geoip fallback"});
+                            geo_sampled_at = Some(fallback.finished_at);
+                        } else if country.is_some() && returned_ip.is_some() {
+                            query_errors["egress_consistency"] = json!({"source":"Cloudflare trace / Net.Coffee geoip","message":"Cloudflare 与 Net.Coffee 备用出口资料不一致"});
+                        } else {
+                            query_errors["geo"] = json!({"source":"Net.Coffee geoip","message":"备用地理响应缺少有效 IP 或国家字段"});
+                        }
+                    } else {
+                        query_errors["geo"] =
+                            json!({"source":"Net.Coffee geoip","message":"备用地理查询未完成"});
+                    }
+                }
+                let asn = lookup_receipt
+                    .as_ref()
+                    .filter(|_| lookup_bound)
+                    .and_then(crate::network_client::lookup_asn);
+                let organization = lookup_data
+                    .filter(|_| lookup_bound)
+                    .and_then(|data| {
+                        data.get("asOrganization")
+                            .or_else(|| data.get("asn_org"))
+                            .or_else(|| data.get("org"))
+                    })
                     .and_then(Value::as_str)
                     .unwrap_or("")
-                    .chars()
-                    .take(80)
-                    .collect::<String>());
-            } else {
-                query_errors["asn"] = json!({"source":"RIPEstat ASN","message":registration.error.unwrap_or_else(||"ASN 注册国家没有返回完整结果".into())});
-            }
-        }
-        let services = include_claude.then(|| {
-            (
-                self.network.claude_homepage(),
-                self.network.service_metadata("api"),
-            )
-        });
-        let openai_services = include_chatgpt.then(|| {
-            (
-                self.network.chatgpt_homepage(),
-                self.network.service_metadata("openai_api"),
-            )
-        });
-        let stun = self.stun_fact(context);
+                    .to_owned();
+                let mut asn_value =
+                    json!({"number":asn,"organization":organization,"source":"Net.Coffee lookup"});
+                if let Some(receipt) = lookup_receipt.as_ref().filter(|_| asn.is_some()) {
+                    asn_value["queried_at"] = json!(receipt.finished_at);
+                    let number = asn.unwrap();
+                    let registration = self.network.ripe_asn(number);
+                    if let Some(country) =
+                        crate::network_client::ripe_registered_country(&registration, number)
+                    {
+                        asn_value["registered_country"] = json!(country);
+                        asn_value["registered_queried_at"] = json!(registration.finished_at);
+                        asn_value["result_time"] = json!(registration
+                            .data
+                            .as_ref()
+                            .and_then(|v| v.pointer("/data/result_time"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .chars()
+                            .take(80)
+                            .collect::<String>());
+                    } else {
+                        query_errors["asn"] = json!({"source":"RIPEstat ASN","message":registration.error.unwrap_or_else(||"ASN 注册国家没有返回完整结果".into())});
+                    }
+                }
+                let services = claude_task.map(|(h, a)| (h.join().unwrap(), a.join().unwrap()));
+                let openai_services = openai_task.map(|(h, a)| (h.join().unwrap(), a.join().unwrap()));
+                let fresh_stun = stun_task.map(|s| s.join().unwrap());
+                (
+                    egress,
+                    services,
+                    openai_services,
+                    fresh_stun,
+                    trace,
+                    geo,
+                    geo_sampled_at,
+                    lookup,
+                    lookup_receipt,
+                    lookup_bound,
+                    asn,
+                    organization,
+                    query_errors,
+                    asn_value,
+                )
+            });
+        let _ = (&lookup_receipt, lookup_bound, asn, &organization, &mut query_errors);
+        let stun = fresh_stun.unwrap_or_else(|| self.stun_fact(context));
         let mut result = json!({"stun":stun,"trace":trace,"geo":geo,"asn":asn_value,"netcoffee_lookup":lookup,"query_errors":query_errors,
             "source_times":{"trace":egress.finished_at,"geo":geo_sampled_at,"asn":asn_value.get("registered_queried_at").or_else(||asn_value.get("queried_at"))}});
         if let Some((claude, api)) = services {
@@ -1176,7 +1199,7 @@ impl<R: ReadRunner, T: Transport, M: Mutator> AuditSystem for Macos<R, T, M> {
     fn online(&mut self, c: &Config, l: &Value) -> Result<Value> {
         // The environment view is not tied to one family: it reports both
         // services so the grid can show a ChatGPT card beside the Claude one.
-        self.online_facts(c, l, true, true)
+        self.online_facts(c, l, true, true, false)
     }
     fn online_for_target(
         &mut self,
@@ -1193,7 +1216,22 @@ impl<R: ReadRunner, T: Transport, M: Mutator> AuditSystem for Macos<R, T, M> {
                 | claude_watch_core::processes::Provider::Chatgpt
                 | claude_watch_core::processes::Provider::Openai
         );
-        self.online_facts(c, l, !openai, openai)
+        self.online_facts(c, l, !openai, openai, false)
+    }
+    fn online_with_fresh_stun(
+        &mut self,
+        c: &Config,
+        l: &Value,
+        target: claude_watch_core::processes::LaunchTarget,
+        refresh_stun: bool,
+    ) -> Result<Value> {
+        let openai = matches!(
+            target.provider(),
+            claude_watch_core::processes::Provider::Codex
+                | claude_watch_core::processes::Provider::Chatgpt
+                | claude_watch_core::processes::Provider::Openai
+        );
+        self.online_facts(c, l, !openai, openai, refresh_stun)
     }
     fn refresh_leaks(&mut self, local: &Value, include_webrtc: bool) -> Result<(Option<Value>, Option<Value>)> {
         use claude_watch_core::evidence::{EvidenceAction, EvidencePurpose, EvidenceRequest, ProbeKind};
@@ -1270,7 +1308,7 @@ impl<R: ReadRunner, T: Transport, M: Mutator> OnboardingSystem for Macos<R, T, M
     fn egress_for_local(&self, config: &Config, local: &Value) -> Result<Value> {
         // The caller already checked this local sample. Exit confirmation
         // needs the exit and its metadata, not another Claude service probe.
-        let online = self.online_facts(config, local, false, false)?;
+        let online = self.online_facts(config, local, false, false, false)?;
         let trace = &online["trace"];
         Ok(json!({"trace":{"ip":trace["ip"],"loc":trace["loc"]},"geo":online["geo"]}))
     }

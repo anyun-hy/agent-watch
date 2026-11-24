@@ -36,6 +36,9 @@ final class MonitorStore: ObservableObject {
     @Published private(set) var graphContinuity = GraphContinuityStore()
     @Published private(set) var serverReferences: [String: ServerReference] = [:]
     @Published private(set) var channelSubscription = ChannelMonitorSubscriptionStore()
+    @Published private(set) var runtimeVersionMismatch: RuntimeVersionMismatch?
+    @Published private(set) var syncingRuntime = false
+    @Published private(set) var runtimeSyncError: String?
     private var referenceQueryRunning = false
     private var referenceQueriesEnabled = false
     private var started = false
@@ -154,6 +157,7 @@ final class MonitorStore: ObservableObject {
                 }
             }
         }
+        refreshRuntimeVersionSync()
         refreshBackgroundIfNeeded(at: Date())
         referenceQueriesEnabled = !initializing
         refresh()
@@ -182,6 +186,39 @@ final class MonitorStore: ObservableObject {
         await readNotificationAccess {
             let settings = await UNUserNotificationCenter.current().notificationSettings()
             return .classify(settings.authorizationStatus, alert: settings.alertSetting, style: settings.alertStyle)
+        }
+    }
+    func refreshRuntimeVersionSync() {
+        guard !switcher.isFixture else {
+            runtimeVersionMismatch = nil
+            return
+        }
+        runtimeVersionMismatch = RuntimeVersionSync.currentMismatch()
+        if runtimeVersionMismatch == nil {
+            runtimeSyncError = nil
+        }
+    }
+    func syncRuntimeFromBundle() async {
+        guard !switcher.isFixture, !syncingRuntime else { return }
+        syncingRuntime = true
+        runtimeSyncError = nil
+        defer { syncingRuntime = false }
+        do {
+            let data = try await Task.detached(priority: .userInitiated) {
+                try SwitcherCommandRunner.run(["install-runtime", "--apply"])
+            }.value
+            let parsed = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+            guard parsed?["status"] as? String == "ok" else {
+                runtimeSyncError = (parsed?["error"] as? [String: Any])?["message"] as? String
+                    ?? (parsed?["message"] as? String)
+                    ?? "后台采集与 Seatbelt 网关同步升级未确认，请重试。"
+                return
+            }
+            refreshRuntimeVersionSync()
+            refresh(manual: true)
+            await switcher.refreshBackground(maximumAge: 0)
+        } catch {
+            runtimeSyncError = error.localizedDescription
         }
     }
     private func readNotificationAccess(_ reader: () async -> WatchNotificationAccess) async {

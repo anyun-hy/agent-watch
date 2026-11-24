@@ -119,24 +119,23 @@ pub(crate) fn run_with_worker(
         input["policy_version"] = json!(req.policy_version);
         worker(kind, &input, deadline, cancel)
     };
-    let audit = invoke("audit", json!({}))?;
-    let mid_now = native::now();
-    let epoch_mid = read_verified_vpn_epoch(paths, enforcer, &req.family, mid_now);
-    verify_audit_vpn_epoch_consistency(req, epoch_mid.as_ref())?;
-    if epoch_before.is_some() && epoch_mid != epoch_before {
-        return Err(CoreError::new(
-            "audit_vpn_epoch_changed",
-            "审计期间 VPN epoch 发生变化，结果作废",
-        ));
-    }
+    let (combined, mut evidence) = enforcer.probe_via_controlled_diagnostic_channel(
+        &req.family,
+        "",
+        start_now,
+        |proxy| invoke("audit-and-egress", json!({"proxy": proxy})),
+    )?;
+    let audit = combined
+        .get("audit")
+        .cloned()
+        .ok_or_else(|| CoreError::new("invalid_audit_response", "审计工作组件缺少环境审计结果"))?;
+    let mut egress = combined
+        .get("egress")
+        .cloned()
+        .ok_or_else(|| CoreError::new("controlled_probe_failed", "受控探针没有有效出口证据"))?;
     // This context comes from this audit, never from an old session/request.
     let context = audit_context(&audit)?;
-    let (mut egress, evidence) = enforcer.probe_via_controlled_diagnostic_channel(
-        &req.family,
-        context,
-        mid_now,
-        |proxy| invoke("egress", json!({"proxy":proxy,"context_id":context})),
-    )?;
+    evidence.context_id = context.to_owned();
     let end_now = native::now();
     let epoch_after = read_verified_vpn_epoch(paths, enforcer, &req.family, end_now)
         .or_else(|| evidence.vpn_epoch.clone());
@@ -200,6 +199,44 @@ pub fn worker(kind: &str, input: Value) -> Result<Value> {
             "审计开始前策略已经变化",
         ));
     }
+    if kind == "audit-and-egress" {
+        let proxy = input["proxy"]
+            .as_str()
+            .filter(|s| !s.trim().is_empty())
+            .ok_or_else(|| CoreError::new("invalid_audit_request", "缺少受控出口"))?
+            .to_owned();
+        let controlled_network = host.network.clone();
+        let (audit, egress_receipt) =
+            AuditStore::new(StateStore::new(paths)).collect_target_with_probe(
+                &mut host,
+                &load_system_catalog(),
+                target,
+                AuditOptions {
+                    online: true,
+                    persist: false,
+                    launch: true,
+                },
+                move || controlled_network.fast_egress_via(Some(&proxy)),
+            )?;
+        let latest = config_store.load()?;
+        if claude_watch_runtime::channel_supervisor::ChannelSupervisor::compute_policy_version(
+            &latest,
+        )? != expected
+            || audit["policy"].as_str() != Some(expected.policy_digest.as_str())
+        {
+            return Err(CoreError::new(
+                "audit_policy_changed",
+                "审计期间策略已经变化",
+            ));
+        }
+        let _ = audit_context(&audit)?;
+        let egress = egress_receipt
+            .and_then(|receipt| receipt.data)
+            .ok_or_else(|| {
+                CoreError::new("controlled_probe_failed", "受控探针没有有效出口证据")
+            })?;
+        return Ok(json!({"audit": audit, "egress": egress}));
+    }
     if kind == "audit" {
         let audit = AuditStore::new(StateStore::new(paths)).collect_target(
             &mut host,
@@ -261,6 +298,16 @@ pub fn worker(kind: &str, input: Value) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use claude_watch_core::{
+        channel::{
+            ChannelEnforcementCommand, ChannelPermit, ChannelPermitState, NetworkBackendKind,
+            PolicyVersion,
+        },
+        processes::LaunchTarget,
+        vpn::VpnEpoch,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     #[test]
     fn channel_audit_requires_the_observed_context_and_rejects_sampling_changes() {
         assert_eq!(
@@ -272,5 +319,98 @@ mod tests {
             &json!({"context_id":"new","context_transition":{"state":"changed"}})
         )
         .is_err());
+    }
+
+    #[test]
+    fn channel_audit_runs_single_combined_audit_and_egress_worker_with_controlled_evidence() {
+        let root = std::env::temp_dir().join(format!("cw-audit-single-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let paths = Paths::new(&root).unwrap();
+        let now = native::now();
+        let policy_version = PolicyVersion {
+            policy_digest: "sha256:policy".into(),
+            guard_policy_digest: "sha256:guard".into(),
+        };
+        let vpn_epoch = VpnEpoch {
+            observer_boot_id: "vpn-boot-1".into(),
+            change_generation: 7,
+        };
+        let enforcer = LocalTunnelEnforcer::new("exec-boot-1");
+        enforcer.set_clock(move || now).unwrap();
+        enforcer.configure_seatbelt_backend(true, now).unwrap();
+        enforcer.set_interception_active(true, now).unwrap();
+        enforcer
+            .apply_command(
+                &ChannelEnforcementCommand {
+                    command_seq: 1,
+                    family: "openai".into(),
+                    session_id: Some("sess-1".into()),
+                    target_executor_boot_id: Some("exec-boot-1".into()),
+                    permit: ChannelPermit {
+                        family: "openai".into(),
+                        session_id: Some("sess-1".into()),
+                        state: ChannelPermitState::PendingVerification,
+                        policy_version: policy_version.clone(),
+                        permit_generation: 1,
+                        command_seq: 1,
+                        issued_at: now,
+                        valid_until: now + 30.0,
+                        reason_code: "pending_audit".into(),
+                        context_id: None,
+                        baseline_ip: None,
+                        members: vec![],
+                        backend: NetworkBackendKind::Seatbelt,
+                        vpn_epoch: Some(vpn_epoch.clone()),
+                        coverage_scope: None,
+                    },
+                    policy_version: policy_version.clone(),
+                    permit_generation: 1,
+                    upstream_endpoint: "http://127.0.0.1:7890".into(),
+                    allowed_processes: vec![],
+                    issued_at: now,
+                },
+                now,
+            )
+            .unwrap();
+        let req = AsyncAuditRequest {
+            request_id: 1,
+            family: "openai".into(),
+            target: LaunchTarget::CodexDesktop,
+            session_id: Some("sess-1".into()),
+            context_id: None,
+            policy_version: policy_version.clone(),
+            upstream_endpoint: "http://127.0.0.1:7890".into(),
+            vpn_epoch: Some(vpn_epoch.clone()),
+            requested_at: now,
+            timeout_seconds: 20.0,
+            cancellation: None,
+        };
+        let calls = AtomicUsize::new(0);
+        let (audit, egress, _) = run_with_worker(&paths, &enforcer, &req, |kind, input, _, _| {
+            calls.fetch_add(1, Ordering::Relaxed);
+            assert_eq!(kind, "audit-and-egress");
+            assert_eq!(input["proxy"], "http://127.0.0.1:7890");
+            Ok(json!({
+                "audit": {
+                    "context_id": "ctx-single-worker",
+                    "context_changed": false,
+                    "context_transition": {"state": "stable"},
+                    "ready": true
+                },
+                "egress": {
+                    "ip": "203.0.113.10",
+                    "country": "JP"
+                }
+            }))
+        })
+        .unwrap();
+        assert_eq!(calls.load(Ordering::Relaxed), 1, "must invoke exactly one combined worker");
+        assert_eq!(audit["context_id"], "ctx-single-worker");
+        assert_eq!(egress["via_controlled_path"], true);
+        assert_eq!(egress["context_id"], "ctx-single-worker");
+        assert_eq!(egress["upstream_endpoint"], "http://127.0.0.1:7890");
+        assert_eq!(egress["executor_boot_id"], "exec-boot-1");
+        assert_eq!(egress["vpn_epoch"], json!(vpn_epoch));
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

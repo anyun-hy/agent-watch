@@ -262,6 +262,25 @@ fn run_fixture_audit(storage: &StateStore, req: &AsyncAuditRequest) -> Result<(V
         assert_eq!(input["home"], json!(storage.paths.home));
         assert_eq!(input["launch_target"], json!(req.target));
         match kind {
+            "audit-and-egress" => {
+                assert_eq!(input["proxy"], config.proxy_url);
+                let proxy = config.proxy_url.clone();
+                let (audit, egress_receipt) = AuditStore::new(storage.clone())
+                    .collect_target_with_probe(
+                        &mut FixtureSystem { collector_ready: true },
+                        &load_system_catalog(),
+                        req.target,
+                        AuditOptions { online: true, persist: false, launch: true },
+                        move || {
+                            let network = NetworkClient::new(Arc::new(FixtureTransport), None).unwrap();
+                            network.fast_egress_via(Some(&proxy))
+                        },
+                    )?;
+                let egress = egress_receipt
+                    .and_then(|r| r.data)
+                    .ok_or_else(|| CoreError::new("fixture_egress_missing", "夹具出口未取得"))?;
+                Ok(json!({"audit": audit, "egress": egress}))
+            }
             "audit" => AuditStore::new(storage.clone()).collect_target(
                 &mut FixtureSystem { collector_ready: true }, &load_system_catalog(), req.target,
                 AuditOptions { online: true, persist: false, launch: true },

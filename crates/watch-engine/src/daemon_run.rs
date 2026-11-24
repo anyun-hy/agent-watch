@@ -167,6 +167,7 @@ pub struct ProductionChannelStack {
     local_proxy_worker: Option<claude_watch_system::ListenerWorker>,
     target_refresh_worker: Option<thread::JoinHandle<()>>,
     target_refresh_cancel: Option<UnixStream>,
+    sampling_wake: Option<UnixStream>,
     backend_refresh_requested: bool,
     active_guard: Arc<ActiveGuardState>,
     #[cfg(all(test, target_os = "macos"))]
@@ -248,12 +249,20 @@ fn target_metadata_signature(storage: &StateStore, resources_dir: Option<&std::p
     out
 }
 
+fn notify_sampling_wake(wake: &Option<UnixStream>) {
+    if let Some(stream) = wake {
+        use std::io::Write;
+        let _ = (&*stream).write(&[1]);
+    }
+}
+
 fn spawn_target_refresh_worker(
     storage: StateStore,
     resources_dir: Option<PathBuf>,
     registry: Arc<SandboxLaunchRegistry>,
     stop: Arc<AtomicBool>,
     event_tx: Sender<SupervisionEvent>,
+    sampling_wake: Option<UnixStream>,
 ) -> Result<(thread::JoinHandle<()>, UnixStream)> {
     let error = |_| CoreError::new("target_refresh_worker_failed", "受控目标通知通道无法启动");
     let (cancel, cancellation) = UnixStream::pair().map_err(error)?;
@@ -297,7 +306,10 @@ fn spawn_target_refresh_worker(
             let mut buffer = [0; 256];
             use std::io::Read;
             if ready == Some(1) { let _ = publications.read(&mut buffer); }
-            if ready == Some(2) { let _ = registrations.read(&mut buffer); }
+            if ready == Some(2) {
+                let _ = registrations.read(&mut buffer);
+                notify_sampling_wake(&sampling_wake);
+            }
         }
     }).map_err(|_| CoreError::new("target_refresh_worker_failed", "受控目标刷新线程启动失败"))?;
     Ok((worker, cancel))
@@ -918,6 +930,7 @@ where
         diagnostics,
         std::sync::mpsc::channel(),
         Arc::new(ActiveGuardState::default()),
+        None,
         run_audit,
     )
 }
@@ -927,6 +940,7 @@ fn assemble_channel_stack_with_diagnostics<F>(
     custom_vpn_reader: Option<Arc<dyn VpnSourceReader>>, diagnostics: ChannelDiagnostics,
     (event_tx, event_rx): (Sender<SupervisionEvent>, Receiver<SupervisionEvent>),
     active_guard: Arc<ActiveGuardState>,
+    sampling_wake: Option<UnixStream>,
     run_audit: F,
 ) -> Result<ProductionChannelStack>
 where F: Fn(&AsyncAuditRequest) -> Result<(Value, Value, f64)> + Send + Sync + 'static,
@@ -1033,6 +1047,7 @@ where F: Fn(&AsyncAuditRequest) -> Result<(Value, Value, f64)> + Send + Sync + '
         local_proxy_worker: None,
         target_refresh_worker: None,
         target_refresh_cancel: None,
+        sampling_wake,
         backend_refresh_requested: false,
         active_guard,
         #[cfg(all(test, target_os = "macos"))]
@@ -1149,8 +1164,14 @@ impl ProductionChannelStack {
             let _ = self.target_refresh_worker.take().unwrap().join();
         }
         if self.target_refresh_worker.is_none() {
-            let (worker, cancel) = spawn_target_refresh_worker(self.supervisor.storage.clone(), resources,
-                reg.clone(), self.stop.clone(), self.event_tx.clone())?;
+            let (worker, cancel) = spawn_target_refresh_worker(
+                self.supervisor.storage.clone(),
+                resources,
+                reg.clone(),
+                self.stop.clone(),
+                self.event_tx.clone(),
+                self.sampling_wake.as_ref().and_then(|s| s.try_clone().ok()),
+            )?;
             self.target_refresh_worker = Some(worker);
             self.target_refresh_cancel = Some(cancel);
         }
@@ -1515,8 +1536,10 @@ fn evidence_signature(rows: &Value) -> Option<String> {
 }
 
 /// A process inventory has no reliable global launch notification for CLI
-/// processes. Keep its existing evidence budget, and wake early on route changes.
+/// processes. Keep its existing evidence budget, wake early on route changes,
+/// and wake immediately when a sandboxed process registers or gets attributed.
 fn wait_for_sampling_event(watcher: &mut NetworkEventWatcher, mut frames: Option<&mut UnixStream>,
+    mut sampling_wake: Option<&mut UnixStream>,
     source: Option<&claude_watch_runtime::native_listener::ListenerStream>, last_revision: &mut u64,
     requested: &mut Option<u64>, mut deadline: Instant, stop: &AtomicBool, shutdown: &UnixStream) -> Result<bool> {
     use std::io::Read;
@@ -1528,11 +1551,22 @@ fn wait_for_sampling_event(watcher: &mut NetworkEventWatcher, mut frames: Option
         let wake_at = source_deadline.map_or(deadline, |at| at.min(deadline));
         let timeout = if pending { Duration::ZERO } else { wake_at.saturating_duration_since(Instant::now()) };
         let mut readers = vec![shutdown.as_fd()];
-        if let Some(fd) = frames.as_ref() { readers.push(fd.as_fd()); }
+        let frames_index = frames.as_ref().map(|fd| {
+            readers.push(fd.as_fd());
+            readers.len() - 1
+        });
+        let wake_index = sampling_wake.as_ref().map(|fd| {
+            readers.push(fd.as_fd());
+            readers.len() - 1
+        });
         let (events, ready) = watcher.wait_with_readers(timeout, &readers);
         if ready == Some(0) || stop.load(Ordering::Acquire) { break; }
-        if ready == Some(1) {
+        if frames_index.is_some() && ready == frames_index {
             if let Some(stream) = &mut frames { let _ = stream.read(&mut [0; 256]); }
+        }
+        if wake_index.is_some() && ready == wake_index {
+            if let Some(stream) = &mut sampling_wake { let _ = stream.read(&mut [0; 256]); }
+            break;
         }
         let change = events.iter().any(|event| !matches!(event, NetworkEventKind::Timeout));
         network_changed |= change;
@@ -1765,7 +1799,12 @@ pub fn run(request: &Request, paths: Paths) -> Result<Value> {
     // cannot hold up the authority or accumulate unbounded stale rounds.
     let guard_rounds = Arc::new(GuardRoundHandoff::default());
     let active_guard = Arc::new(ActiveGuardState::default());
+    let (mut sampling_wake_rx, sampling_wake_tx) = UnixStream::pair()
+        .map_err(|_| CoreError::new("sampling_wake_failed", "进程采样唤醒通道无法启动"))?;
+    let _ = sampling_wake_rx.set_nonblocking(true);
+    let _ = sampling_wake_tx.set_nonblocking(true);
     let guard = if request.flag("observe-only") {
+        drop(sampling_wake_tx);
         None
     } else {
         let guard_diagnostics = diagnostic_queue.clone();
@@ -1785,6 +1824,7 @@ pub fn run(request: &Request, paths: Paths) -> Result<Value> {
         let shutdown_rounds = guard_rounds.clone();
         let collector_rounds = guard_rounds.clone();
         let guard_active = active_guard.clone();
+        let guard_sampling_wake = sampling_wake_tx;
         Some(
             thread::Builder::new()
                 .name("claude-session-guard".into())
@@ -1797,6 +1837,7 @@ pub fn run(request: &Request, paths: Paths) -> Result<Value> {
                         guard_channel_diagnostics,
                         (guard_events.clone(), event_rx),
                         guard_active.clone(),
+                        Some(guard_sampling_wake),
                         move |req| {
                             let enforcer = claude_watch_runtime::channel_enforcer::registered_production_enforcer(&audit_paths.watch())
                                 .ok_or_else(|| CoreError::new("controlled_channel_missing", "受控诊断执行器不可用，保持待验证"))?;
@@ -2051,8 +2092,8 @@ pub fn run(request: &Request, paths: Paths) -> Result<Value> {
             if snapshot["samplingDiagnostics"]["network_reused"].is_boolean() {
                 if let Some(review) = publisher.next_network_review() { deadline = deadline.min(review); }
             }
-            match wait_for_sampling_event(&mut sampling_events, frames.as_mut(), source.as_deref(),
-                &mut last_revision, &mut requested_revision, deadline, &stop, &shutdown_signals.wake) {
+            match wait_for_sampling_event(&mut sampling_events, frames.as_mut(), Some(&mut sampling_wake_rx),
+                source.as_deref(), &mut last_revision, &mut requested_revision, deadline, &stop, &shutdown_signals.wake) {
                 Ok(changed) => {
                     if changed { active_guard.request_immediate_probe(); }
                     network_changed |= changed;
@@ -2168,6 +2209,43 @@ mod tests {
         handoff.close();
         assert!(handoff.take().is_none());
         assert!(started.elapsed() < Duration::from_millis(500), "empty handoff must leave stop checks bounded");
+    }
+
+    #[test]
+    fn wait_for_sampling_event_wakes_immediately_on_sampling_wake_signal() {
+        let mut watcher = NetworkEventWatcher::new(&[]);
+        let (shutdown_rx, _shutdown_tx) = UnixStream::pair().unwrap();
+        let (mut wake_rx, wake_tx) = UnixStream::pair().unwrap();
+        let _ = shutdown_rx.set_nonblocking(true);
+        let _ = wake_rx.set_nonblocking(true);
+        let _ = wake_tx.set_nonblocking(true);
+        let stop = AtomicBool::new(false);
+        let mut last_revision = 0u64;
+        let mut requested = None;
+        let sender = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(30));
+            notify_sampling_wake(&Some(wake_tx));
+        });
+        let started = Instant::now();
+        let changed = wait_for_sampling_event(
+            &mut watcher,
+            None,
+            Some(&mut wake_rx),
+            None,
+            &mut last_revision,
+            &mut requested,
+            Instant::now() + Duration::from_secs(5),
+            &stop,
+            &shutdown_rx,
+        )
+        .unwrap();
+        sender.join().unwrap();
+        assert!(!changed, "sandbox registration wake must not trigger a slow network rescan");
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "sampling loop must wake immediately on sandbox registration instead of waiting for 5s deadline (elapsed {:?})",
+            started.elapsed()
+        );
     }
 
     #[test]

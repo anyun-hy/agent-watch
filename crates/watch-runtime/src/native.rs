@@ -207,13 +207,18 @@ pub fn decode_inventory(value: &Value, sent: f64, received: f64) -> Result<Inven
         finished_at: value["finished_at"].as_f64().unwrap(),
     })
 }
-pub fn decode_arguments(
+pub struct ArgumentsResult {
+    pub arguments: BTreeMap<u32, Arguments>,
+    pub confirmed_exited: BTreeSet<u32>,
+}
+
+pub fn decode_arguments_result(
     value: &Value,
     expected: &[Identity],
     round: &str,
     sent: f64,
     received: f64,
-) -> Result<BTreeMap<u32, Arguments>> {
+) -> Result<ArgumentsResult> {
     let uid = envelope(value, sent, received, Some(round))?;
     let rows = value["argument_prefixes"]
         .as_array()
@@ -221,6 +226,7 @@ pub fn decode_arguments(
         .ok_or_else(invalid)?;
     let expected: BTreeMap<_, _> = expected.iter().map(|p| (p.pid, p)).collect();
     let mut result = BTreeMap::new();
+    let mut confirmed_exited = BTreeSet::new();
     let mut seen = BTreeSet::new();
     for row in rows {
         let pid = row["pid"]
@@ -229,6 +235,23 @@ pub fn decode_arguments(
             .ok_or_else(invalid)?;
         if !seen.insert(pid) || !expected.contains_key(&pid) {
             return Err(invalid());
+        }
+        if row["code"] == "process_exited" {
+            // Mirror `decode_sockets`: the native observer emits exactly these
+            // three fields for a confirmed exit. Contradictory payloads are
+            // rejected instead of accepted as exit evidence.
+            if row["state"] != "unknown"
+                || !row.as_object().is_some_and(|v| {
+                    v.len() == 3
+                        && v.contains_key("pid")
+                        && v.contains_key("state")
+                        && v.contains_key("code")
+                })
+            {
+                return Err(invalid());
+            }
+            confirmed_exited.insert(pid);
+            continue;
         }
         if row["state"] != "ok" {
             continue;
@@ -261,7 +284,20 @@ pub fn decode_arguments(
             },
         );
     }
-    Ok(result)
+    Ok(ArgumentsResult {
+        arguments: result,
+        confirmed_exited,
+    })
+}
+
+pub fn decode_arguments(
+    value: &Value,
+    expected: &[Identity],
+    round: &str,
+    sent: f64,
+    received: f64,
+) -> Result<BTreeMap<u32, Arguments>> {
+    decode_arguments_result(value, expected, round, sent, received).map(|res| res.arguments)
 }
 pub fn decode_sockets(
     value: &Value,
@@ -447,14 +483,20 @@ impl<R: ReadRunner> Observer<'_, R> {
         decode_inventory(&v, s, r)
     }
     pub fn arguments(&self, targets: &[Identity], round: &str) -> Result<BTreeMap<u32, Arguments>> {
+        self.arguments_result(targets, round).map(|res| res.arguments)
+    }
+    pub fn arguments_result(&self, targets: &[Identity], round: &str) -> Result<ArgumentsResult> {
         if targets.is_empty() {
-            return Ok(BTreeMap::new());
+            return Ok(ArgumentsResult {
+                arguments: BTreeMap::new(),
+                confirmed_exited: BTreeSet::new(),
+            });
         }
         let (v, s, r) = self.call(
             ObserverAction::Arguments,
             json!({"schema":1,"round_id":round,"targets":targets}),
         )?;
-        decode_arguments(&v, targets, round, s, r)
+        decode_arguments_result(&v, targets, round, s, r)
     }
     pub fn sockets(&self, targets: &[Identity], round: &str) -> Result<SocketResult> {
         let (v, s, r) = self.call(

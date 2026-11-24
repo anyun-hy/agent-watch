@@ -1589,6 +1589,7 @@ impl SandboxLaunchRegistry {
             )
             .with_audit_token(kernel_id.audit_token);
 
+            let mut promoted_main = false;
             if inst.state == ManagedInstanceState::SandboxApplied {
                 if !Self::initial_script_exec_matches(&guard, &inst, &kernel_id) {
                     Self::invalidate_instance(&mut guard, &inst_id, "script_interpreter_loaded_identity_mismatch");
@@ -1598,6 +1599,7 @@ impl SandboxLaunchRegistry {
                 inst.verified_executable = Some(canon_exec);
                 inst.state = ManagedInstanceState::ExecVerified;
                 inst.updated_at = now;
+                promoted_main = true;
             } else if inst.state == ManagedInstanceState::ExecVerified {
                 if inst.exec_identity.as_ref() != Some(&verified_token) {
                     Self::invalidate_instance(&mut guard, &inst_id, "exec_audit_token_changed");
@@ -1613,6 +1615,9 @@ impl SandboxLaunchRegistry {
 
             let family = inst.family.clone();
             guard.instances.insert(inst_id.clone(), inst);
+            if promoted_main {
+                guard.changes.publish();
+            }
             drop(guard);
             self.persist_instances();
             Some((family, verified_token))
