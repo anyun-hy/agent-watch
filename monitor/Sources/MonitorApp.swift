@@ -4,6 +4,7 @@ import UserNotifications
 
 struct MonitorView: View {
     @ObservedObject var store: MonitorStore
+    @ObservedObject private var switcher: SwitcherStore
     let startMonitoring: Bool
     let restoresNavigation: Bool
     let refreshAction: (() -> Void)?
@@ -12,12 +13,20 @@ struct MonitorView: View {
     @FocusState private var focusedPage: Page?
     @State private var sidebarVisibility: NavigationSplitViewVisibility = .all
     @State private var showProxyDetails = false
+    @State private var confirmUpdateInstall = false
 
     init(store: MonitorStore, startMonitoring: Bool = true, restoresNavigation: Bool = true, refreshAction: (() -> Void)? = nil) {
         self.store = store
+        self.switcher = store.switcher
         self.startMonitoring = startMonitoring
         self.restoresNavigation = restoresNavigation
         self.refreshAction = refreshAction
+    }
+
+    private var appVersionLabel: String {
+        let info = Bundle.main.infoDictionary
+        let short = (info?["CFBundleShortVersionString"] as? String) ?? ""
+        return short.isEmpty ? "" : "v\(short)"
     }
 
     private var p: Palette { Palette(dark: dark) }
@@ -68,6 +77,31 @@ struct MonitorView: View {
                         }
                         .buttonStyle(.borderedProminent)
                         .disabled(store.syncingRuntime)
+                    }
+                    .padding(12)
+                    .background(p.blue.opacity(0.08), in: RoundedRectangle(cornerRadius: 9))
+                    .overlay(RoundedRectangle(cornerRadius: 9).stroke(p.blue.opacity(0.25), lineWidth: 1))
+                    .padding(.horizontal, 20).padding(.bottom, 12)
+                }
+                if let available = switcher.updateStatus, available.isAvailable, !switcher.updateRecoveryRequired {
+                    HStack(alignment: .center, spacing: 12) {
+                        Image(systemName: "arrow.down.circle.fill")
+                            .font(.system(size: 16, weight: .medium))
+                            .foregroundStyle(p.blue)
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text("发现新版本 \(available.versionLabel)")
+                                .font(WatchTypography.bodyStrong).foregroundStyle(p.text)
+                            Text(available.message ?? "已完成签名校验，可原地升级并保留全部配置、账号与初始化状态（无需重新初始化）。")
+                                .font(WatchTypography.caption)
+                                .foregroundStyle(p.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                        Spacer(minLength: 8)
+                        Button("下载并安装更新…") {
+                            confirmUpdateInstall = true
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(switcher.busy || switcher.hasUnsavedSettings || switcher.isFixture)
                     }
                     .padding(12)
                     .background(p.blue.opacity(0.08), in: RoundedRectangle(cornerRadius: 9))
@@ -136,6 +170,18 @@ struct MonitorView: View {
             Task { await store.refreshNotificationAccess() }
         }
         .onChange(of: store.page) { _, page in if restoresNavigation { savedPage = page.rawValue } }
+        .confirmationDialog(
+            "下载并安装更新 \(switcher.updateStatus?.versionLabel ?? "")",
+            isPresented: $confirmUpdateInstall,
+            titleVisibility: .visible
+        ) {
+            Button("下载并安装更新") {
+                Task { await store.installAvailableUpdate() }
+            }
+            Button("取消", role: .cancel) {}
+        } message: {
+            Text("将从已验签发布源下载完整更新并保留全部配置、账号与初始化状态（无需重新初始化）。替换期间将短暂关闭监控窗口，如核心网关组件变动将请求一次管理员授权，完成后自动重开新版。")
+        }
     }
 
     private func taskPage(_ section: SwitcherSection) -> some View {
@@ -212,12 +258,48 @@ struct MonitorView: View {
                 focusedPage = pages[next]
                 store.page = pages[next]
             }
-            VStack(alignment: .leading, spacing: 12) {
+            VStack(alignment: .leading, spacing: 10) {
                 Divider()
                 HStack(spacing: 7) {
                     Circle().fill(store.live ? p.mint : p.amber).frame(width: 6, height: 6)
                     Text(store.live ? (store.automatic ? "采集后台心跳正常" : "上次后台心跳正常") : store.snapshot == nil ? "等待后台心跳" : "后台心跳待核对")
                         .font(WatchTypography.caption).foregroundStyle(p.secondary)
+                }
+                HStack(spacing: 6) {
+                    if !appVersionLabel.isEmpty {
+                        Text(appVersionLabel)
+                            .font(WatchTypography.small)
+                            .foregroundStyle(p.secondary)
+                            .lineLimit(1)
+                    }
+                    Spacer(minLength: 4)
+                    Button {
+                        Task { await store.checkForUpdates() }
+                    } label: {
+                        HStack(spacing: 4) {
+                            if store.checkingForUpdate {
+                                ProgressView().controlSize(.mini)
+                            } else {
+                                Image(systemName: switcher.updateStatus?.isAvailable == true
+                                    ? "arrow.down.circle.fill" : "arrow.triangle.2.circlepath")
+                                    .font(.system(size: 11, weight: .medium))
+                            }
+                            Text(store.checkingForUpdate ? "检查中…"
+                                 : switcher.updateStatus?.isAvailable == true ? "有新版本" : "检查更新")
+                                .font(WatchTypography.small)
+                        }
+                        .foregroundStyle(switcher.updateStatus?.isAvailable == true ? p.blue : p.text)
+                    }
+                    .buttonStyle(.borderless)
+                    .disabled(store.checkingForUpdate || switcher.busy || switcher.hasUnsavedSettings || switcher.isFixture)
+                    .help("从已验签发布源检查 Agent Watch 新版本")
+                }
+                if let note = store.updateCheckNote, switcher.updateStatus?.isAvailable != true {
+                    Text(note)
+                        .font(WatchTypography.small)
+                        .foregroundStyle(store.updateCheckFailed ? p.amber : p.secondary)
+                        .lineLimit(2)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
                 HStack {
                     Text(dark ? "深色外观" : "浅色外观").font(WatchTypography.caption).foregroundStyle(p.secondary)
@@ -611,6 +693,12 @@ struct ClaudeWatchApp: App {
             .windowStyle(.titleBar)
             .windowToolbarStyle(.unifiedCompact)
             .commands {
+                CommandGroup(after: .appInfo) {
+                    Button("检查更新…") {
+                        Task { await store.checkForUpdates() }
+                    }
+                    .disabled(!initialization.entered || store.checkingForUpdate || store.switcher.busy || store.switcher.hasUnsavedSettings)
+                }
                 CommandGroup(replacing: .newItem) {}
                 CommandMenu("页面") {
                     ForEach(Array(Page.orderedPages.enumerated()), id: \.element) { index, page in

@@ -39,6 +39,9 @@ final class MonitorStore: ObservableObject {
     @Published private(set) var runtimeVersionMismatch: RuntimeVersionMismatch?
     @Published private(set) var syncingRuntime = false
     @Published private(set) var runtimeSyncError: String?
+    @Published private(set) var checkingForUpdate = false
+    @Published private(set) var updateCheckNote: String?
+    @Published private(set) var updateCheckFailed = false
     private var referenceQueryRunning = false
     private var referenceQueriesEnabled = false
     private var started = false
@@ -219,6 +222,31 @@ final class MonitorStore: ObservableObject {
             await switcher.refreshBackground(maximumAge: 0)
         } catch {
             runtimeSyncError = error.localizedDescription
+        }
+    }
+    func checkForUpdates() async {
+        guard !switcher.isFixture, !checkingForUpdate else { return }
+        checkingForUpdate = true
+        updateCheckNote = nil
+        updateCheckFailed = false
+        defer { checkingForUpdate = false }
+        await switcher.perform(["update"], refresh: false)
+        if switcher.failure {
+            updateCheckFailed = true
+            updateCheckNote = switcher.message.isEmpty ? "检查更新失败，请稍后重试。" : switcher.message
+        } else if let available = switcher.updateStatus, available.isAvailable {
+            updateCheckNote = "发现新版本 \(available.versionLabel)"
+        } else {
+            updateCheckNote = switcher.message.isEmpty ? "当前已是最新版本。" : switcher.message
+        }
+    }
+    func installAvailableUpdate() async {
+        guard !switcher.isFixture else { return }
+        updateCheckFailed = false
+        await switcher.perform(["update", "--apply", "--detach", "--relaunch"], refresh: false)
+        if switcher.failure {
+            updateCheckFailed = true
+            updateCheckNote = switcher.message.isEmpty ? "下载或安装更新未完成，请重试。" : switcher.message
         }
     }
     private func readNotificationAccess(_ reader: () async -> WatchNotificationAccess) async {
