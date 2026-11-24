@@ -62,7 +62,9 @@ private struct LeakInspectorPage: View {
                 Label(error, systemImage: "exclamationmark.triangle").font(WatchTypography.caption).foregroundStyle(p.amber)
             }
             if showingPreviousSuccessfulResult, let previous = result {
-                Label("本轮查询" + (latestResult.map { "（" + probeTime($0.finishedAt) + "）" } ?? "") + "未完成。下方显示上次有效样本（" + probeTime(previous.finishedAt) + "），启动预检采用本轮结果。", systemImage: "clock.arrow.circlepath")
+                let latestSuffix = latestResult.map { "（\(probeTime($0.finishedAt))）" } ?? ""
+                let previousTime = probeTime(previous.finishedAt)
+                Label("本轮查询\(latestSuffix)未完成。下方显示上次有效样本（\(previousTime)），启动预检采用本轮结果。", systemImage: "clock.arrow.circlepath")
                     .font(.callout).foregroundStyle(p.amber).fixedSize(horizontal: false, vertical: true)
             }
             if latestResult?.contextChanged == true {
