@@ -148,16 +148,16 @@ jobs:
           PRERELEASE: ${{ inputs.prerelease || false }}
         run: |
           set -euo pipefail
-          FLAGS=()
-          if [[ "$PRERELEASE" == "true" ]]; then
-            FLAGS+=(--prerelease)
-          fi
           NOTES="Claude Watch v${APP_VERSION} (Build ${BUILD_NUMBER}, macOS arm64 Seatbelt)."
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release upload "$TAG" release-assets/* --clobber
-          else
+          elif [[ "$PRERELEASE" == "true" ]]; then
             gh release create "$TAG" release-assets/* \
               --title "Claude Watch v${APP_VERSION} (Build ${BUILD_NUMBER})" \
               --notes "$NOTES" \
-              "${FLAGS[@]}"
+              --prerelease
+          else
+            gh release create "$TAG" release-assets/* \
+              --title "Claude Watch v${APP_VERSION} (Build ${BUILD_NUMBER})" \
+              --notes "$NOTES"
           fi
