@@ -245,7 +245,7 @@ struct FirstRunView: View {
                     showingApproval = nil
                 }.frame(minHeight: 44)
                 Spacer()
-                Button(request.action == .accessibility ? "打开系统设置…" : "确认并应用") {
+                Button(request.action == .accessibility ? "打开系统设置…" : request.action == .runtimeInstall ? "确认并安装" : "确认并应用") {
                     showingApproval = nil
                     Task { await initialization.authorize(request) }
                 }.buttonStyle(.borderedProminent).tint(p.mint).frame(minHeight: 44)

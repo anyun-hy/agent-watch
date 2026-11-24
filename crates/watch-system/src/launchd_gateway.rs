@@ -22,6 +22,11 @@ pub const CONTROL_PATH: &str = "/Library/PrivilegedHelperTools/io.local.claudewa
 const OWNER_PATH: &str = "/Library/PrivilegedHelperTools/io.local.claudewatch.gateway/owner.json";
 pub const SERVICE_LABEL: &str = "io.local.claudewatch.gateway";
 const WIRE_MAGIC: &[u8; 8] = b"CWGW0001";
+const COMMIT_MAGIC: &[u8; 8] = b"CWGWCMT1";
+const ADMIN_MAGIC: &[u8; 8] = b"CWGWADM1";
+const REPLY_OK: &[u8; 3] = b"OK\n";
+const REPLY_ERR: &[u8; 3] = b"ER\n";
+const MAX_ADMIN_PAYLOAD: usize = 1024;
 const MAX_CONFIG_BYTES: u64 = 16 * 1024;
 #[cfg(target_os = "macos")]
 pub(crate) use platform::verify_code as verify_hardened_peer_code;
@@ -207,6 +212,136 @@ fn acquire_gateway_listener_at(config: &GatewayInstallConfig, broker_path: &str,
 /// signature, configuration, or descriptor validation failures.
 pub fn acquire_gateway_listener_for_install() -> io::Result<VerifiedGatewayListener> {
     wait_for_control_startup(Duration::from_secs(5), acquire_gateway_listener)
+}
+
+fn is_valid_tx_id(id: &str) -> bool {
+    id.len() == 32 && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+fn is_valid_admin_zone(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value.contains('/')
+        && !value.starts_with('/')
+        && !value.ends_with('/')
+        && !value.contains("..")
+        && value.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'_' | b'-' | b'+'))
+}
+
+fn is_valid_admin_service(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && !value.starts_with('-')
+        && !value.contains(['\0', '\n', '\r', ';', '&', '|', '$', '`', '<', '>', '\\'])
+        && value.chars().all(|c| !c.is_control())
+}
+
+/// Strictly validates the fixed allowlist of administrative actions that the
+/// kernel-authenticated root broker may execute via the pinned admin helper.
+/// Arbitrary shell commands and destructive uninstall are rejected unconditionally.
+pub fn validate_gateway_admin_args(args: &[String]) -> io::Result<()> {
+    let valid = match args.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
+        ["timezone", z] => is_valid_admin_zone(z),
+        ["ipv6", svc, mode] => is_valid_admin_service(svc) && matches!(*mode, "off" | "automatic"),
+        ["flush-dns"] => true,
+        ["watchdog", "off"] => true,
+        ["watchdog", z] => is_valid_admin_zone(z),
+        ["status"] => true,
+        ["legacy-stop"] => true,
+        _ => false,
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(invalid("gateway admin action rejected by allowlist"))
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn connect_authenticated_broker(
+    read_timeout: Duration,
+) -> io::Result<(UnixStream, GatewayInstallConfig, GatewayBrokerIdentity)> {
+    let config = load_gateway_install_config()?;
+    config.validate()?;
+    if crate::effective_uid() != config.engine_uid {
+        return Err(denied("engine UID is not approved"));
+    }
+    at_stage("gateway_broker_path", || verify_protected_path(Path::new(BROKER_PATH), false))?;
+    at_stage("gateway_broker_digest", || {
+        if crate::sha256_file_hex(Path::new(BROKER_PATH)).as_deref() != Some(&config.broker_sha256) {
+            return Err(denied("installed broker digest does not match protected configuration"));
+        }
+        Ok(())
+    })?;
+    at_stage("gateway_control_path", || verify_protected_path(Path::new(CONTROL_PATH), true))?;
+    let stream = at_stage("gateway_control_connect", || {
+        connect_control_socket(Path::new(CONTROL_PATH), Duration::from_secs(1))
+    })?;
+    stream.set_read_timeout(Some(read_timeout))?;
+    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+    let broker = at_stage("gateway_broker_identity", || {
+        platform::verify_broker_peer(&stream, BROKER_PATH, &config.broker_sha256, &config.broker_cdhash)
+    })?;
+    if broker.ppid != 1 {
+        return Err(denied("broker is not owned by system launchd"));
+    }
+    Ok((stream, config, broker))
+}
+
+/// Commits an active gateway installation transaction over the kernel-authenticated
+/// root control socket, avoiding a second interactive administrator prompt.
+pub fn commit_gateway_transaction(transaction_id: &str) -> io::Result<()> {
+    if !is_valid_tx_id(transaction_id) {
+        return Err(invalid("invalid gateway transaction id"));
+    }
+    #[cfg(not(target_os = "macos"))]
+    return Err(io::Error::new(io::ErrorKind::Unsupported, "launchd gateway requires macOS"));
+    #[cfg(target_os = "macos")]
+    {
+        let (mut stream, config, broker) = connect_authenticated_broker(Duration::from_secs(15))?;
+        stream.write_all(COMMIT_MAGIC)?;
+        stream.write_all(transaction_id.as_bytes())?;
+        let mut reply = [0u8; 3];
+        stream.read_exact(&mut reply)?;
+        let after = platform::verify_broker_peer(&stream, BROKER_PATH, &config.broker_sha256, &config.broker_cdhash)?;
+        if after != broker {
+            return Err(denied("broker identity changed during transaction commit"));
+        }
+        if &reply != REPLY_OK {
+            return Err(io::Error::other("gateway broker rejected transaction commit"));
+        }
+        Ok(())
+    }
+}
+
+/// Executes an allowlisted administrative action through the already-authorized,
+/// kernel-authenticated root gateway broker so routine environment changes never
+/// repeatedly prompt the user for an administrator password.
+pub fn run_gateway_admin_action(args: &[String]) -> io::Result<()> {
+    validate_gateway_admin_args(args)?;
+    let payload = serde_json::to_vec(args).map_err(|_| invalid("admin action encode failed"))?;
+    if payload.len() > MAX_ADMIN_PAYLOAD {
+        return Err(invalid("admin action payload exceeds limit"));
+    }
+    #[cfg(not(target_os = "macos"))]
+    return Err(io::Error::new(io::ErrorKind::Unsupported, "launchd gateway requires macOS"));
+    #[cfg(target_os = "macos")]
+    {
+        let (mut stream, config, broker) = connect_authenticated_broker(Duration::from_secs(120))?;
+        stream.write_all(ADMIN_MAGIC)?;
+        stream.write_all(&(payload.len() as u32).to_be_bytes())?;
+        stream.write_all(&payload)?;
+        let mut reply = [0u8; 3];
+        stream.read_exact(&mut reply)?;
+        let after = platform::verify_broker_peer(&stream, BROKER_PATH, &config.broker_sha256, &config.broker_cdhash)?;
+        if after != broker {
+            return Err(denied("broker identity changed during admin action"));
+        }
+        if &reply != REPLY_OK {
+            return Err(io::Error::other("gateway broker admin action failed"));
+        }
+        Ok(())
+    }
 }
 fn wait_for_control_startup<T>(timeout: Duration, mut acquire: impl FnMut() -> io::Result<T>) -> io::Result<T> {
     let deadline = std::time::Instant::now() + timeout;
@@ -447,13 +582,37 @@ pub struct GatewayBrokerEvent {
     pub reason: &'static str,
 }
 
+pub struct GatewayControlHandlers<'a> {
+    pub on_commit: Option<&'a (dyn Fn(&str, &GatewayInstallConfig) -> io::Result<()> + Sync)>,
+    pub on_admin: Option<&'a (dyn Fn(&[String]) -> io::Result<()> + Sync)>,
+}
+
+impl Default for GatewayControlHandlers<'_> {
+    fn default() -> Self {
+        Self {
+            on_commit: None,
+            on_admin: None,
+        }
+    }
+}
+
 pub fn run_gateway_broker() -> io::Result<()> {
     run_gateway_broker_with_events(&|_| {})
 }
 
 pub fn run_gateway_broker_with_events(events: &dyn Fn(GatewayBrokerEvent)) -> io::Result<()> {
+    run_gateway_broker_with_handlers(events, &GatewayControlHandlers::default())
+}
+
+pub fn run_gateway_broker_with_handlers(
+    events: &dyn Fn(GatewayBrokerEvent),
+    handlers: &GatewayControlHandlers<'_>,
+) -> io::Result<()> {
     #[cfg(not(target_os = "macos"))]
-    return Err(io::Error::new(io::ErrorKind::Unsupported, "launchd gateway requires macOS"));
+    {
+        let _ = (events, handlers);
+        return Err(io::Error::new(io::ErrorKind::Unsupported, "launchd gateway requires macOS"));
+    }
     #[cfg(target_os = "macos")]
     {
         at_stage("gateway_launchd_identity", || {
@@ -477,29 +636,108 @@ pub fn run_gateway_broker_with_events(events: &dyn Fn(GatewayBrokerEvent)) -> io
         events(GatewayBrokerEvent { operation: "listener_activation", result: "verified", reason: "protected_listeners_verified" });
         for connection in control.incoming() {
             let mut stream = connection?;
+            let mut operation = "listener_handoff";
+            let mut success_reason = "descriptors_transferred";
             let mut failure_reason = "peer_identity_rejected";
             let result = (|| {
                 stream.set_read_timeout(Some(Duration::from_secs(3)))?;
                 stream.set_write_timeout(Some(Duration::from_secs(3)))?;
                 let peer = platform::verify_peer(&stream, config.engine_uid, &config.engine_executable, &config.engine_sha256, &config.engine_cdhash)?;
                 failure_reason = "handoff_protocol_rejected";
-                let mut request = [0; 8]; stream.read_exact(&mut request)?;
-                if request != *WIRE_MAGIC { return Err(invalid("unsupported gateway handoff protocol")); }
-                failure_reason = "peer_identity_changed";
-                let after = platform::verify_peer(&stream, config.engine_uid, &config.engine_executable, &config.engine_sha256, &config.engine_cdhash)?;
-                if after != peer { return Err(denied("engine identity changed during handoff")); }
-                failure_reason = "listener_owner_unconfirmed";
-                claim_owner(&peer)?;
-                failure_reason = "descriptor_transfer_failed";
-                send_listeners(&stream, &[&listener, &ipv6])?;
-                let mut done = [0];
-                let _ = stream.read(&mut done);
-                Ok(())
+                let mut request = [0; 8];
+                stream.read_exact(&mut request)?;
+                if request == *WIRE_MAGIC {
+                    failure_reason = "peer_identity_changed";
+                    let after = platform::verify_peer(&stream, config.engine_uid, &config.engine_executable, &config.engine_sha256, &config.engine_cdhash)?;
+                    if after != peer { return Err(denied("engine identity changed during handoff")); }
+                    failure_reason = "listener_owner_unconfirmed";
+                    claim_owner(&peer)?;
+                    failure_reason = "descriptor_transfer_failed";
+                    send_listeners(&stream, &[&listener, &ipv6])?;
+                    let mut done = [0];
+                    let _ = stream.read(&mut done);
+                    return Ok(());
+                }
+                if request == *COMMIT_MAGIC {
+                    operation = "transaction_commit";
+                    success_reason = "transaction_committed";
+                    failure_reason = "commit_payload_invalid";
+                    let mut raw_id = [0u8; 32];
+                    stream.read_exact(&mut raw_id)?;
+                    let tx_id = std::str::from_utf8(&raw_id).map_err(|_| invalid("invalid tx utf8"))?;
+                    if !is_valid_tx_id(tx_id) {
+                        let _ = stream.write_all(REPLY_ERR);
+                        return Err(invalid("invalid gateway tx id"));
+                    }
+                    failure_reason = "peer_identity_changed";
+                    let after = platform::verify_peer(&stream, config.engine_uid, &config.engine_executable, &config.engine_sha256, &config.engine_cdhash)?;
+                    if after != peer {
+                        let _ = stream.write_all(REPLY_ERR);
+                        return Err(denied("engine identity changed during commit"));
+                    }
+                    failure_reason = "commit_failed";
+                    let Some(handler) = handlers.on_commit else {
+                        let _ = stream.write_all(REPLY_ERR);
+                        return Err(denied("commit handler unavailable"));
+                    };
+                    match handler(tx_id, &config) {
+                        Ok(()) => {
+                            let _ = stream.write_all(REPLY_OK);
+                            return Ok(());
+                        }
+                        Err(error) => {
+                            let _ = stream.write_all(REPLY_ERR);
+                            return Err(error);
+                        }
+                    }
+                }
+                if request == *ADMIN_MAGIC {
+                    operation = "admin_action";
+                    success_reason = "admin_action_completed";
+                    failure_reason = "admin_payload_invalid";
+                    let mut len_bytes = [0u8; 4];
+                    stream.read_exact(&mut len_bytes)?;
+                    let len = u32::from_be_bytes(len_bytes) as usize;
+                    if len == 0 || len > MAX_ADMIN_PAYLOAD {
+                        let _ = stream.write_all(REPLY_ERR);
+                        return Err(invalid("admin payload out of bounds"));
+                    }
+                    let mut buf = vec![0u8; len];
+                    stream.read_exact(&mut buf)?;
+                    let args: Vec<String> = serde_json::from_slice(&buf).map_err(|_| invalid("invalid admin json"))?;
+                    if validate_gateway_admin_args(&args).is_err() {
+                        let _ = stream.write_all(REPLY_ERR);
+                        return Err(invalid("admin action rejected by allowlist"));
+                    }
+                    failure_reason = "peer_identity_changed";
+                    let after = platform::verify_peer(&stream, config.engine_uid, &config.engine_executable, &config.engine_sha256, &config.engine_cdhash)?;
+                    if after != peer {
+                        let _ = stream.write_all(REPLY_ERR);
+                        return Err(denied("engine identity changed during admin action"));
+                    }
+                    failure_reason = "admin_action_failed";
+                    let Some(handler) = handlers.on_admin else {
+                        let _ = stream.write_all(REPLY_ERR);
+                        return Err(denied("admin handler unavailable"));
+                    };
+                    stream.set_write_timeout(Some(Duration::from_secs(120)))?;
+                    match handler(&args) {
+                        Ok(()) => {
+                            let _ = stream.write_all(REPLY_OK);
+                            return Ok(());
+                        }
+                        Err(error) => {
+                            let _ = stream.write_all(REPLY_ERR);
+                            return Err(error);
+                        }
+                    }
+                }
+                Err(invalid("unsupported gateway handoff protocol"))
             })();
             // Never log credentials, request bytes, or raw process metadata.
             events(match result {
-                Ok(()) => GatewayBrokerEvent { operation: "listener_handoff", result: "completed", reason: "descriptors_transferred" },
-                Err(_) => GatewayBrokerEvent { operation: "listener_handoff", result: "rejected", reason: failure_reason },
+                Ok(()) => GatewayBrokerEvent { operation, result: "completed", reason: success_reason },
+                Err(_) => GatewayBrokerEvent { operation, result: "rejected", reason: failure_reason },
             });
         }
         Ok(())
@@ -1047,6 +1285,38 @@ mod tests {
         let (accepted, _) = listener.accept().unwrap();
         drop(client); drop(accepted); drop(listener);
     }
+    #[test]
+    fn gateway_admin_allowlist_accepts_fixed_verbs_and_rejects_injection_or_uninstall() {
+        for ok in [
+            vec!["timezone".into(), "Asia/Tokyo".into()],
+            vec!["ipv6".into(), "Wi-Fi".into(), "off".into()],
+            vec!["ipv6".into(), "USB 10/100/1000 LAN".into(), "automatic".into()],
+            vec!["flush-dns".into()],
+            vec!["watchdog".into(), "America/Los_Angeles".into()],
+            vec!["watchdog".into(), "off".into()],
+            vec!["status".into()],
+            vec!["legacy-stop".into()],
+        ] {
+            validate_gateway_admin_args(&ok).unwrap_or_else(|e| panic!("expected ok for {ok:?}: {e}"));
+        }
+        for bad in [
+            vec![],
+            vec!["uninstall".into()],
+            vec!["timezone".into(), "../etc/passwd".into()],
+            vec!["timezone".into(), "Asia/Tokyo;whoami".into()],
+            vec!["ipv6".into(), "Wi-Fi;$(id)".into(), "off".into()],
+            vec!["ipv6".into(), "-bad".into(), "off".into()],
+            vec!["ipv6".into(), "Wi-Fi".into(), "manual".into()],
+            vec!["flush-dns".into(), "extra".into()],
+            vec!["sh".into(), "-c".into(), "id".into()],
+        ] {
+            assert!(validate_gateway_admin_args(&bad).is_err(), "expected rejection for {bad:?}");
+        }
+        assert!(is_valid_tx_id(&"a".repeat(32)));
+        assert!(!is_valid_tx_id(&"A".repeat(32)));
+        assert!(!is_valid_tx_id("short"));
+    }
+
     #[test]
     fn gateway_descriptor_rejects_wrong_endpoint_and_missing_rights() {
         let listener = TcpListener::bind("0.0.0.0:0").unwrap();

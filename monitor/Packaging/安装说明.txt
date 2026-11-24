@@ -8,24 +8,17 @@ Agent Watch {{PRODUCT_VERSION}} / build {{BUILD_NUMBER}}
 - 运行引擎：内置原生 Rust 引擎（v{{BACKEND_VERSION}}）与 Seatbelt 隔离网关，无需预装 Python
 - 签名说明：本安装包采用本机临时签名（ad-hoc），未经过 Apple Developer ID 公证
 
-安装与升级
-----------
-1. 推荐双击运行本磁盘映像中的「安装或更新后台.command」：
-   - 会先核验应用签名、架构和组件完整性，再统一安装 `/Applications/Agent Watch.app` 与后台服务；
-   - 旧应用移入废纸篓，自动保留已有账号 A/B 存档、日志与保护配置；
+安装与首次使用（纯拖拽，无需命令行）
+------------------------------------
+1. 打开本磁盘映像，直接将「Agent Watch.app」拖入旁边的「Applications（应用程序）」文件夹。
+2. 从「应用程序」中双击打开 Agent Watch：
+   - 若首次打开遇到系统未公证拦截，请在「系统设置 › 隐私与安全性」中点击允许，或右键应用选择「打开」。
+   - 首次初始化向导会自动引导完成辅助功能授权，并在第 3 步通过图形界面一次性安装后台采集任务与本地 Seatbelt 网关（全程只需输入一次管理员密码，后续改时区/关 IPv6/日常使用均不再反复弹窗）。
    - 不会擅自启动 Claude / ChatGPT / Codex，也不会修改 TAG 或其他代理软件配置。
-2. 从「应用程序」打开 Agent Watch 后，首次初始化向导会自动检测本地代理、出口 IP、DNS 与 WebRTC 环境，并按需引导完成系统权限与网关授权。
-3. 后续版本无需手动下载 DMG：可直接在应用内「后台保护」页点击「检查更新 / 下载并安装更新」，通过 RSA-4096 签名校验自动完成原地升级，并保留全部账号与配置。
-
-核心功能
---------
-- 受控启动与 Seatbelt 隔离：为 Claude、ChatGPT、Codex 桌面端与 CLI 提供受控入口，经由固定环回网关出网，防止未代理直连。
-- 自动断线与泄漏保护：持续核验出口 IP 一致性、地区风险、DNS 与 WebRTC 状态及代理链完整性；异常时按策略（提醒 / 断流 / 强停）及时响应。
-- 多账号 A/B 切换：事务化归档与切换账号资料，带完整哈希校验与失败回滚，不破坏当前登录。
-- 实时连接拓扑与离线诊断：分组展示平台、MCP 与组件连接；支持一键导出自动脱敏（不含凭据、账号与原始 IP）的诊断 JSON 以便排障。
+3. 后续升级无需手动下载 DMG：可直接在应用内「后台保护」页点击「检查更新 / 下载并安装更新」，通过 RSA-4096 签名校验自动完成原地升级，保留全部账号与配置。
 
 卸载方法
 --------
-- 双击运行本磁盘映像中的「卸载应用.command」，或执行：
-  `/Applications/Agent Watch.app/Contents/Resources/watch-engine app-uninstall --apply`
+- 双击运行本磁盘映像中的「卸载应用.command」，或在终端执行：
+  "/Applications/Agent Watch.app/Contents/Resources/watch-engine" app-uninstall --apply
 - 卸载仅移除 Agent Watch 应用与自有后台任务并清理其辅助功能授权；原生 Claude / ChatGPT / Codex、登录数据、TAG 配置及独立原版工具均不受影响。

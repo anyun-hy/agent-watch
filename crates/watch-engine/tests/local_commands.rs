@@ -215,16 +215,61 @@ fn native_mutation_commands_require_apply_before_sampling_or_writing() {
 #[test]
 fn updater_without_a_pinned_source_never_downloads_or_creates_runtime_state() {
     let home = Home::new();
-    let (code, value) = call(&home, &["update"], None);
-    assert_eq!(code, 0);
-    assert_eq!(value["status"], "unavailable");
-    let (code, value) = call(&home, &["update", "--auto", "--apply"], None);
+    if claude_watch_core::release_source::builtin_release_source().is_some() {
+        // When an official built-in release source is embedded, a partial custom
+        // override (URL without matching public key) must still fail closed as
+        // unavailable without downloading or writing runtime state.
+        let base = home.0.join("Library/Application Support/ClaudeWatch/switcher");
+        fs::create_dir_all(&base).unwrap();
+        fs::write(
+            base.join("config.json"),
+            r#"{"update_url":"https://updates.example/manifest.json","update_public_key":""}"#,
+        )
+        .unwrap();
+        let (code, value) = call(&home, &["update"], None);
+        assert_eq!(code, 0);
+        assert_eq!(value["status"], "unavailable");
+    } else {
+        let (code, value) = call(&home, &["update"], None);
+        assert_eq!(code, 0);
+        assert_eq!(value["status"], "unavailable");
+        assert!(!home.0.join("Library").exists());
+    }
+    let clean = Home::new();
+    let (code, value) = call(&clean, &["update", "--auto", "--apply"], None);
     assert_eq!(code, 0);
     assert_eq!(value["status"], "disabled");
-    assert!(!home.0.join("Library").exists());
-    let (code, value) = call(&home, &["update", "--recover"], None);
+    assert!(!clean.0.join("Library").exists());
+    let (code, value) = call(&clean, &["update", "--recover"], None);
     assert_eq!(code, 4);
     assert_eq!(value["code"], "explicit_apply_required");
+}
+
+#[test]
+fn gateway_control_subcommands_reject_invalid_transaction_and_disallowed_admin_verbs() {
+    let direct = |args: &[&str]| -> (i32, Value) {
+        let out = Command::new(env!("CARGO_BIN_EXE_claude-watch-engine"))
+            .args(args)
+            .output()
+            .unwrap();
+        let text = if out.stdout.is_empty() { out.stderr } else { out.stdout };
+        (
+            out.status.code().unwrap_or(1),
+            serde_json::from_slice(&text).unwrap(),
+        )
+    };
+    let (code, value) = direct(&["gateway-commit-transaction"]);
+    assert_eq!(code, 2);
+    assert_eq!(value["code"], "invalid_arguments");
+    let (code, value) = direct(&["gateway-commit-transaction", "not-hex-32"]);
+    assert_eq!(code, 4);
+    assert_eq!(value["code"], "gateway_commit_failed");
+    let (code, value) = direct(&["gateway-admin", "uninstall"]);
+    assert_eq!(code, 4);
+    assert_eq!(value["code"], "gateway_admin_failed");
+    let (code, value) = direct(&["gateway-admin", "timezone", "../etc/passwd"]);
+    assert_eq!(code, 4);
+    assert_eq!(value["code"], "gateway_admin_failed");
 }
 
 #[test]

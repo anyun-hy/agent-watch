@@ -5,7 +5,7 @@ use claude_watch_core::{
     error::{CoreError, Result},
 };
 use claude_watch_runtime::{
-    app_lifecycle::{AppLifecycle, LifecyclePaths, APP_NAME},
+    app_lifecycle::{AppLifecycle, LifecycleOs, LifecyclePaths, APP_NAME},
     release_native::NativeRelease,
     storage::{Paths, StateStore},
 };
@@ -33,6 +33,66 @@ pub fn dispatch(request: &Request, paths: Paths, uid: u32) -> Result<Option<Valu
             &mut claude_watch_runtime::release_native::SystemExecutor,
         )?;
         return Ok(Some(value));
+    }
+    if request.command == "install-runtime" {
+        let installed = PathBuf::from("/Applications").join(APP_NAME);
+        if !installed.is_dir() {
+            return Err(CoreError::new(
+                "app_not_in_applications",
+                "请先将 Agent Watch.app 拖入「应用程序（/Applications）」文件夹后再打开。",
+            ));
+        }
+        let store = StateStore::new(paths.clone());
+        let mut os = NativeRelease::production(&paths.home, uid);
+        if !request.flag("apply") {
+            let identity = os.validate_bundle(&installed)?;
+            return Ok(Some(json!({
+                "status": "preview",
+                "engine": "rust",
+                "action": "install-runtime",
+                "installed": installed,
+                "version": identity.version,
+                "build": identity.build,
+                "architecture": identity.architecture,
+                "reset_accessibility": false,
+                "preserves_account_and_policy_data": true,
+                "gateway_install_requires_administrator": true,
+                "gateway_signing": "local_adhoc_no_paid_membership",
+                "gateway_verification": "actual_ipv4_ipv6_listener_handoff_before_daemon_start"
+            })));
+        }
+        let _operation = store.lock("operation", None)?;
+        let identity = os.validate_bundle(&installed)?;
+        let had_agent = os.stop_agent()?;
+        let result: Result<()> = (|| {
+            os.install_agent(&installed)?;
+            os.commit_agent_install()?;
+            Ok(())
+        })();
+        if let Err(error) = result {
+            let _ = os.stop_agent();
+            if let Err(rollback) = os.rollback_agent_install() {
+                return Err(CoreError::new(
+                    &error.code,
+                    &format!("{}；后台回滚未完成：{}", error.message, rollback.message),
+                ));
+            }
+            if had_agent {
+                let _ = os.resume_agent(&installed);
+            }
+            return Err(error);
+        }
+        return Ok(Some(json!({
+            "status": "ok",
+            "engine": "rust",
+            "action": "install-runtime",
+            "version": identity.version,
+            "build": identity.build,
+            "architecture": identity.architecture,
+            "gateway_cleanup_pending": os.gateway_cleanup_warning().is_some(),
+            "gateway_cleanup_warning": os.gateway_cleanup_warning(),
+            "message": "后台采集服务与本地 Seatbelt 网关已安装并就绪；已保留辅助功能授权、账号及配置。"
+        })));
     }
     if !matches!(request.command.as_str(), "app-install" | "app-uninstall") {
         return Ok(None);

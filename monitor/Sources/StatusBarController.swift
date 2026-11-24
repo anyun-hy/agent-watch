@@ -22,61 +22,57 @@ enum TrayIconStatus: Equatable {
 /// CoreGraphics renderer for the custom "Hex Agent Core" macOS menu bar icon
 /// (18x18 pt Retina vector: hexagonal Seatbelt boundary + four-point AI core,
 /// with an optional status indicator dot cut cleanly into the bottom-right).
+///
+/// Relies on AppKit's native `NSImage(size:flipped:drawingHandler:)` appearance
+/// resolution rather than KVO-observing `button.effectiveAppearance`, which
+/// triggers an infinite `_updateReplicants` redraw loop on multi-display macOS.
 enum StatusBarIconRenderer {
-    static func render(status: TrayIconStatus, appearance: NSAppearance?) -> NSImage {
+    static func render(status: TrayIconStatus) -> NSImage {
         let size = NSSize(width: 18, height: 18)
         let image = NSImage(size: size, flipped: true) { _ in
             let strokeColor: NSColor = (status == .idle) ? .black : .labelColor
-            let drawArtwork = {
-                let hex = NSBezierPath()
-                hex.move(to: NSPoint(x: 9.0, y: 1.8))
-                hex.line(to: NSPoint(x: 15.2, y: 5.4))
-                hex.line(to: NSPoint(x: 15.2, y: 12.6))
-                hex.line(to: NSPoint(x: 9.0, y: 16.2))
-                hex.line(to: NSPoint(x: 2.8, y: 12.6))
-                hex.line(to: NSPoint(x: 2.8, y: 5.4))
-                hex.close()
-                hex.lineWidth = 1.65
-                hex.lineJoinStyle = .round
-                hex.lineCapStyle = .round
-                strokeColor.setStroke()
-                hex.stroke()
+            let hex = NSBezierPath()
+            hex.move(to: NSPoint(x: 9.0, y: 1.8))
+            hex.line(to: NSPoint(x: 15.2, y: 5.4))
+            hex.line(to: NSPoint(x: 15.2, y: 12.6))
+            hex.line(to: NSPoint(x: 9.0, y: 16.2))
+            hex.line(to: NSPoint(x: 2.8, y: 12.6))
+            hex.line(to: NSPoint(x: 2.8, y: 5.4))
+            hex.close()
+            hex.lineWidth = 1.65
+            hex.lineJoinStyle = .round
+            hex.lineCapStyle = .round
+            strokeColor.setStroke()
+            hex.stroke()
 
-                let star = NSBezierPath()
-                star.move(to: NSPoint(x: 9.0, y: 5.3))
-                star.line(to: NSPoint(x: 10.0, y: 8.0))
-                star.line(to: NSPoint(x: 12.7, y: 9.0))
-                star.line(to: NSPoint(x: 10.0, y: 10.0))
-                star.line(to: NSPoint(x: 9.0, y: 12.7))
-                star.line(to: NSPoint(x: 8.0, y: 10.0))
-                star.line(to: NSPoint(x: 5.3, y: 9.0))
-                star.line(to: NSPoint(x: 8.0, y: 8.0))
-                star.close()
-                strokeColor.setFill()
-                star.fill()
+            let star = NSBezierPath()
+            star.move(to: NSPoint(x: 9.0, y: 5.3))
+            star.line(to: NSPoint(x: 10.0, y: 8.0))
+            star.line(to: NSPoint(x: 12.7, y: 9.0))
+            star.line(to: NSPoint(x: 10.0, y: 10.0))
+            star.line(to: NSPoint(x: 9.0, y: 12.7))
+            star.line(to: NSPoint(x: 8.0, y: 10.0))
+            star.line(to: NSPoint(x: 5.3, y: 9.0))
+            star.line(to: NSPoint(x: 8.0, y: 8.0))
+            star.close()
+            strokeColor.setFill()
+            star.fill()
 
-                if let dot = status.dotColor, let ctx = NSGraphicsContext.current?.cgContext {
-                    // Punch a crisp transparent halo so the status dot never muddies
-                    // against the hexagon corner on either light or dark menu bars.
-                    ctx.saveGState()
-                    ctx.setBlendMode(.clear)
-                    ctx.fillEllipse(in: CGRect(x: 11.7, y: 11.7, width: 6.2, height: 6.2))
-                    ctx.restoreGState()
+            if let dot = status.dotColor, let ctx = NSGraphicsContext.current?.cgContext {
+                // Punch a crisp transparent halo so the status dot never muddies
+                // against the hexagon corner on either light or dark menu bars.
+                ctx.saveGState()
+                ctx.setBlendMode(.clear)
+                ctx.fillEllipse(in: CGRect(x: 11.7, y: 11.7, width: 6.2, height: 6.2))
+                ctx.restoreGState()
 
-                    dot.setFill()
-                    NSBezierPath(ovalIn: NSRect(x: 12.6, y: 12.6, width: 4.4, height: 4.4)).fill()
-                }
-            }
-
-            if let appearance {
-                appearance.performAsCurrentDrawingAppearance(drawArtwork)
-            } else {
-                drawArtwork()
+                dot.setFill()
+                NSBezierPath(ovalIn: NSRect(x: 12.6, y: 12.6, width: 4.4, height: 4.4)).fill()
             }
             return true
         }
         // Monochrome standby uses native macOS template tinting; colored badges
-        // render explicitly against the status button's live appearance.
+        // resolve `NSColor.labelColor` per-display inside `drawingHandler`.
         image.isTemplate = (status == .idle)
         image.accessibilityDescription = "Agent Watch"
         return image
@@ -94,7 +90,6 @@ final class StatusBarController: NSObject, NSWindowDelegate {
     private weak var store: MonitorStore?
     private weak var initialization: FirstRunInitialization?
     private var subscriptions = Set<AnyCancellable>()
-    private var appearanceObservation: NSKeyValueObservation?
     private var currentIconStatus: TrayIconStatus = .idle
 
     override init() {
@@ -103,16 +98,11 @@ final class StatusBarController: NSObject, NSWindowDelegate {
         popover.behavior = .transient
         popover.animates = true
         if let button = item.button {
-            button.image = StatusBarIconRenderer.render(status: .idle, appearance: button.effectiveAppearance)
+            button.image = StatusBarIconRenderer.render(status: .idle)
             button.toolTip = "Agent Watch · 正在读取后台状态（左键详情卡片，右键菜单）"
             button.target = self
             button.action = #selector(statusItemClicked)
             button.sendAction(on: [.leftMouseUp, .rightMouseUp])
-            appearanceObservation = button.observe(\.effectiveAppearance, options: [.new]) { [weak self] _, _ in
-                Task { @MainActor [weak self] in
-                    self?.redrawIcon()
-                }
-            }
         }
         NotificationCenter.default.addObserver(
             self, selector: #selector(handleWindowKey(_:)),
@@ -122,7 +112,6 @@ final class StatusBarController: NSObject, NSWindowDelegate {
 
     deinit {
         NotificationCenter.default.removeObserver(self)
-        appearanceObservation?.invalidate()
     }
 
     /// Connects the tray icon and popover to the single authoritative SwiftUI stores.
@@ -210,10 +199,7 @@ final class StatusBarController: NSObject, NSWindowDelegate {
 
     private func redrawIcon() {
         guard let button = item.button else { return }
-        button.image = StatusBarIconRenderer.render(
-            status: currentIconStatus,
-            appearance: button.effectiveAppearance
-        )
+        button.image = StatusBarIconRenderer.render(status: currentIconStatus)
     }
 
     // MARK: window adoption

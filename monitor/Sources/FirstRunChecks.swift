@@ -88,6 +88,41 @@ final class FirstRunChecks: InitializationChecking {
             // Seed service status once. MonitorStore already owns ongoing snapshot
             // and status reads; their consumers must not schedule the next read.
             await store.switcher.refreshBackground(maximumAge: 5)
+            // When dragged directly into /Applications without running any CLI
+            // script, the background agent and Seatbelt gateway are not yet
+            // registered. Guide the user through a single GUI authorization
+            // right inside Step 3 instead of timing out in a dead end.
+            let diag = store.switcher.background?.backend_diagnostics
+            let fm = FileManager.default
+            let home = NSHomeDirectory()
+            let runtimeMissing = !fm.isExecutableFile(atPath: home + "/Library/Application Support/ClaudeWatch/runtime/watch-engine")
+            let plistMissing = !fm.fileExists(atPath: home + "/Library/LaunchAgents/io.local.claudewatch.agent.plist")
+            let gatewayMissing = !fm.fileExists(atPath: "/Library/PrivilegedHelperTools/io.local.claudewatch.gateway/config.json")
+            let agentNotInstalled = !store.switcher.isFixture
+                && (runtimeMissing || plistMissing || gatewayMissing
+                    || (store.switcher.background?.guard_backend_healthy != true
+                        && (diag?.launchd_registered == false || diag?.launchd_state == "absent")))
+            if agentNotInstalled {
+                let expectedPath = AccessibilityPermission.installedPath
+                let currentPath = Bundle.main.bundleURL.standardizedFileURL.path
+                if currentPath != expectedPath {
+                    return finish(.failed(
+                        code: "app_not_in_applications",
+                        detail: "请先将 Agent Watch.app 拖入「应用程序（/Applications）」文件夹，再从「应用程序」中打开。"
+                    ))
+                }
+                return .approval(.init(
+                    id: "runtime-install",
+                    action: .runtimeInstall,
+                    title: "安装后台采集与 Seatbelt 网关",
+                    detail: "检测到这是首次从「应用程序」启动，需一次性安装自有后台采集任务与本地 Seatbelt 网关。全程只需输入一次管理员密码，后续环境配置与日常使用均无需重复输密码。",
+                    changes: [
+                        "复制原生运行组件并注册后台采集任务（io.local.claudewatch.agent）",
+                        "通过一次 macOS 管理员授权安装并固定本地 Seatbelt 网关（io.local.claudewatch.gateway）与系统辅助组件",
+                        "保留已授予的辅助功能授权、账号及配置；不修改 Claude / ChatGPT / TAG 配置"
+                    ]
+                ))
+            }
             while !Task.isCancelled {
                 phase = confirmationDeadline == nil ? "waiting_first_sample" : "waiting_next_sample"
                 let deadline = confirmationDeadline ?? startupDeadline
@@ -256,6 +291,27 @@ final class FirstRunChecks: InitializationChecking {
             // OS consent can outlive this call. Only a later actual trust check
             // may advance; opening Settings is never treated as permission.
             return accessResult
+        case .runtimeInstall:
+            do {
+                let data = try await Task.detached(priority: .userInitiated) {
+                    try SwitcherCommandRunner.run(["install-runtime", "--apply"])
+                }.value
+                let parsed = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+                guard parsed?["status"] as? String == "ok" else {
+                    let message = (parsed?["error"] as? [String: Any])?["message"] as? String
+                        ?? (parsed?["message"] as? String)
+                        ?? "后台采集与 Seatbelt 网关安装未确认，请重试。"
+                    return .failed(code: "runtime_install_failed", detail: message)
+                }
+            } catch {
+                return .failed(code: "runtime_install_failed", detail: error.localizedDescription)
+            }
+            // Refresh live snapshot & service status immediately, then run the
+            // authoritative connection check so `boundContext` is established
+            // from live post-install samples before advancing to Step 4.
+            store.refresh(manual: true)
+            await store.switcher.refreshBackground(maximumAge: 0)
+            return await check(.connection)
         case .environment, .protection:
             guard contextMatches, let plan = store.switcher.setupPlan, plan.id == request.id,
                   store.switcher.setupCanConfirm, Self.allowed(plan.actions) else {
@@ -331,7 +387,7 @@ final class FirstRunChecks: InitializationChecking {
         }
         let needsAdministrator = plan.actions.contains { ["timezone", "ipv6", "watchdog"].contains($0.id) }
         let description = needsAdministrator
-            ? "确认后先复核出口，再请求 macOS 管理员权限以执行所列系统操作，完成后回读。"
+            ? "确认后先复核出口并应用所列系统配置变更（已安装网关的本机通常无需重复输入管理员密码），完成后自动回读。"
             : "确认后先复核出口，再保存 Watch 设置；本次列出的操作不需要管理员权限。"
         return .approval(.init(id: plan.id, action: enableProtection ? .protection : .environment,
             title: enableProtection ? "启用 Watch 自有守护" : "确认初始化环境",

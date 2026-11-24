@@ -83,7 +83,16 @@ fn main() -> std::process::ExitCode {
     }
     let result = if args.first().map(String::as_str) == Some("--prepare") { prepare(&args[1..]) }
         else if args.first().is_some_and(|v| v.starts_with("--service-")) { service::dispatch(&args) }
-        else if args.is_empty() { claude_watch_system::launchd_gateway::run_gateway_broker_with_events(&|event| logging::record_async(event.operation, event.result, event.reason)) }
+        else if args.is_empty() {
+            let handlers = claude_watch_system::launchd_gateway::GatewayControlHandlers {
+                on_commit: Some(&service::commit_live_transaction),
+                on_admin: Some(&service::run_pinned_admin_action),
+            };
+            claude_watch_system::launchd_gateway::run_gateway_broker_with_handlers(
+                &|event| logging::record_async(event.operation, event.result, event.reason),
+                &handlers,
+            )
+        }
         else { Err(io::Error::other("unsupported broker command")) };
     match result {
         Ok(()) => {

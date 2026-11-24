@@ -340,6 +340,28 @@ fn run() -> Result<EngineOutput> {
     if args.first().map(String::as_str) == Some("gateway-endpoint-check") {
         return gateway_endpoint_check::run(&args).map(|value| EngineOutput::json(value, 0));
     }
+    if args.first().map(String::as_str) == Some("gateway-commit-transaction") {
+        if args.len() != 2 {
+            return Err(CoreError::new("invalid_arguments", "网关事务提交需要明确事务编号"));
+        }
+        claude_watch_system::launchd_gateway::commit_gateway_transaction(&args[1]).map_err(|e| {
+            CoreError::new("gateway_commit_failed", &format!("内核鉴权网关提交失败：{e}"))
+        })?;
+        return Ok(EngineOutput::json(
+            json!({"status":"ok","action":"--service-commit","transaction":args[1]}),
+            0,
+        ));
+    }
+    if args.first().map(String::as_str) == Some("gateway-admin") {
+        let admin_args = &args[1..];
+        claude_watch_system::launchd_gateway::run_gateway_admin_action(admin_args).map_err(|e| {
+            CoreError::new("gateway_admin_failed", &format!("内核鉴权系统操作失败：{e}"))
+        })?;
+        return Ok(EngineOutput::json(
+            json!({"status":"ok","action":"gateway-admin"}),
+            0,
+        ));
+    }
     if args == ["--version"] {
         return Ok(EngineOutput::json(
             json!({"schema":1,"status":"ok","engine":"rust","version":env!("CARGO_PKG_VERSION"),"backend_version":claude_watch_runtime::monitor_snapshot::VERSION,"runtime_schema":2,"migration_complete":false}),

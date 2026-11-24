@@ -2,6 +2,12 @@
 
 该摘要根据现有源码和版本发布记录整理。后续版本遵循语义化版本（SemVer）：缺陷修复递增 patch，功能/品牌升级递增 minor，破坏性架构变更递增 major。
 
+## 4.2.1 — 2026-11-24
+
+- **纯拖拽安装与向导内置后台部署**：从 DMG 移除 `安装或更新后台.command`，直接拖入 `/Applications` 打开即可使用；新增 Rust 权威命令 `watch-engine install-runtime`，首次初始化向导第 3 步检测到后台与 Seatbelt 网关未安装时自动弹出图形化一键部署卡片，不重置辅助功能授权。
+- **全流程仅需 1 次管理员密码授权**：在内核鉴权 root 网关（`watch-gateway-broker`）新增 `CWGWCMT1` 事务提交与 `CWGWADM1` 严格白名单管理转发，并在首次网关安装时同步落位编译期哈希固定的 `claude-watch-admin.sh`；彻底消除网关二次 `commit` 弹窗以及后续改时区、关 IPv6、刷 DNS 与时区守护的重复密码弹窗（首次初始化从最多 5 次降至 1 次，日常使用 0 弹窗）。
+- **修复菜单栏托盘 96% CPU 死循环**：移除 `StatusBarController` 中引发多屏 `_updateReplicants` 无限重绘的 `effectiveAppearance` KVO，改由 AppKit 原生 `NSImage` 绘制回调实时适配外观，待机 CPU 归零。
+
 ## 4.2.0 — 2026-11-24
 
 - **全新菜单栏托盘图标（六边沙箱核）**：淘汰默认系统盾牌图标，改用原生 CoreGraphics 矢量绘制的「六边沙箱核（Hex Agent Core）」菜单栏图标，避免与常见安全/代理工具视觉冲突，并根据后台权威保护状态自动呈现待命单色与绿 / 黄 / 红高对比状态角标，支持深浅菜单栏外观实时重绘。

@@ -50,14 +50,11 @@ No local compilation is needed. Download the pre-built release directly from Git
    ```bash
    shasum -a 256 -c Agent-Watch-*-arm64.dmg.sha256
    ```
-3. **Mount the DMG** and double-click **`安装或更新后台.command`**.
-   - Verifies bundle code signature, architecture, and component hashes.
-   - Installs `/Applications/Agent Watch.app` and registers the background supervision agent.
-   - Moves any prior version safely to Trash while preserving all accounts, logs, and settings.
+3. **Mount the DMG** and drag **`Agent Watch.app`** into **`Applications`** — no terminal scripts needed.
+4. **Open Agent Watch** from `/Applications` and complete the guided **First-Run Wizard**.
+   - Checks bundled integrity and guides macOS Accessibility permission.
+   - Automatically installs the background agent and pinned local Seatbelt gateway right inside the GUI with a **single** administrator password prompt (routine timezone/IPv6/watchdog changes afterward require zero additional password prompts).
    - Never launches Claude / ChatGPT / Codex automatically and never edits your proxy/VPN configuration.
-4. **Open Agent Watch** from `/Applications` and complete the **First-Run Wizard**.
-   - Checks active proxy, exit IP, DNS, and WebRTC posture automatically.
-   - Guides you through macOS Accessibility permission and one-time Seatbelt local gateway authorization.
 
 > **Ad-hoc Signing Note**: Releases are signed with a free local ad-hoc signature rather than a paid Apple Developer ID notarization. If macOS Gatekeeper warns on first launch, allow `Agent Watch.app` in **System Settings → Privacy & Security** or right-click → **Open**.
 

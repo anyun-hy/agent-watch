@@ -13,6 +13,9 @@ use std::{
 };
 
 const PLIST: &str = "/Library/LaunchDaemons/io.local.claudewatch.gateway.plist";
+const ADMIN_ROOT: &str = "/Library/Application Support/ClaudeWatch";
+const ADMIN_HELPER: &str = "/Library/Application Support/ClaudeWatch/claude-watch-admin.sh";
+const BUNDLED_ADMIN_HELPER: &[u8] = include_bytes!("../../../monitor/Resources/watch-admin.sh");
 const MAX_EXECUTABLE_BYTES: u64 = 128 * 1024 * 1024;
 fn invalid(message: &str) -> io::Error {
     io::Error::other(message)
@@ -734,6 +737,10 @@ pub fn dispatch(args: &[String]) -> io::Result<()> {
         host.prepare_logging();
         host.log("service_install", "installation_started", Some(&args[4]));
         install(&paths, &mut host, approved, &args[4], generation)?;
+        // Also materialize the compile-time pinned admin helper during this single
+        // administrator prompt so subsequent timezone/IPv6/watchdog operations run
+        // via the kernel-authenticated root broker without re-prompting.
+        ensure_pinned_admin_helper()?;
         println!(
             "{}",
             json!({"status":"prepared","transaction":args[4],"endpoint_verified":false})
@@ -815,6 +822,105 @@ pub fn dispatch(args: &[String]) -> io::Result<()> {
         return Ok(());
     }
     Err(invalid("unsupported gateway service command"))
+}
+
+/// Ensures `/Library/Application Support/ClaudeWatch/claude-watch-admin.sh`
+/// exists as a root-owned, non-symlink executable matching the compile-time
+/// SHA-256 of `monitor/Resources/watch-admin.sh`.
+pub fn ensure_pinned_admin_helper() -> io::Result<()> {
+    if claude_watch_system::effective_uid() != 0 {
+        return Err(invalid("pinned admin helper requires root privileges"));
+    }
+    let root = Path::new(ADMIN_ROOT);
+    let parent = root.parent().ok_or_else(|| invalid("missing admin parent"))?;
+    let parent_meta = fs::symlink_metadata(parent)?;
+    if parent_meta.file_type().is_symlink() || !parent_meta.is_dir() || parent_meta.uid() != 0 || parent_meta.mode() & 0o022 != 0 {
+        return Err(invalid("admin helper parent directory is not trusted"));
+    }
+    if exists(root) {
+        let meta = fs::symlink_metadata(root)?;
+        if meta.file_type().is_symlink() || !meta.is_dir() || meta.uid() != 0 || meta.mode() & 0o022 != 0 {
+            return Err(invalid("admin helper root directory is not trusted"));
+        }
+    } else {
+        use std::os::unix::fs::DirBuilderExt;
+        fs::DirBuilder::new().mode(0o755).create(root)?;
+        fs::set_permissions(root, fs::Permissions::from_mode(0o755))?;
+    }
+    let expected = claude_watch_system::sha256_bytes_hex(BUNDLED_ADMIN_HELPER);
+    let target = Path::new(ADMIN_HELPER);
+    if exists(target) {
+        let meta = fs::symlink_metadata(target)?;
+        if meta.file_type().is_symlink() || !meta.is_file() || meta.uid() != 0 || meta.mode() & 0o022 != 0 {
+            return Err(invalid("existing admin helper is not a trusted root file"));
+        }
+        if claude_watch_system::sha256_file_hex(target).as_deref() == Some(expected.as_str()) {
+            return Ok(());
+        }
+    }
+    let temp = root.join(format!(".claude-watch-admin.{}.tmp", std::process::id()));
+    let _ = fs::remove_file(&temp);
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o755)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&temp)?;
+    file.write_all(BUNDLED_ADMIN_HELPER)?;
+    file.sync_all()?;
+    drop(file);
+    fs::set_permissions(&temp, fs::Permissions::from_mode(0o755))?;
+    if claude_watch_system::sha256_file_hex(&temp).as_deref() != Some(expected.as_str()) {
+        let _ = fs::remove_file(&temp);
+        return Err(invalid("staged admin helper digest mismatch"));
+    }
+    fs::rename(&temp, target)?;
+    Ok(())
+}
+
+/// Commits an in-progress gateway transaction from the already-running root
+/// broker after kernel peer verification of the pinned `watch-engine`.
+pub fn commit_live_transaction(tx_id: &str, config: &GatewayInstallConfig) -> io::Result<()> {
+    token(tx_id)?;
+    let paths = Paths::production();
+    let _lock = service_lock(&paths)?;
+    let mut host = Native;
+    if !exists(&paths.transaction) {
+        return Ok(());
+    }
+    let tx = read_transaction(&paths, tx_id, config.engine_uid, &config.engine_executable)?;
+    let actual = installed(&paths, &mut host, config.engine_uid, &config.engine_executable)?
+        .ok_or_else(|| invalid("gateway not installed"))?;
+    if !same_config(&actual, &tx.next) || !loaded(&mut host, &paths)? {
+        return Err(invalid("gateway changed before live transaction commit"));
+    }
+    fs::remove_dir_all(&paths.transaction)?;
+    Ok(())
+}
+
+/// Executes an allowlisted administrative action through the compile-time pinned
+/// `claude-watch-admin.sh` helper inside a clean root environment.
+pub fn run_pinned_admin_action(args: &[String]) -> io::Result<()> {
+    claude_watch_system::launchd_gateway::validate_gateway_admin_args(args)?;
+    ensure_pinned_admin_helper()?;
+    let output = Command::new("/usr/bin/env")
+        .env_clear()
+        .arg("-i")
+        .arg("PATH=/usr/bin:/bin:/usr/sbin:/sbin")
+        .arg("/bin/bash")
+        .arg("--noprofile")
+        .arg("--norc")
+        .arg(ADMIN_HELPER)
+        .args(args)
+        .current_dir("/private/tmp")
+        .output()?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(invalid("pinned admin helper command failed"))
+    }
 }
 
 #[cfg(test)]

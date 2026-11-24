@@ -39,7 +39,7 @@ struct InitializationRow: Identifiable {
     var id: String { step.rawValue }
 }
 struct InitializationApproval: Identifiable, Equatable {
-    enum Action { case environment, accessibility, protection }
+    enum Action { case environment, accessibility, runtimeInstall, protection }
     let id: String
     let action: Action
     let title, detail: String
@@ -302,8 +302,14 @@ final class FirstRunInitialization: ObservableObject {
               let index = rows.firstIndex(where: { $0.status == .authorization }) else { return }
         running = true
         rows[index].status = .running
-        rows[index].detail = request.action == .accessibility
-            ? "正在请求辅助功能授权，请在系统设置中确认…" : SetupProgressPhase.verifyEgress.detail
+        switch request.action {
+        case .accessibility:
+            rows[index].detail = "正在请求辅助功能授权，请在系统设置中确认…"
+        case .runtimeInstall:
+            rows[index].detail = "正在安装后台采集服务与本地 Seatbelt 网关，请在系统弹窗中输入一次管理员密码…"
+        case .environment, .protection:
+            rows[index].detail = SetupProgressPhase.verifyEgress.detail
+        }
         let operation = UUID(); approvalOperation = operation
         log("authorization_started", index: index, code: "authorization_started")
         let result = await checks.approve(request, progress: { [weak self] phase in

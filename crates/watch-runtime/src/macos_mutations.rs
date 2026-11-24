@@ -417,8 +417,46 @@ impl NativeMutationRunner {
     }
 }
 
+impl NativeMutationRunner {
+    /// Attempts to run an allowlisted administrative action through the already
+    /// installed, kernel-authenticated root gateway broker so the user is not
+    /// repeatedly prompted for an administrator password after initial setup.
+    fn try_broker_admin(&self, args: &[String]) -> bool {
+        if claude_watch_system::launchd_gateway::validate_gateway_admin_args(args).is_err() {
+            return false;
+        }
+        if !Path::new(claude_watch_system::launchd_gateway::CONTROL_PATH).exists() {
+            return false;
+        }
+        let engine = self.paths.watch.join("runtime/watch-engine");
+        if !engine.is_file() {
+            return false;
+        }
+        let running_is_pinned = std::env::current_exe()
+            .ok()
+            .and_then(|p| fs::canonicalize(p).ok())
+            .zip(fs::canonicalize(&engine).ok())
+            .is_some_and(|(a, b)| a == b);
+        if running_is_pinned {
+            return claude_watch_system::launchd_gateway::run_gateway_admin_action(args).is_ok();
+        }
+        let Some(program) = engine.to_str() else {
+            return false;
+        };
+        let mut cmd_args = Vec::with_capacity(args.len() + 1);
+        cmd_args.push("gateway-admin".to_string());
+        cmd_args.extend(args.iter().cloned());
+        Self::execute_input_timeout(program, &cmd_args, Vec::new(), ADMIN_TIMEOUT)
+            .is_ok_and(|(ok, _)| ok)
+    }
+}
+
 impl MutationRunner for NativeMutationRunner {
     fn admin(&mut self, command: AdminCommand) -> Result<()> {
+        let args = Self::admin_args(command.clone())?;
+        if self.try_broker_admin(&args) {
+            return Ok(());
+        }
         let plan = self.admin_authorization_plan(command)?;
         // Emit only after validating the fixed helper and immediately before
         // the actual macOS administrator request, never during egress reads.

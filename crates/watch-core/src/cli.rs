@@ -102,6 +102,7 @@ impl Request {
                 &["install-staged"],
             ),
             "app-install" => (&[], &["apply"], &["source"]),
+            "install-runtime" => (&[], &["apply"], &[]),
             "reinstall" => (&[], &["dry-run"], &["version", "build", "project"]),
             "app-uninstall" => (&[], &["apply"], &[]),
             "install" => (&[], &["apply"], &["source"]),

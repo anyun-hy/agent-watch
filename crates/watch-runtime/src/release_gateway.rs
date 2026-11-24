@@ -260,6 +260,28 @@ pub(crate) fn finish<E: FixedCommandExecutor>(
     } else {
         "--service-commit"
     };
+    // On normal commit, prefer committing over the already-running, kernel-
+    // authenticated root broker socket via the pinned runtime engine so the
+    // user is never prompted for a second administrator password just to remove
+    // the completed transaction directory. Fall back to osascript only if live
+    // IPC is unavailable.
+    if !rollback {
+        if let Ok(output) = run(
+            executor,
+            &transaction.engine,
+            vec!["gateway-commit-transaction".into(), transaction.id.clone()],
+        ) {
+            if let Ok(receipt) = json(output) {
+                if receipt["status"] == "ok"
+                    && receipt["transaction"] == transaction.id
+                    && receipt["action"] == action
+                {
+                    *state = None;
+                    return Ok(());
+                }
+            }
+        }
+    }
     let receipt = json(administrator(executor, transaction, if rollback { "rollback" } else { "commit" }, None).map_err(
         |mut error| {
             error
@@ -337,6 +359,12 @@ mod tests {
                 json!({"prepared":true})
             } else if c.args.first().map(String::as_str) == Some("gateway-endpoint-check") {
                 json!({"status":"ok","gateway_endpoint":if self.wrong_endpoint {"127.0.0.1:7890"}else{"127.0.0.1:1023"},"ipv4_verified":true,"ipv6_verified":true})
+            } else if c.args.first().map(String::as_str) == Some("gateway-commit-transaction") {
+                if self.fail_commit {
+                    status = 1;
+                }
+                let id = c.args.get(1).cloned().unwrap_or_default();
+                json!({"status":"ok","action":"--service-commit","transaction":id})
             } else if c.program == Path::new("/usr/bin/osascript") {
                 let request = &c.args[c.args.len() - 11..];
                 let id = &request[6];
@@ -463,6 +491,15 @@ mod tests {
         );
         finish(&mut executor, &mut state, false).unwrap();
         assert!(state.is_none());
+        let osascript_calls = executor
+            .calls
+            .iter()
+            .filter(|c| c.program == Path::new("/usr/bin/osascript"))
+            .count();
+        assert_eq!(
+            osascript_calls, 1,
+            "normal install+commit must only prompt for administrator once"
+        );
     }
     #[test]
     fn lost_admin_receipt_retains_transaction_for_verified_rollback() {

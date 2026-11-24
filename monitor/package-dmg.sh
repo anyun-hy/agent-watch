@@ -72,7 +72,7 @@ PAYLOAD="$STAGE/payload"
 mkdir -p "$PAYLOAD"
 cp -R "$APP" "$PAYLOAD/$APP_NAME"
 ln -s /Applications "$PAYLOAD/Applications"
-cp "$ROOT/Packaging/安装说明.txt" "$ROOT/Packaging/安装或更新后台.command" "$ROOT/Packaging/卸载应用.command" "$PAYLOAD/"
+cp "$ROOT/Packaging/安装说明.txt" "$ROOT/Packaging/卸载应用.command" "$PAYLOAD/"
 python3 - "$APP/Contents/Resources/BuildInfo.plist" "$PAYLOAD/安装说明.txt" "$ACTUAL_BUILD" <<'PY'
 from pathlib import Path
 import plistlib, sys
@@ -88,7 +88,6 @@ for key, value in values.items(): text = text.replace("{{" + key + "}}", str(val
 if "{{" in text: raise SystemExit("Unresolved installation instruction placeholder")
 target.write_text(text)
 PY
-chmod 755 "$PAYLOAD/安装或更新后台.command"
 chmod 755 "$PAYLOAD/卸载应用.command"
 
 if [[ "$USE_DISKUTIL_IMAGE" == '1' ]]; then
@@ -106,7 +105,7 @@ ATTACHED=1
 [[ -d "$MOUNT/$APP_NAME" ]] || { printf 'Mounted DMG is missing the app.\n' >&2; exit 1; }
 [[ -s "$MOUNT/$APP_NAME/Contents/Resources/AppIcon.icns" ]] || { printf 'Mounted DMG is missing the application icon.\n' >&2; exit 1; }
 [[ -L "$MOUNT/Applications" ]] || { printf 'Mounted DMG is missing the Applications link.\n' >&2; exit 1; }
-[[ -x "$MOUNT/安装或更新后台.command" ]] || { printf 'Mounted DMG is missing the installer command.\n' >&2; exit 1; }
+[[ -x "$MOUNT/卸载应用.command" ]] || { printf 'Mounted DMG is missing the uninstaller command.\n' >&2; exit 1; }
 [[ -f "$MOUNT/安装说明.txt" ]] || { printf 'Mounted DMG is missing the Chinese instructions.\n' >&2; exit 1; }
 /usr/bin/codesign --verify --deep --strict "$MOUNT/$APP_NAME"
 [[ "$('/usr/libexec/PlistBuddy' -c 'Print :CFBundleVersion' "$MOUNT/$APP_NAME/Contents/Info.plist")" == "$BUILD_NUMBER" ]] || { printf 'Mounted app build mismatch.\n' >&2; exit 1; }
