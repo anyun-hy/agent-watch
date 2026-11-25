@@ -1047,7 +1047,12 @@ impl<R: ReadRunner, T: Transport, S: AuditSystem + ServiceSystem> DesktopRuntime
                 }
             }
             let latest = configs.load()?;
-            let mut after = self.system.local(&latest)?;
+            let mut after = self.system.local_from_process_round_with_max_age(
+                &latest,
+                self.desktop.target(),
+                round,
+                MAX_IN_FLIGHT_PROBE_SPAN,
+            )?;
             if !(0.0..=MAX_IN_FLIGHT_PROBE_SPAN).contains(&(native::now() - round.observed_at)) {
                 return Err(CoreError::new("process_observation_stale", "出口采样跨度超时"));
             }
@@ -1057,8 +1062,9 @@ impl<R: ReadRunner, T: Transport, S: AuditSystem + ServiceSystem> DesktopRuntime
                 || before["guard_identity_evidence"] != after["guard_identity_evidence"] {
                 return Err(CoreError::new("audit_context_changed", "出口采样期间环境变化"));
             }
-            after["environment_observed_at"] = serde_json::json!(native::now()
-                .min(after["environment_observed_at"].as_f64().unwrap_or_else(native::now)));
+            after["environment_observed_at"] = serde_json::json!(round.observed_at
+                .min(before["environment_observed_at"].as_f64().unwrap_or(round.observed_at))
+                .min(after["environment_observed_at"].as_f64().unwrap_or(round.observed_at)));
             Ok((egress, after))
         })();
         result.unwrap_or_else(|error| (

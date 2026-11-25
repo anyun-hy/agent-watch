@@ -288,3 +288,51 @@ fn guard_round_ignores_transient_same_binary_worker_when_daemon_owner_is_bound()
         "daemon owner PID mutation must still invalidate the round"
     );
 }
+
+#[test]
+fn guard_round_post_probe_recheck_retains_listener_and_identity_evidence_past_intent_ttl() {
+    use claude_watch_core::processes::LaunchTarget;
+    use claude_watch_runtime::audit_store::AuditSystem;
+
+    let fixture = Fixture::new(false, false);
+    let mut round = fixture.sampler().processes_with_system_metadata().unwrap();
+    let cfg = claude_watch_runtime::config_store::ConfigStore {
+        storage: fixture.store.clone(),
+    }
+    .load()
+    .unwrap();
+    let network = NetworkClient::new(fixture.http.clone(), None).unwrap();
+    let host = Macos {
+        request_evidence: true,
+        runner: fixture.source.clone(),
+        network,
+        storage: fixture.store.clone(),
+        authority: Authority::ReadOnly,
+        mutator: NoWrites,
+        probes: Arc::new(|| panic!("guard must not run full audit probes")),
+    };
+    let before = host
+        .local_from_process_round(&cfg, LaunchTarget::ClaudeDesktop, &round)
+        .unwrap();
+    assert!(!before["guard_listener"].is_null());
+    assert!(!before["guard_identity_evidence"].is_null());
+
+    // Simulate a slow in-flight online probe (> INTENT_TTL = 8s, < 60s):
+    // strict start-of-round check rejects it, while post-probe recheck still
+    // populates and matches guard_listener and guard_identity_evidence.
+    round.observed_at -= 12.0;
+    if let Some(sys) = round.system_processes.as_mut() {
+        sys.observed_at -= 12.0;
+    }
+    assert!(host
+        .local_from_process_round(&cfg, LaunchTarget::ClaudeDesktop, &round)
+        .is_err());
+    let after = host
+        .local_from_process_round_with_max_age(&cfg, LaunchTarget::ClaudeDesktop, &round, 60.0)
+        .unwrap();
+    assert_eq!(before["guard_listener"], after["guard_listener"]);
+    assert_eq!(
+        before["guard_identity_evidence"],
+        after["guard_identity_evidence"]
+    );
+}

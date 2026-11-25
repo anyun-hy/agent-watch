@@ -35,7 +35,23 @@ pub trait AuditSystem {
     /// adapter still rechecks selected identities and network context now.
     fn local_from_process_round(
         &self, config: &Config, target: claude_watch_core::processes::LaunchTarget,
+        round: &crate::sampler::ProcessRound,
+    ) -> Result<Value> {
+        self.local_from_process_round_with_max_age(
+            config,
+            target,
+            round,
+            crate::process_disposition::INTENT_TTL,
+        )
+    }
+    /// Same as `local_from_process_round`, with an explicit age budget for
+    /// post-probe consistency checks so slow online I/O does not drop
+    /// `guard_listener` or `guard_identity_evidence` while still re-verifying
+    /// live identities and network state.
+    fn local_from_process_round_with_max_age(
+        &self, config: &Config, target: claude_watch_core::processes::LaunchTarget,
         _round: &crate::sampler::ProcessRound,
+        _max_round_age: f64,
     ) -> Result<Value> {
         self.local_for_target(config, target)
     }

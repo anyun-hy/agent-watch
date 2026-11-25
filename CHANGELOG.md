@@ -2,6 +2,12 @@
 
 该摘要根据现有源码和版本发布记录整理。后续版本遵循语义化版本（SemVer）：缺陷修复递增 patch，功能/品牌升级递增 minor，破坏性架构变更递增 major。
 
+## 4.2.4 — 2026-11-25
+
+- **热修 `sample_guard_environment` 探针后复核误判 `audit_context_changed` 导致持续断流**：
+  - 为 `AuditSystem::local_from_process_round_with_max_age` 补齐探针后 `60s` 跨度复核入口，使 `sample_guard_environment` 探针前后同样完整采集并核验 `guard_listener` 与 `guard_identity_evidence`，消除 `v4.2.3` 中因探针后缺少这两项字段导致的 `local_guard_unverified` 反复阻断。
+  - 新增 `guard_round_post_probe_recheck_retains_listener_and_identity_evidence_past_intent_ttl` 回归契约测试。
+
 ## 4.2.3 — 2026-11-25
 
 - **长会话事件驱动稳定性加固（消除无故闪断与空基线）**：

@@ -529,9 +529,9 @@ impl<R: ReadRunner, T: Transport, M: Mutator> Macos<R, T, M> {
         }
     }
     fn local_facts(&self, c: &Config) -> Result<Value> {
-        self.local_facts_from_round(c, None)
+        self.local_facts_from_round(c, None, crate::process_disposition::INTENT_TTL)
     }
-    fn local_facts_from_round(&self, c: &Config, round: Option<&ProcessRound>) -> Result<Value> {
+    fn local_facts_from_round(&self, c: &Config, round: Option<&ProcessRound>, max_round_age: f64) -> Result<Value> {
         let env = self.environment()?;
         let uid = env["uid"]
             .as_u64()
@@ -545,7 +545,7 @@ impl<R: ReadRunner, T: Transport, M: Mutator> Macos<R, T, M> {
                 CoreError::new("process_observation_missing", "本轮系统进程观察缺失"))?;
             let now = native::now();
             if round.uid != uid || ![round.observed_at, observation.observed_at].iter()
-                .all(|at| (0.0..=crate::process_disposition::INTENT_TTL).contains(&(now - at))) {
+                .all(|at| (0.0..=max_round_age).contains(&(now - at))) {
                 return Err(CoreError::new("process_observation_stale", "本轮进程观察已过期或用户身份不符"));
             }
             let table = observation.processes.as_ref().map_err(Clone::clone)?;
@@ -846,9 +846,9 @@ impl<R: ReadRunner, T: Transport, M: Mutator> Macos<R, T, M> {
     }
     fn local_for_target_using(
         &self, c: &Config, target: claude_watch_core::processes::LaunchTarget,
-        round: Option<&ProcessRound>,
+        round: Option<&ProcessRound>, max_round_age: f64,
     ) -> Result<Value> {
-        let mut local = self.local_facts_from_round(c, round)?;
+        let mut local = self.local_facts_from_round(c, round, max_round_age)?;
         if target.cli() {
             let overrides = if target == claude_watch_core::processes::LaunchTarget::ClaudeCli {
                 crate::config_store::cli_proxy_overrides(&self.runner, &self.storage.paths.home)
@@ -1193,13 +1193,13 @@ impl<R: ReadRunner, T: Transport, M: Mutator> AuditSystem for Macos<R, T, M> {
         c: &Config,
         target: claude_watch_core::processes::LaunchTarget,
     ) -> Result<Value> {
-        self.local_for_target_using(c, target, None)
+        self.local_for_target_using(c, target, None, crate::process_disposition::INTENT_TTL)
     }
-    fn local_from_process_round(
+    fn local_from_process_round_with_max_age(
         &self, c: &Config, target: claude_watch_core::processes::LaunchTarget,
-        round: &ProcessRound,
+        round: &ProcessRound, max_round_age: f64,
     ) -> Result<Value> {
-        self.local_for_target_using(c, target, Some(round))
+        self.local_for_target_using(c, target, Some(round), max_round_age)
     }
     fn network_and_local(&self, c: &Config, target: claude_watch_core::processes::LaunchTarget) -> Result<(Value, Value)> {
         let local = self.local_for_target(c, target)?;
