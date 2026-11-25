@@ -395,15 +395,19 @@ pub fn evaluate_target(
         true,
         "本机环境",
     ));
+    let require_ipv6_off = config.require_ipv6_off_for(target);
+    let require_dns = config.require_dns_for(target);
+    let require_stun = config.require_stun_for(target);
+    let require_pinned_rules = config.require_pinned_rules_for(target);
     rows.push(row(
         "ipv6",
         text(local, "ipv6"),
-        if config.require_ipv6_off {
+        if require_ipv6_off {
             "关闭策略已启用"
         } else {
             "未要求关闭；此项不能证明 IPv6 无泄漏"
         },
-        config.require_ipv6_off,
+        require_ipv6_off,
         "本机环境",
     ));
     let dns = &online["dns"];
@@ -420,7 +424,7 @@ pub fn evaluate_target(
         } else {
             text(dns, "detail")
         },
-        config.require_dns,
+        require_dns,
         "IPLeak.net DNS 泄漏采样；不代表所有应用或浏览器 DoH",
     ));
     let stun = &online["stun"];
@@ -460,7 +464,7 @@ pub fn evaluate_target(
         "stun",
         state,
         detail,
-        config.require_stun,
+        require_stun,
         "原生 UDP/STUN 探针，用于 AI 受控启动网络检查；不等于 Claude 实际 socket 或 WebRTC",
     );
     stun_row["sampled_at"] = json!(sampled);
@@ -512,7 +516,7 @@ pub fn evaluate_target(
             .get("detail")
             .and_then(Value::as_str)
             .unwrap_or("规则未确认；请配置或查看代理实际连接"),
-        config.require_pinned_rules,
+        require_pinned_rules,
         "规则配置；实际流量另见连接页",
     ));
     if target.cli() {

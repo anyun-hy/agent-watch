@@ -28,7 +28,8 @@ use claude_watch_core::{
 };
 use claude_watch_system::{
     attribute_loopback_tcp_peer, effective_uid, inspect_process_identity, list_descendant_pids,
-    sha256_bytes_hex, sha256_file_hex, verify_sandbox_helper_peer, SandboxPeerVerifier,
+    list_user_pids, sha256_bytes_hex, sha256_file_hex, verify_sandbox_helper_peer,
+    SandboxPeerVerifier,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -1129,6 +1130,115 @@ impl SandboxLaunchRegistry {
     ///   invalidates stale identity on `exec`, updates `controlled_subtree_pids`, and cleans up
     ///   exited or unapproved children.
     pub fn reconcile_process_trees(&self, now: f64) -> Vec<ManagedLaunchInstance> {
+        // Pre-scan orphan `ppid == 1` `crashpad_handler` processes OUTSIDE the
+        // registry mutex, and only once per desktop instance that actually
+        // declares an approved `crashpad_handler` child executable and has not
+        // yet bound one (so subsequent rounds and registration sockets see zero
+        // lock contention or full-table syscalls).
+        let crashpad_targets: Option<(u32, Vec<(String, String, u32, u64, u32)>)> = {
+            let Ok(guard) = self.inner.lock() else {
+                return Vec::new();
+            };
+            let expected_uid = guard.verifier.expected_uid;
+            let mut pending = Vec::new();
+            for (inst_id, inst) in &guard.instances {
+                if matches!(
+                    inst.state,
+                    ManagedInstanceState::Exited | ManagedInstanceState::Failed
+                ) || !matches!(
+                    inst.target,
+                    LaunchTarget::ClaudeDesktop
+                        | LaunchTarget::CodexDesktop
+                        | LaunchTarget::ChatgptDesktop
+                ) {
+                    continue;
+                }
+                let Some(app_idx) = inst.expected_executable.find(".app/Contents/") else {
+                    continue;
+                };
+                let bundle_prefix = &inst.expected_executable[..app_idx + 5];
+                let declares_crashpad = guard
+                    .approved_child_executables
+                    .keys()
+                    .any(|k| k.starts_with(bundle_prefix) && k.ends_with("crashpad_handler"));
+                if !declares_crashpad {
+                    continue;
+                }
+                let already_bound = inst.controlled_subtree_pids.iter().any(|p| {
+                    guard
+                        .child_identities
+                        .get(p)
+                        .is_some_and(|(exe, _)| exe.ends_with("crashpad_handler"))
+                });
+                if !already_bound {
+                    pending.push((
+                        inst_id.clone(),
+                        inst.expected_executable.clone(),
+                        inst.uid,
+                        inst.start_seconds,
+                        inst.start_microseconds,
+                    ));
+                }
+            }
+            (!pending.is_empty()).then_some((expected_uid, pending))
+        };
+
+        let mut prediscovered_crashpads: BTreeMap<String, Vec<u32>> = BTreeMap::new();
+        if let Some((expected_uid, pending_instances)) = crashpad_targets {
+            let all_pids = list_user_pids(expected_uid);
+            let mut inspected = Vec::new();
+            for pid in all_pids {
+                if let Some(ck) = inspect_process_identity(pid) {
+                    inspected.push(ck);
+                }
+            }
+            let controlled_main_pids: BTreeSet<u32> = self
+                .inner
+                .lock()
+                .map(|g| {
+                    g.instances
+                        .values()
+                        .filter(|m| {
+                            !matches!(
+                                m.state,
+                                ManagedInstanceState::Exited | ManagedInstanceState::Failed
+                            )
+                        })
+                        .map(|m| m.pid)
+                        .collect()
+                })
+                .unwrap_or_default();
+            for (inst_id, expected_exe, inst_uid, start_sec, start_usec) in pending_instances {
+                let Some(app_idx) = expected_exe.find(".app/Contents/") else {
+                    continue;
+                };
+                let bundle_prefix = &expected_exe[..app_idx + 5];
+                let has_unmanaged_same_app_main = inspected.iter().any(|ck| {
+                    ck.uid == inst_uid
+                        && ck.executable_path == expected_exe
+                        && !controlled_main_pids.contains(&ck.pid)
+                });
+                if has_unmanaged_same_app_main {
+                    continue;
+                }
+                let matches: Vec<u32> = inspected
+                    .iter()
+                    .filter(|ck| {
+                        ck.uid == inst_uid
+                            && ck.ppid == 1
+                            && ck.executable_path.starts_with(bundle_prefix)
+                            && ck.executable_path.ends_with("crashpad_handler")
+                            && (ck.start_seconds, ck.start_microseconds) >= (start_sec, start_usec)
+                            && ck.start_seconds.saturating_sub(start_sec) <= 60
+                    })
+                    .map(|ck| ck.pid)
+                    .collect();
+                if !matches.is_empty() {
+                    prediscovered_crashpads.insert(inst_id, matches);
+                }
+            }
+        }
+
         let Ok(mut guard) = self.inner.lock() else {
             return Vec::new();
         };
@@ -1255,6 +1365,19 @@ impl SandboxLaunchRegistry {
                 }
             }
             let mut candidate_children = list_descendant_pids(&seed_roots, expected_uid);
+            if main_alive_and_matching {
+                if let Some(found) = prediscovered_crashpads.get(&inst_id) {
+                    for &pid in found {
+                        if guard
+                            .pid_to_instance
+                            .get(&pid)
+                            .is_none_or(|owner| owner == &inst_id)
+                        {
+                            candidate_children.push(pid);
+                        }
+                    }
+                }
+            }
             for &root_child in &seed_roots {
                 if root_child != inst.pid && !candidate_children.contains(&root_child) {
                     candidate_children.push(root_child);

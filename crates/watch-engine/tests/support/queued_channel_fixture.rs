@@ -371,8 +371,8 @@ fn queued_inventory_failure_keeps_other_family_and_ordinary_connections() {
         .unwrap(),
     ));
     let stack = owned.0.as_mut().unwrap();
-    // Observe the actual periodic worker's wall samples without substituting
-    // a timestamp or driving an extra check from the fixture.
+    // Observe the event-driven lease watchdog worker's real wall samples
+    // without substituting a timestamp.
     let (watchdog_tx, watchdog_rx) = mpsc::channel();
     stack.enforcer.set_clock(move || {
         let now = native::now();
@@ -559,6 +559,10 @@ fn queued_inventory_failure_keeps_other_family_and_ordinary_connections() {
         .unwrap();
     let deadline = Instant::now() + Duration::from_secs(2);
     let watchdog_at = loop {
+        thread::sleep(Duration::from_secs_f64(
+            CLOCK_ROLLBACK_TOLERANCE_SECONDS + 0.02,
+        ));
+        stack.lease_watchdog.thread().unpark();
         let tick = watchdog_rx
             .recv_timeout(deadline.saturating_duration_since(Instant::now()))
             .expect("the automatic watchdog must advance beyond the queued event");

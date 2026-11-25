@@ -83,7 +83,7 @@ enum StatusBarIconRenderer {
 /// popover; right-click opens a compact native menu. Closing the main window
 /// folds it into the menu bar while background supervision continues.
 @MainActor
-final class StatusBarController: NSObject, NSWindowDelegate {
+final class StatusBarController: NSObject, NSWindowDelegate, NSPopoverDelegate {
     private let item: NSStatusItem
     private let popover = NSPopover()
     private var quitting = false
@@ -91,12 +91,15 @@ final class StatusBarController: NSObject, NSWindowDelegate {
     private weak var initialization: FirstRunInitialization?
     private var subscriptions = Set<AnyCancellable>()
     private var currentIconStatus: TrayIconStatus = .idle
+    private var globalClickMonitor: Any?
+    private var localEventMonitor: Any?
 
     override init() {
         item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         super.init()
         popover.behavior = .transient
         popover.animates = true
+        popover.delegate = self
         if let button = item.button {
             button.image = StatusBarIconRenderer.render(status: .idle)
             button.toolTip = "Agent Watch · 正在读取后台状态（左键详情卡片，右键菜单）"
@@ -107,10 +110,15 @@ final class StatusBarController: NSObject, NSWindowDelegate {
         NotificationCenter.default.addObserver(
             self, selector: #selector(handleWindowKey(_:)),
             name: NSWindow.didBecomeKeyNotification, object: nil)
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(handleAppResignActive(_:)),
+            name: NSApplication.didResignActiveNotification, object: nil)
         adoptWindows()
     }
 
     deinit {
+        if let globalClickMonitor { NSEvent.removeMonitor(globalClickMonitor) }
+        if let localEventMonitor { NSEvent.removeMonitor(localEventMonitor) }
         NotificationCenter.default.removeObserver(self)
     }
 
@@ -139,11 +147,27 @@ final class StatusBarController: NSObject, NSWindowDelegate {
         store.$snapshot.sink { [weak self] _ in self?.syncTrayStatus() }.store(in: &subscriptions)
         store.$error.sink { [weak self] _ in self?.syncTrayStatus() }.store(in: &subscriptions)
         store.switcher.$background.sink { [weak self] _ in self?.syncTrayStatus() }.store(in: &subscriptions)
+        store.switcher.$currentEnvironment.sink { [weak self] _ in self?.syncTrayStatus() }.store(in: &subscriptions)
         store.switcher.$backgroundError.sink { [weak self] _ in self?.syncTrayStatus() }.store(in: &subscriptions)
         store.switcher.$updateStatus.sink { [weak self] _ in self?.syncTrayStatus() }.store(in: &subscriptions)
         store.$channelSubscription.sink { [weak self] _ in self?.syncTrayStatus() }.store(in: &subscriptions)
 
         syncTrayStatus()
+    }
+
+    static func resolveActiveEgress(_ switcher: SwitcherStore) -> EgressReference? {
+        let candidates: [EgressReference?] = [
+            switcher.currentEnvironment?.egress_reference,
+            switcher.audit?.egress_reference,
+            switcher.background?.session_guard?.current,
+            switcher.background?.egress_reference,
+        ]
+        for candidate in candidates {
+            if let ref = candidate, let ip = ref.ip, !ip.isEmpty {
+                return ref
+            }
+        }
+        return nil
     }
 
     private func computeIconStatus() -> (TrayIconStatus, String) {
@@ -152,11 +176,16 @@ final class StatusBarController: NSObject, NSWindowDelegate {
         }
         let session = store.switcher.sessionDisplay
         let anyBlockedOrFailed = MonitoredProduct.allCases.contains { product in
-            guard let state = store.channelState(for: product)?.display_state else { return false }
-            return state == .blocked || state == .failed
+            guard let channel = store.channelState(for: product) else { return false }
+            let procCount = store.snapshot?.processes.filter { $0.product == product }.count ?? 0
+            let hasActiveSession = channel.session_id?.isEmpty == false
+            guard procCount > 0 || hasActiveSession else { return false }
+            if channel.reason_code == "idle_no_process" { return false }
+            return channel.display_state == .blocked || channel.display_state == .failed
         }
         let anyForwarding = MonitoredProduct.allCases.contains { product in
-            store.channelState(for: product)?.display_state == .forwarding
+            let procCount = store.snapshot?.processes.filter { $0.product == product }.count ?? 0
+            return procCount > 0 && store.channelState(for: product)?.display_state == .forwarding
         }
         let updateAvailable = store.switcher.updateStatus?.isAvailable == true
 
@@ -176,9 +205,7 @@ final class StatusBarController: NSObject, NSWindowDelegate {
         }
 
         var parts = ["Agent Watch · \(session.title)"]
-        if let ip = store.switcher.background?.session_guard?.current?.ip
-            ?? store.switcher.background?.egress_reference?.ip,
-           !ip.isEmpty {
+        if let ip = Self.resolveActiveEgress(store.switcher)?.ip {
             parts.append("出口 \(ip)")
         }
         if updateAvailable, let label = store.switcher.updateStatus?.versionLabel, !label.isEmpty {
@@ -259,14 +286,65 @@ final class StatusBarController: NSObject, NSWindowDelegate {
             if Self.mainWindowVisible() { hideMainWindow() } else { showMainWindow() }
             return
         }
-        NSApp.activate(ignoringOtherApps: true)
+        if let switcher = store?.switcher, switcher.background == nil && !switcher.refreshingBackground {
+            Task { await switcher.refreshBackground() }
+        }
         popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
         popover.contentViewController?.view.window?.makeKey()
+        installDismissMonitors()
     }
 
     private func closePopover() {
+        removeDismissMonitors()
         if popover.isShown {
             popover.performClose(nil)
+        }
+    }
+
+    func popoverDidClose(_ notification: Notification) {
+        removeDismissMonitors()
+    }
+
+    @objc private func handleAppResignActive(_ note: Notification) {
+        closePopover()
+    }
+
+    private func installDismissMonitors() {
+        removeDismissMonitors()
+        globalClickMonitor = NSEvent.addGlobalMonitorForEvents(
+            matching: [.leftMouseDown, .rightMouseDown, .otherMouseDown]
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.closePopover()
+            }
+        }
+        localEventMonitor = NSEvent.addLocalMonitorForEvents(
+            matching: [.leftMouseDown, .rightMouseDown, .otherMouseDown, .keyDown]
+        ) { [weak self] event in
+            guard let self, self.popover.isShown else { return event }
+            if event.type == .keyDown, event.keyCode == 53 {
+                self.closePopover()
+                return nil
+            }
+            if event.type != .keyDown {
+                let popoverWindow = self.popover.contentViewController?.view.window
+                let statusButtonWindow = self.item.button?.window
+                if event.window !== popoverWindow && event.window !== statusButtonWindow {
+                    self.closePopover()
+                }
+            }
+            return event
+        }
+    }
+
+    private func removeDismissMonitors() {
+        if let globalClickMonitor {
+            NSEvent.removeMonitor(globalClickMonitor)
+            self.globalClickMonitor = nil
+        }
+        if let localEventMonitor {
+            NSEvent.removeMonitor(localEventMonitor)
+            self.localEventMonitor = nil
         }
     }
 
@@ -304,9 +382,7 @@ final class StatusBarController: NSObject, NSWindowDelegate {
         status.isEnabled = false
         menu.addItem(status)
 
-        if let ip = store?.switcher.background?.session_guard?.current?.ip
-            ?? store?.switcher.background?.egress_reference?.ip,
-           !ip.isEmpty {
+        if let store, let ip = Self.resolveActiveEgress(store.switcher)?.ip {
             let egressItem = NSMenuItem(title: "当前出口：\(ip)", action: nil, keyEquivalent: "")
             egressItem.isEnabled = false
             menu.addItem(egressItem)

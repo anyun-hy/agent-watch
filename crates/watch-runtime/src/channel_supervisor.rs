@@ -1567,9 +1567,14 @@ impl ChannelSupervisor {
                     };
                     if stop.load(Ordering::Acquire) { break; }
                     if req.is_cancelled() { continue; }
-                    // The previous runner may have finished while waiting for
-                    // this request. Recheck now before rejecting new work.
-                    if retiring.as_ref().is_some_and(|(_, result)| !matches!(result.try_recv(), Err(mpsc::TryRecvError::Empty))) {
+                    // The previous runner may have finished (or be finishing its
+                    // millisecond SIGKILL reap) when the next request arrives.
+                    if retiring.as_ref().is_some_and(|(_, result)| {
+                        !matches!(
+                            result.recv_timeout(std::time::Duration::from_millis(25)),
+                            Err(mpsc::RecvTimeoutError::Timeout)
+                        )
+                    }) {
                         let (handle, _) = retiring.take().unwrap();
                         let _ = handle.join();
                     }
@@ -2288,7 +2293,12 @@ impl ChannelSupervisor {
                 if let Some(s) = session.as_ref().filter(|s| matches!(s.state, Phase::Active | Phase::Locked)) {
                     if exit.ip != s.baseline.ip { risks.push(("egress_ip_changed".to_owned(), exit.observed_at + session::GUARD_EGRESS_TTL)); }
                     let extra = serde_json::to_value(&s.extra).unwrap_or(Value::Null);
-                    let drift = receipts_store.probe_drift_risk(&extra, now);
+                    let drift = receipts_store.probe_drift_risk_for_network(
+                        &extra,
+                        Some(s.context_id.as_str()),
+                        Some(exit.ip.as_str()),
+                        now,
+                    );
                     if drift["state"] == "risk" {
                         if let (Some(code),Some(at)) = (drift["reason"]["code"].as_str(),drift["observed_at"].as_f64()) {
                             risks.push((code.to_owned(), at + session::RISK_EVIDENCE_TTL));
@@ -2323,7 +2333,12 @@ impl ChannelSupervisor {
                 self.tracks.get(family).and_then(|t| t.process_fence.as_ref()).and_then(|fence| fence.current()))
             {
                 if intent.session_id == s.session_id {
-                    let drift = receipts_store.probe_drift_risk(&serde_json::to_value(&s.extra).unwrap_or(Value::Null), now);
+                    let drift = receipts_store.probe_drift_risk_for_network(
+                        &serde_json::to_value(&s.extra).unwrap_or(Value::Null),
+                        Some(s.context_id.as_str()),
+                        Some(exit.ip.as_str()),
+                        now,
+                    );
                     let still_observed = match intent.risk_code.as_str() {
                         "egress_ip_changed" => exit.ip != s.baseline.ip,
                         "egress_country_cn" => exit.country == "CN",
@@ -2531,11 +2546,20 @@ impl ChannelSupervisor {
             return;
         }
 
+        let unmanaged = self.unmanaged_member_pids.get(family);
+        let has_managed_desktop = track
+            .desktops
+            .iter()
+            .any(|(d, _, _)| !unmanaged.is_some_and(|pids| pids.contains(&d.pid)));
+        let has_managed_process = track
+            .processes
+            .iter()
+            .any(|p| !unmanaged.is_some_and(|pids| pids.contains(&p.pid)));
         self.next_audit_request_id = self.next_audit_request_id.saturating_add(1);
         let req = AsyncAuditRequest {
             request_id: self.next_audit_request_id,
             family: family.into(),
-            target: if track.desktops.is_empty() && !track.processes.is_empty() {
+            target: if !has_managed_desktop && has_managed_process {
                 if family == "claude" { LaunchTarget::ClaudeCli } else { LaunchTarget::CodexCli }
             } else {
                 PolicyCatalog::family(family).and_then(PolicyCatalog::guard_target).unwrap_or_default()
@@ -2936,7 +2960,12 @@ impl ChannelSupervisor {
                 return Ok(());
             };
             track.audit_retry_count = track.audit_retry_count.saturating_add(1);
-            track.audit_retry_not_before = Some(now + async_audit_retry_delay(track.audit_retry_count));
+            let delay = if failure_code == "audit_cleanup_pending" && track.audit_retry_count == 1 {
+                0.2
+            } else {
+                async_audit_retry_delay(track.audit_retry_count)
+            };
+            track.audit_retry_not_before = Some(now + delay);
             let exhausted = track.audit_retry_count >= MAX_ASYNC_AUDIT_RETRIES;
             let code = if exhausted {
                 "async_audit_retry_wait"
@@ -3135,6 +3164,23 @@ impl ChannelSupervisor {
             upstream_endpoint: self.upstream_endpoint.clone(),
             issued_at: now,
         };
+        let silent_renewal = permit.state == ChannelPermitState::Permitted
+            && self.tracks.get(family).is_some_and(|t| {
+                t.permit_generation == permit.permit_generation
+                    && t.session_id == permit.session_id
+                    && t.policy_sync_state == PolicySyncState::Applied
+                    && t.current_permit.as_ref().is_some_and(|old| {
+                        old.state == ChannelPermitState::Permitted
+                            && old.reason_code == permit.reason_code
+                            && old.policy_version == permit.policy_version
+                            && old.vpn_epoch == permit.vpn_epoch
+                    })
+                    && t.latest_receipt.as_ref().is_some_and(|old_r| {
+                        old_r.enforcement_state == ChannelEnforcementState::Forwarding
+                            && old_r.error_code.is_none()
+                    })
+                    && t.commanded_processes == command.allowed_processes
+            });
         if let Some(track) = self.tracks.get_mut(family) {
             track.commanded_processes = command.allowed_processes.clone();
             track.session_id = permit.session_id.clone();
@@ -3144,17 +3190,19 @@ impl ChannelSupervisor {
             track.policy_sync_state = PolicySyncState::PendingApply;
             track.latest_receipt = None;
         }
-        if let Some(logger) = &self.diagnostics {
-            let mut diagnostic = self.diagnostic(Some(family), "command_issued");
-            diagnostic.state = serde_json::to_value(command.permit.state).ok().and_then(|v| v.as_str().map(str::to_owned));
-            diagnostic.reason_code = Some(command.permit.reason_code.clone());
-            logger.record(diagnostic, now);
+        if !silent_renewal {
+            if let Some(logger) = &self.diagnostics {
+                let mut diagnostic = self.diagnostic(Some(family), "command_issued");
+                diagnostic.state = serde_json::to_value(command.permit.state).ok().and_then(|v| v.as_str().map(str::to_owned));
+                diagnostic.reason_code = Some(command.permit.reason_code.clone());
+                logger.record(diagnostic, now);
+            }
         }
         if let Some(enforcer) = self.enforcer.clone() {
             match enforcer.apply_command(&command, now) {
                 Ok(receipt) => {
                     let received_at = self.inline_receipt_clock.map_or(now, |clock| clock());
-                    self.ingest_receipt(receipt, received_at)?;
+                    self.ingest_receipt_inner(receipt, received_at, silent_renewal)?;
                     return Ok(());
                 }
                 Err(error) => {
@@ -3244,15 +3292,32 @@ impl ChannelSupervisor {
     }
 
     fn ingest_receipt(&mut self, receipt: ChannelEnforcementReceipt, receiver_now: f64) -> Result<bool> {
+        self.ingest_receipt_inner(receipt, receiver_now, false)
+    }
+
+    fn ingest_receipt_inner(
+        &mut self,
+        receipt: ChannelEnforcementReceipt,
+        receiver_now: f64,
+        silent_renewal: bool,
+    ) -> Result<bool> {
         let family = receipt.family.clone();
         let expected_boot_id = self.expected_executor_boot_id.clone();
         let mut autonomous_cutoff = None;
         let receipt_for_log = receipt.clone();
-        let changed = self.tracks.get(&family).and_then(|t| t.latest_receipt.as_ref()).is_none_or(|old|
-            old.executor_boot_id != receipt.executor_boot_id || old.command_seq != receipt.command_seq
-            || old.permit_generation != receipt.permit_generation || old.enforcement_state != receipt.enforcement_state
-            || old.error_code != receipt.error_code || old.new_connections_blocked != receipt.new_connections_blocked
-            || old.active_flows_count != receipt.active_flows_count);
+        let changed = self.tracks.get(&family).and_then(|t| t.latest_receipt.as_ref()).is_none_or(|old| {
+            let steady_forwarding = old.enforcement_state == ChannelEnforcementState::Forwarding
+                && receipt.enforcement_state == ChannelEnforcementState::Forwarding
+                && old.error_code.is_none()
+                && receipt.error_code.is_none();
+            old.executor_boot_id != receipt.executor_boot_id
+                || old.command_seq != receipt.command_seq
+                || old.permit_generation != receipt.permit_generation
+                || old.enforcement_state != receipt.enforcement_state
+                || old.error_code != receipt.error_code
+                || old.new_connections_blocked != receipt.new_connections_blocked
+                || (!steady_forwarding && old.active_flows_count != receipt.active_flows_count)
+        });
         let accepted = {
             let Some(track) = self.tracks.get_mut(&family) else {
                 return Ok(false);
@@ -3298,7 +3363,11 @@ impl ChannelSupervisor {
                 true
             }
         };
-        if changed {
+        let suppress_steady_log = silent_renewal
+            && accepted
+            && receipt_for_log.enforcement_state == ChannelEnforcementState::Forwarding
+            && receipt_for_log.error_code.is_none();
+        if changed && !suppress_steady_log {
             if let Some(logger) = &self.diagnostics {
                 let mut diagnostic = self.diagnostic(Some(&family), if accepted { "receipt_received" } else { "receipt_rejected" });
                 diagnostic.executor_boot_id = Some(receipt_for_log.executor_boot_id);

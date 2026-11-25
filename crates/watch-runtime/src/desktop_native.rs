@@ -1008,10 +1008,11 @@ impl<R: ReadRunner, T: Transport, S: AuditSystem + ServiceSystem> DesktopRuntime
         &mut self, enforcer: &crate::channel_enforcer::LocalTunnelEnforcer, families: &[&str],
         round: &crate::sampler::ProcessRound,
     ) -> (std::collections::BTreeMap<String, Value>, Value) {
+        const MAX_IN_FLIGHT_PROBE_SPAN: f64 = 60.0;
         let configs = ConfigStore { storage: self.storage.clone() };
         let result = (|| -> Result<_> {
-            let fresh = || (0.0..=crate::process_disposition::INTENT_TTL).contains(&(native::now() - round.observed_at));
-            if !fresh() { return Err(CoreError::new("process_observation_stale", "本轮进程观察已过期")); }
+            let fresh_at_start = (0.0..=crate::process_disposition::INTENT_TTL).contains(&(native::now() - round.observed_at));
+            if !fresh_at_start { return Err(CoreError::new("process_observation_stale", "本轮进程观察已过期")); }
             let config = configs.load()?;
             let before = self.system.local_from_process_round(&config, self.desktop.target(), round)?;
             let context = before["context_id"].as_str().filter(|s| !s.is_empty())
@@ -1046,17 +1047,18 @@ impl<R: ReadRunner, T: Transport, S: AuditSystem + ServiceSystem> DesktopRuntime
                 }
             }
             let latest = configs.load()?;
-            let mut after = self.system.local_from_process_round(&latest, self.desktop.target(), round)?;
-            if !fresh() { return Err(CoreError::new("process_observation_stale", "出口采样结束时进程观察已经过期")); }
+            let mut after = self.system.local(&latest)?;
+            if !(0.0..=MAX_IN_FLIGHT_PROBE_SPAN).contains(&(native::now() - round.observed_at)) {
+                return Err(CoreError::new("process_observation_stale", "出口采样跨度超时"));
+            }
             if config.value()? != latest.value()? || after["context_id"].as_str() != Some(context)
                 || before["network"] != after["network"]
                 || before["guard_listener"] != after["guard_listener"]
                 || before["guard_identity_evidence"] != after["guard_identity_evidence"] {
                 return Err(CoreError::new("audit_context_changed", "出口采样期间环境变化"));
             }
-            after["environment_observed_at"] = serde_json::json!(round.observed_at
-                .min(before["environment_observed_at"].as_f64().unwrap_or(round.observed_at))
-                .min(after["environment_observed_at"].as_f64().unwrap_or(round.observed_at)));
+            after["environment_observed_at"] = serde_json::json!(native::now()
+                .min(after["environment_observed_at"].as_f64().unwrap_or_else(native::now)));
             Ok((egress, after))
         })();
         result.unwrap_or_else(|error| (

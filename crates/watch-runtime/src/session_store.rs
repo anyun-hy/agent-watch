@@ -205,7 +205,8 @@ impl SessionStore {
             session.extra.insert("adopted_from".into(), json!("running_processes"));
         }
         self.save(&session)?;
-        Ok(session)
+        self.load(now)?
+            .ok_or_else(|| CoreError::new("invalid_session", "受控会话持久化后读取失败"))
     }
     fn require_audit_family(&self, audit: &Value, provider: Option<Provider>) -> Result<()> {
         self.require_audit_family_scope(audit, provider, false)
@@ -229,10 +230,16 @@ impl SessionStore {
     fn anchor_probe_baseline(session: &mut Session, receipts: &crate::receipt_store::ReceiptStore, now: f64) {
         let (mut dns, mut webrtc) = receipts.probe_receipts();
         let usable = |value: &Value, context_key: &str, time_key: &str| {
-            value["status"] == "complete"
+            let within_window = value["status"] == "complete"
                 && value[context_key].as_str() == Some(session.context_id.as_str())
                 && value[time_key].as_f64().is_some_and(|at| at.is_finite()
-                    && (0.0..=session::RISK_EVIDENCE_TTL).contains(&(now - at)))
+                    && (0.0..=session::RISK_EVIDENCE_TTL).contains(&(now - at)));
+            within_window
+                || claude_watch_core::receipts::network_reusable(
+                    value,
+                    &session.context_id,
+                    Some(session.baseline.ip.as_str()),
+                )
         };
         if !usable(&dns, "context", "finished_at") { dns = Value::Null; }
         if !usable(&webrtc, "context_id", "sampled_at") { webrtc = Value::Null; }

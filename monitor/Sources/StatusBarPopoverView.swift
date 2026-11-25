@@ -93,28 +93,25 @@ struct StatusBarPopoverView: View {
     }
 
     private var activeEgress: EgressReference? {
-        if let current = switcher.background?.session_guard?.current,
-           let ip = current.ip, !ip.isEmpty {
-            return current
-        }
-        if let ref = switcher.background?.egress_reference,
-           let ip = ref.ip, !ip.isEmpty {
-            return ref
-        }
-        return nil
+        StatusBarController.resolveActiveEgress(switcher)
     }
 
     private var proxySummaryText: String {
         guard let proxy = store.proxy else {
             return store.proxyError ?? "等待后台代理采样"
         }
+        let mode = modeName(proxy.mode)
+        let rawNode = proxy.mode == "global" ? proxy.globalNode : proxy.selectedNode
+        let activeNode = rawNode.isEmpty ? nil : rawNode
+        if proxy.selectionDiffers {
+            return "\(mode) · 节点与预期不一致"
+        }
+        if let activeNode {
+            return "\(mode) · \(activeNode)"
+        }
         let endpoint = proxy.endpoint
             .replacingOccurrences(of: "http://", with: "")
             .replacingOccurrences(of: "https://", with: "")
-        let mode = modeName(proxy.mode)
-        if proxy.selectionDiffers {
-            return "\(endpoint) · \(mode) · 节点与参照不一致"
-        }
         return "\(endpoint) · \(mode) · \(store.entryTitle)"
     }
 
@@ -145,7 +142,7 @@ struct StatusBarPopoverView: View {
             footerSection
         }
         .padding(14)
-        .frame(width: 332)
+        .frame(width: 368)
         .background(p.background)
         .foregroundStyle(p.text)
         .font(WatchTypography.caption)
@@ -255,14 +252,20 @@ struct StatusBarPopoverView: View {
                     HStack(spacing: 5) {
                         if let code = CountryIdentity.code(egress.country, country: egress.country) {
                             CountryFlag(code: code, width: 14)
+                            Text("\(ip) · \(code)")
+                                .font(WatchTypography.small.weight(.medium))
+                                .monospacedDigit()
+                                .lineLimit(1)
+                        } else {
+                            Text(ip)
+                                .font(WatchTypography.small.weight(.medium))
+                                .monospacedDigit()
+                                .lineLimit(1)
                         }
-                        Text(ip)
-                            .font(WatchTypography.small.weight(.medium))
-                            .monospacedDigit()
-                            .lineLimit(1)
                     }
+                    .fixedSize(horizontal: true, vertical: false)
                 } else {
-                    Text("等待采样")
+                    Text(isRefreshing ? "正在读取…" : "等待采样")
                         .font(WatchTypography.small)
                         .foregroundStyle(p.secondary)
                 }
@@ -347,6 +350,7 @@ struct StatusBarPopoverView: View {
                         .foregroundStyle(status.color)
                         .lineLimit(1)
                 }
+                .fixedSize(horizontal: true, vertical: false)
                 Image(systemName: "chevron.right")
                     .font(.system(size: 9, weight: .semibold))
                     .foregroundStyle(p.secondary.opacity(0.7))
@@ -359,6 +363,10 @@ struct StatusBarPopoverView: View {
 
     private func productStatus(count: Int, channel: FamilyChannelMonitorState?) -> (label: String, color: Color) {
         if let channel {
+            let hasActiveSession = channel.session_id?.isEmpty == false
+            if count == 0 && (!hasActiveSession || channel.reason_code == "idle_no_process") {
+                return ("未运行 · 网关待命", p.secondary)
+            }
             switch channel.display_state {
             case .forwarding:
                 return (count > 0 ? "受控守护 · \(count) 进程" : "通道获准转发", p.mint)
@@ -425,6 +433,27 @@ struct StatusBarPopoverView: View {
                 .background(p.elevated, in: RoundedRectangle(cornerRadius: 7))
             }
             .buttonStyle(.plain)
+
+            if switcher.updateSourceReady {
+                Button {
+                    Task { await store.checkForUpdates() }
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: switcher.updateStatus?.isAvailable == true
+                              ? "arrow.down.circle.fill" : "arrow.triangle.2.circlepath")
+                            .font(.system(size: 10))
+                        Text(store.checkingForUpdate ? "检查中…"
+                             : switcher.updateStatus?.isAvailable == true ? "有新版本" : "检查更新")
+                            .font(WatchTypography.small)
+                    }
+                    .foregroundStyle(switcher.updateStatus?.isAvailable == true ? p.blue : p.secondary)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 5)
+                    .background(p.elevated.opacity(0.6), in: RoundedRectangle(cornerRadius: 7))
+                }
+                .buttonStyle(.plain)
+                .disabled(store.checkingForUpdate || switcher.busy || switcher.hasUnsavedSettings || switcher.isFixture)
+            }
 
             Spacer(minLength: 4)
 

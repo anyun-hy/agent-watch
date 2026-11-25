@@ -275,6 +275,29 @@ fn a_different_context_cannot_seed_a_new_sessions_probe_baseline() {
     assert_eq!(f.sessions("openai").load(1000.).unwrap().unwrap(), pending);
 }
 #[test]
+fn same_network_reusable_receipt_older_than_five_minutes_still_anchors_probe_baseline() {
+    let f = Fixture::new();
+    let mut loc = local("ctx");
+    loc["evidence_network_bound"] = json!(true);
+    loc["evidence_egress_ip"] = json!("1.1.1.1");
+    f.receipts().record_dns(&probe(ProbeKind::Dns, 1000.), &loc, None, 1000.).unwrap();
+    f.receipts().record_webrtc(&probe(ProbeKind::WebRtc, 1000.), &loc, None, 1000.).unwrap();
+    let launch_at = 2500.;
+    let pending = f
+        .sessions("openai")
+        .begin_verified(&f.receipts(), &audit(&f.store, "openai", launch_at), &egress(launch_at), launch_at)
+        .unwrap();
+    assert_eq!(pending.extra["baseline_dns_countries"], json!(["JP"]));
+    assert_eq!(pending.extra["baseline_webrtc_addresses"], json!(["1.1.1.1"]));
+    let drift = f.receipts().probe_drift_risk_for_network(
+        &serde_json::to_value(&pending.extra).unwrap(),
+        Some("ctx"),
+        Some("1.1.1.1"),
+        launch_at + 3600.,
+    );
+    assert_eq!(drift["state"], "safe");
+}
+#[test]
 fn cancellation_starts_no_family_collection() {
     let f = Fixture::new(); f.active("openai"); let mut system = f.mock("claude"); system.cancelled = true;
     let out = background_evidence::refresh_supervised_sessions(&f.store, &mut system).unwrap();

@@ -527,7 +527,7 @@ fn preview_checked(id: &str, options: &Value, merge: Option<&str>, c: &Value, cf
     let protection_only = id.starts_with(CONFIRMED_PROTECTION_PREFIX);
     if protection_only && (options["apply_environment"] != false || options["enable_policy"] != true
         || options["guard_enabled"] != true || options["timezone_watchdog"] != true
-        || options["auto_update"] != cfg.auto_update) {
+        || (options["auto_update"] != cfg.auto_update && options["auto_update"] != true)) {
         return Err(err("invalid_options", "此预览只用于启用 Watch 保镖和时区守护"));
     }
     let mut desired = cfg.value()?;
@@ -572,7 +572,7 @@ fn preview_checked(id: &str, options: &Value, merge: Option<&str>, c: &Value, cf
         .unwrap()
         .iter()
         .filter(|a| {
-            if protection_only { return a["id"] == "watchdog"; }
+            if protection_only { return matches!(text(a, "id"), "watchdog" | "updater"); }
             matches!(text(a, "id"), "watchdog" | "updater")
                 || (options["apply_environment"] == Value::Bool(true)
                     && matches!(text(a, "id"), "timezone" | "locale" | "language" | "ipv6"))
@@ -696,6 +696,9 @@ fn apply_inner<S: OnboardingSystem>(
                 || final_local["watchdog"]["registered"] != (!a["after"].is_null()))
         {
             return Err(err("setting_unconfirmed", "时区守护注册未能确认"));
+        }
+        if k == "updater" && final_local["updater"]["registered"] != a["after"] {
+            return Err(err("setting_unconfirmed", "自动更新任务注册未能确认"));
         }
     }
     if options["apply_environment"] == true

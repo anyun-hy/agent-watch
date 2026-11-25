@@ -30,6 +30,14 @@ pub struct Config {
     pub require_stun: bool,
     pub require_dns: bool,
     pub require_pinned_rules: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpt_require_ipv6_off: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpt_require_stun: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpt_require_dns: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpt_require_pinned_rules: Option<bool>,
     pub guard_enabled: bool,
     pub timezone_watchdog: bool,
     pub auto_update: bool,
@@ -79,6 +87,10 @@ impl Default for Config {
             require_stun: false,
             require_dns: false,
             require_pinned_rules: false,
+            gpt_require_ipv6_off: None,
+            gpt_require_stun: None,
+            gpt_require_dns: None,
+            gpt_require_pinned_rules: None,
             guard_enabled: false,
             timezone_watchdog: false,
             auto_update: false,
@@ -125,6 +137,46 @@ impl Config {
         true
     }
 
+    pub fn is_openai_target(target: crate::processes::LaunchTarget) -> bool {
+        matches!(
+            target.provider(),
+            Provider::Codex | Provider::Chatgpt | Provider::Openai
+        )
+    }
+
+    pub fn require_ipv6_off_for(&self, target: crate::processes::LaunchTarget) -> bool {
+        if Self::is_openai_target(target) {
+            self.gpt_require_ipv6_off.unwrap_or(self.require_ipv6_off)
+        } else {
+            self.require_ipv6_off
+        }
+    }
+
+    pub fn require_dns_for(&self, target: crate::processes::LaunchTarget) -> bool {
+        if Self::is_openai_target(target) {
+            self.gpt_require_dns.unwrap_or(self.require_dns)
+        } else {
+            self.require_dns
+        }
+    }
+
+    pub fn require_stun_for(&self, target: crate::processes::LaunchTarget) -> bool {
+        if Self::is_openai_target(target) {
+            self.gpt_require_stun.unwrap_or(self.require_stun)
+        } else {
+            self.require_stun
+        }
+    }
+
+    pub fn require_pinned_rules_for(&self, target: crate::processes::LaunchTarget) -> bool {
+        if Self::is_openai_target(target) {
+            self.gpt_require_pinned_rules
+                .unwrap_or(self.require_pinned_rules)
+        } else {
+            self.require_pinned_rules
+        }
+    }
+
     pub fn from_value(value: Value) -> Result<Self> {
         let incoming = value.as_object().ok_or_else(|| invalid("配置必须是对象"))?;
         let mut defaults =
@@ -137,11 +189,31 @@ impl Config {
         merged.insert("gpt_force_approved_v1".into(), serde_json::json!([]));
         merged.insert("network_backend".into(), Value::Null);
         merged.insert("vpn_expectation".into(), Value::Null);
+        for key in [
+            "gpt_require_ipv6_off",
+            "gpt_require_stun",
+            "gpt_require_dns",
+            "gpt_require_pinned_rules",
+        ] {
+            merged.insert(key.into(), Value::Null);
+        }
         if incoming.keys().any(|k| !merged.contains_key(k)) {
             return Err(invalid("配置包含未知字段"));
         }
         for (key, value) in incoming {
             let default = &merged[key];
+            if matches!(
+                key.as_str(),
+                "gpt_require_ipv6_off"
+                    | "gpt_require_stun"
+                    | "gpt_require_dns"
+                    | "gpt_require_pinned_rules"
+            ) {
+                if !value.is_null() && !value.is_boolean() {
+                    return Err(invalid(&format!("{key} 必须是布尔值")));
+                }
+                continue;
+            }
             if default.is_boolean() && !value.is_boolean() {
                 return Err(invalid(&format!("{key} 必须是布尔值")));
             }
@@ -692,5 +764,43 @@ mod protection_tests {
         // Unconfigured fields remain their family default ("force" for Claude, "close" for OpenAI)
         assert_eq!(reloaded.action("claude", "dns"), "force");
         assert_eq!(reloaded.action("openai", "ip"), "close");
+    }
+
+    #[test]
+    fn openai_prelaunch_requirements_fall_back_to_global_and_override_independently() {
+        use crate::processes::LaunchTarget;
+
+        let defaults = Config::from_value(json!({
+            "require_ipv6_off": true,
+            "require_dns": true,
+            "require_stun": false,
+            "require_pinned_rules": true
+        }))
+        .unwrap();
+        assert!(defaults.require_ipv6_off_for(LaunchTarget::ClaudeDesktop));
+        assert!(defaults.require_ipv6_off_for(LaunchTarget::ChatgptDesktop));
+        assert!(defaults.require_dns_for(LaunchTarget::CodexDesktop));
+        assert!(!defaults.require_stun_for(LaunchTarget::ChatgptDesktop));
+        assert!(defaults.require_pinned_rules_for(LaunchTarget::CodexCli));
+
+        let customized = Config::from_value(json!({
+            "require_ipv6_off": true,
+            "require_dns": true,
+            "require_stun": false,
+            "require_pinned_rules": true,
+            "gpt_require_ipv6_off": false,
+            "gpt_require_dns": false,
+            "gpt_require_stun": true,
+            "gpt_require_pinned_rules": false
+        }))
+        .unwrap();
+        assert!(customized.require_ipv6_off_for(LaunchTarget::ClaudeDesktop));
+        assert!(!customized.require_ipv6_off_for(LaunchTarget::ChatgptDesktop));
+        assert!(customized.require_dns_for(LaunchTarget::ClaudeDesktop));
+        assert!(!customized.require_dns_for(LaunchTarget::CodexDesktop));
+        assert!(!customized.require_stun_for(LaunchTarget::ClaudeDesktop));
+        assert!(customized.require_stun_for(LaunchTarget::ChatgptDesktop));
+        assert!(customized.require_pinned_rules_for(LaunchTarget::ClaudeDesktop));
+        assert!(!customized.require_pinned_rules_for(LaunchTarget::CodexDesktop));
     }
 }

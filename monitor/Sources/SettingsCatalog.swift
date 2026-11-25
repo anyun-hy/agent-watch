@@ -31,6 +31,10 @@ enum Setting {
     static let requireDNS = FlagSetting(key: "require_dns")
     static let requireStun = FlagSetting(key: "require_stun")
     static let requirePinnedRules = FlagSetting(key: "require_pinned_rules")
+    static let gptRequireIPv6Off = FlagSetting(key: "gpt_require_ipv6_off")
+    static let gptRequireDNS = FlagSetting(key: "gpt_require_dns")
+    static let gptRequireStun = FlagSetting(key: "gpt_require_stun")
+    static let gptRequirePinnedRules = FlagSetting(key: "gpt_require_pinned_rules")
     static let updateURL = TextSetting(key: "update_url")
     static let updatePublicKey = TextSetting(key: "update_public_key")
     static let country = TextSetting(key: "country")
@@ -84,5 +88,53 @@ enum BackgroundServiceCatalog {
         byID[id] ?? .init(symbol: "shield.lefthalf.filled", toggle: nil,
                           enableTitle: "", disableTitle: "", syncTitle: "",
                           note: nil, requiresEnabled: false, requiresSource: false)
+    }
+}
+
+struct PrelaunchGateDescriptor: Identifiable {
+    let id: String
+    let title: String
+    let detail: String
+    let symbol: String
+    let setting: FlagSetting
+    let fallback: FlagSetting?
+    let badge: String?
+
+    static func descriptors(for product: MonitoredProduct) -> [PrelaunchGateDescriptor] {
+        switch product {
+        case .claude:
+            return [
+                .init(id: "claude_ipv6", title: "要求 IPv6 已关闭",
+                      detail: "防止双栈网络下 IPv6 旁路直连", symbol: "network.slash",
+                      setting: Setting.requireIPv6Off, fallback: nil, badge: nil),
+                .init(id: "claude_english", title: "要求客户端使用英文",
+                      detail: "核对客户端首选语言为 en-US", symbol: "character.bubble",
+                      setting: Setting.requireEnglish, fallback: nil, badge: "Claude 专属"),
+                .init(id: "claude_rules", title: "要求代理规则覆盖通过",
+                      detail: "核验 TAG 规则表命中 Claude 域名", symbol: "arrow.triangle.branch",
+                      setting: Setting.requirePinnedRules, fallback: nil, badge: nil),
+                .init(id: "claude_dns", title: "要求 DNS 递归出口无泄漏",
+                      detail: "启动前要求 DNS 探针递归出口通过", symbol: "server.rack",
+                      setting: Setting.requireDNS, fallback: nil, badge: nil),
+                .init(id: "claude_stun", title: "要求 UDP / STUN 出口一致",
+                      detail: "启动前要求 STUN 探针无真实 IP 暴露", symbol: "waveform.path.ecg",
+                      setting: Setting.requireStun, fallback: nil, badge: nil)
+            ]
+        case .openAI:
+            return [
+                .init(id: "gpt_ipv6", title: "要求 IPv6 已关闭",
+                      detail: "防止双栈网络下 IPv6 旁路直连", symbol: "network.slash",
+                      setting: Setting.gptRequireIPv6Off, fallback: Setting.requireIPv6Off, badge: nil),
+                .init(id: "gpt_rules", title: "要求代理规则覆盖通过",
+                      detail: "核验 TAG 规则表覆盖 ChatGPT / Codex", symbol: "arrow.triangle.branch",
+                      setting: Setting.gptRequirePinnedRules, fallback: Setting.requirePinnedRules, badge: nil),
+                .init(id: "gpt_dns", title: "要求 DNS 递归出口无泄漏",
+                      detail: "启动前要求 DNS 探针递归出口通过", symbol: "server.rack",
+                      setting: Setting.gptRequireDNS, fallback: Setting.requireDNS, badge: nil),
+                .init(id: "gpt_stun", title: "要求 UDP / STUN 出口一致",
+                      detail: "启动前要求 STUN 探针无真实 IP 暴露", symbol: "waveform.path.ecg",
+                      setting: Setting.gptRequireStun, fallback: Setting.requireStun, badge: nil)
+            ]
+        }
     }
 }

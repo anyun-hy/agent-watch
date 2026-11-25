@@ -473,8 +473,8 @@ final class MonitorStore: ObservableObject {
         let busy = switcher.readingEnvironment || switcher.busy
         guard environmentRefreshScheduler.claim(context: usableContext, now: Date(), switcherBusy: busy,
               observedAt: snapshot?.proxy.map { Date(timeIntervalSince1970: $0.observedAt) }) != nil else {
-            if case .rustCandidate? = BundledBackendVariant.current() {
-                LeakDiagnosticTrace.shared.schedule(kind: "dns", event: usableContext == nil ? "schedule_context_missing" : busy ? "schedule_busy" : "schedule_deferred")
+            if usableContext == nil, case .rustCandidate? = BundledBackendVariant.current() {
+                LeakDiagnosticTrace.shared.schedule(kind: "dns", event: "schedule_context_missing")
             }
             return
         }

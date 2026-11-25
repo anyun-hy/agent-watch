@@ -6,7 +6,7 @@ private enum GraphNodeID: String {
 }
 
 /// Observe the entry controller itself: MonitorStore does not forward its changes.
-private struct ManagedEntryPanel: View {
+struct ManagedEntryPanel: View {
     @ObservedObject var control: ManagedEntryControl
     let product: MonitoredProduct
     let p: Palette

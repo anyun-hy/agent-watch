@@ -242,6 +242,39 @@ pub fn service_status_with_health<S: ServiceSystem>(
         ]}),
     )
 }
+pub fn latest_egress_reference(store: &StateStore) -> Value {
+    for name in ["last-environment-detection.json", "last-audit.json"] {
+        if let Ok(r) = store.read_json(&store.paths.base().join(name), Value::Null) {
+            let refv = &r["egress_reference"];
+            if !text(refv, "ip").is_empty() {
+                return refv.clone();
+            }
+        }
+    }
+    for family in claude_watch_core::policy::PolicyCatalog::families() {
+        let path = store.paths.session_for(family.id);
+        if let Ok(s) = store.read_json(&path, Value::Null) {
+            let cur = &s["last_check"];
+            if !text(cur, "ip").is_empty() {
+                return json!({
+                    "ip": cur["ip"],
+                    "country": cur["country"],
+                    "checked_at": cur["observed_at"],
+                });
+            }
+            let base = &s["baseline"];
+            if s["state"] == "active" && !text(base, "ip").is_empty() {
+                return json!({
+                    "ip": base["ip"],
+                    "country": base["country"],
+                    "checked_at": base["observed_at"],
+                });
+            }
+        }
+    }
+    Value::Null
+}
+
 fn watchdog_reference(store: &StateStore, now: f64) -> Result<(String, String)> {
     for name in ["last-environment-detection.json", "last-audit.json"] {
         let r = store.read_json(&store.paths.base().join(name), Value::Null)?;

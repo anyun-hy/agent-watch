@@ -194,7 +194,7 @@ struct MonitorView: View {
             store.netCoffee.query = ip
             store.page = .ipScore
         }, channelState: store.channelState(for:), leakChecks: store.leakChecks,
-        netCoffee: store.netCoffee, finished: { store.page = .environment })
+        netCoffee: store.netCoffee, managedEntryControl: store.managedEntryControl, finished: { store.page = .environment })
     }
 
     private func navRow(_ page: Page) -> some View {

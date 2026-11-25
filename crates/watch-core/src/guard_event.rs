@@ -20,7 +20,13 @@ pub const NON_POLICY_REASONS: &[&str] = &[
     "display_receipt_not_authority", "claude_already_running", "pending_cleanup_failed",
     "revalidation_lease_rollback_failed", "backend_unhealthy", "guard_memory_unavailable",
     "guard_encoding_failed", "egress_changed", "state_io_failed", "unsafe_path",
-    "home_owner_mismatch", "clock_unavailable", "sampling_failed", "none", "other",
+    "home_owner_mismatch", "clock_unavailable", "sampling_failed",
+    "active", "idle_no_process", "channel_recovered", "local_guard_unverified",
+    "vpn_observation_unknown", "vpn_observation_stale", "vpn_refresh_pending",
+    "egress_evidence_expired", "permit_lease_expired", "awaiting_recovery_verification",
+    "unmanaged_existing_processes", "process_observation_changed",
+    "process_observation_stale",
+    "none", "other",
 ];
 
 pub fn valid_state(value: &str) -> bool { STATES.contains(&value) }

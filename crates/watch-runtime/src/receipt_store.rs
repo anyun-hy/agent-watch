@@ -274,6 +274,16 @@ impl ReceiptStore {
     /// session extra map. Absolute probe verdicts no longer close sessions;
     /// only a change relative to the session's own baseline does.
     pub fn probe_drift_risk(&self, extra: &Value, now: f64) -> Value {
+        self.probe_drift_risk_for_network(extra, None, None, now)
+    }
+
+    pub fn probe_drift_risk_for_network(
+        &self,
+        extra: &Value,
+        context_id: Option<&str>,
+        current_ip: Option<&str>,
+        now: f64,
+    ) -> Value {
         let empty: Vec<String> = Vec::new();
         let baseline_dns = extra
             .get("baseline_dns_countries")
@@ -296,7 +306,15 @@ impl ReceiptStore {
             })
             .unwrap_or_else(|| empty.clone());
         let (dns, webrtc) = self.probe_receipts();
-        claude_watch_core::risk::probe_drift(&baseline_dns, &baseline_webrtc, &dns, &webrtc, now)
+        claude_watch_core::risk::probe_drift_for_network(
+            &baseline_dns,
+            &baseline_webrtc,
+            &dns,
+            &webrtc,
+            context_id,
+            current_ip,
+            now,
+        )
     }
 
     pub fn session_risk(&self, context: &str, current_ip: Option<&str>, now: f64) -> Value {

@@ -1701,6 +1701,44 @@ impl Drop for DiscoveryWorker {
     }
 }
 
+fn ensure_default_auto_update_enabled<R, T, M>(
+    store: &StateStore,
+    host: &mut claude_watch_runtime::macos::Macos<R, T, M>,
+) where
+    R: claude_watch_runtime::commands::ReadRunner,
+    T: claude_watch_runtime::network_client::Transport,
+    M: claude_watch_runtime::macos::Mutator,
+{
+    use claude_watch_runtime::services::ServiceSystem;
+    let marker = store.paths.watch().join("state/auto-update-default-v1");
+    if marker.exists() || !store.paths.watch().join("runtime/watch-engine").is_file() {
+        return;
+    }
+    let config_store = ConfigStore {
+        storage: store.clone(),
+    };
+    let Ok(mut cfg) = config_store.load() else {
+        return;
+    };
+    if claude_watch_core::release_source::resolve_update_source(
+        &cfg.update_url,
+        &cfg.update_public_key,
+    )
+    .is_none()
+    {
+        return;
+    }
+    if !cfg.auto_update {
+        cfg.auto_update = true;
+        let Ok(val) = cfg.value() else { return };
+        if config_store.save(val).is_err() {
+            return;
+        }
+    }
+    let _ = host.apply_service(&json!({"id": "updater", "after": true}));
+    let _ = store.atomic_bytes(&marker, b"1\n", 0o600);
+}
+
 pub fn run(request: &Request, paths: Paths) -> Result<Value> {
     request.require_apply()?;
     let stop = Arc::new(AtomicBool::new(false));
@@ -1768,12 +1806,16 @@ pub fn run(request: &Request, paths: Paths) -> Result<Value> {
     } else {
         let paths = paths.clone();
         let store = storage.clone();
+        let auto_enable_updater = !request.flag("once");
         let mut runtime = None;
         Some(spawn_baseline(stop.clone(), move || {
             // Construct the adapter once inside this independent worker. A
             // failed observation must never terminate the guard worker.
             if runtime.is_none() {
-                let host = super::runtime::host(paths.clone(), Authority::ExplicitPermit)?;
+                let mut host = super::runtime::host(paths.clone(), Authority::ExplicitPermit)?;
+                if auto_enable_updater {
+                    ensure_default_auto_update_enabled(&store, &mut host);
+                }
                 let desktop = NativeDesktop::new(
                     host.runner.clone(),
                     super::runtime::process_component()?,
@@ -1850,7 +1892,7 @@ pub fn run(request: &Request, paths: Paths) -> Result<Value> {
                     let enforcer = channel_stack.enforcer.clone();
                     let collector = thread::Builder::new().name("watch-guard-collector".into())
                         .spawn(move || -> Result<()> {
-                            const ACTIVE_EGRESS_RECHECK_INTERVAL: Duration = Duration::from_secs(30);
+                            const ACTIVE_EGRESS_RECHECK_INTERVAL: Duration = Duration::from_secs(600);
                             let controller = Controller::new(store.clone());
                             let network = host.network.clone();
                             let mut runtime = DesktopRuntime {

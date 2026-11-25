@@ -227,6 +227,7 @@ fn background_from_frame(host: &Host, config: &claude_watch_core::config::Config
     let mut value = services::service_status_with_health(host, config, health, now)?;
     enrich_background_services(&mut value);
     value["session_guard"] = session_view_from_frame(host, frame.value(), evidence, now);
+    value["egress_reference"] = services::latest_egress_reference(&host.storage);
     Ok(value)
 }
 pub fn dispatch_read(request: &Request, paths: Paths) -> Result<Option<Value>> {

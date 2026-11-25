@@ -151,11 +151,12 @@ pub fn guard_round_matches_for_owner(
     backend: &std::path::Path,
     backend_owner_pid: Option<u32>,
 ) -> bool {
-    let context = |round: &ProcessRound| -> Option<Value> {
+    const MAX_IN_FLIGHT_PROBE_SPAN: f64 = 60.0;
+    let context = |round: &ProcessRound, max_age: f64| -> Option<Value> {
         let observation = round.system_processes.as_ref()?;
         let now = native::now();
         if ![round.observed_at, observation.observed_at].iter()
-            .all(|at| (0.0..=crate::process_disposition::INTENT_TTL).contains(&(now - at))) { return None; }
+            .all(|at| (0.0..=max_age).contains(&(now - at))) { return None; }
         let processes = observation.processes.as_ref().ok()?.iter()
             .filter(|(pid, row)| guard_process_candidate(**pid, row, round.uid, backend, backend_owner_pid))
             .map(|(pid, row)| json!({"pid":pid,"uid":row["uid"],"executable":row["executable"],"stamp":row["stamp"],
@@ -164,7 +165,15 @@ pub fn guard_round_matches_for_owner(
             .collect::<Vec<_>>();
         Some(json!({"uid":round.uid,"processes":processes}))
     };
-    context(current).zip(context(newer)).is_some_and(|(current, newer)| current == newer)
+    let same_round = current.observed_at == newer.observed_at;
+    let newer_ttl = if same_round {
+        MAX_IN_FLIGHT_PROBE_SPAN
+    } else {
+        crate::process_disposition::INTENT_TTL
+    };
+    context(current, MAX_IN_FLIGHT_PROBE_SPAN)
+        .zip(context(newer, newer_ttl))
+        .is_some_and(|(current, newer)| current == newer)
 }
 
 struct BackendFacts {

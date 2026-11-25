@@ -237,7 +237,7 @@ pub fn spawn(paths: Paths, stop: Arc<AtomicBool>) -> Result<EvidenceWorker> {
                 if status != "idle"
                     && (count > 0
                         || signature != last_report
-                        || last_report_at.elapsed() >= Duration::from_secs(300))
+                        || last_report_at.elapsed() >= Duration::from_secs(1800))
                 {
                     let _ = events.append(
                         "background-evidence",

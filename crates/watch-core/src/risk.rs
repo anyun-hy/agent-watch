@@ -301,8 +301,34 @@ pub fn probe_drift(
     webrtc_receipt: &Value,
     now: f64,
 ) -> Value {
-    let dns_ready = probe_fresh(dns_receipt, "finished_at", now);
-    let rtc_ready = probe_fresh(webrtc_receipt, "sampled_at", now);
+    probe_drift_for_network(
+        baseline_dns,
+        baseline_webrtc,
+        dns_receipt,
+        webrtc_receipt,
+        None,
+        None,
+        now,
+    )
+}
+
+pub fn probe_drift_for_network(
+    baseline_dns: &[String],
+    baseline_webrtc: &[String],
+    dns_receipt: &Value,
+    webrtc_receipt: &Value,
+    context_id: Option<&str>,
+    current_ip: Option<&str>,
+    now: f64,
+) -> Value {
+    let valid_ctx = context_id.filter(|s| !s.is_empty());
+    let valid_ip = current_ip.filter(|s| !s.is_empty());
+    let dns_reused = valid_ctx
+        .is_some_and(|ctx| crate::receipts::network_reusable(dns_receipt, ctx, valid_ip));
+    let rtc_reused = valid_ctx
+        .is_some_and(|ctx| crate::receipts::network_reusable(webrtc_receipt, ctx, valid_ip));
+    let dns_ready = dns_reused || probe_fresh(dns_receipt, "finished_at", now);
+    let rtc_ready = rtc_reused || probe_fresh(webrtc_receipt, "sampled_at", now);
     let (current_dns, current_rtc) = probe_fingerprint(dns_receipt, webrtc_receipt);
     let dns_state = probe_state(dns_ready, baseline_dns, &current_dns);
     let rtc_state = probe_state(rtc_ready, baseline_webrtc, &current_rtc);

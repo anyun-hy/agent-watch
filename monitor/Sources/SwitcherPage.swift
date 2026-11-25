@@ -24,9 +24,11 @@ struct SwitcherPage: View {
     var channelState: (MonitoredProduct) -> FamilyChannelMonitorState? = { _ in nil }
     var leakChecks: LeakCheckStore? = nil
     var netCoffee: NetCoffeeStore? = nil
+    var managedEntryControl: ManagedEntryControl? = nil
     let finished: () -> Void
     @State private var showEnvironmentAdjustment = false
     @State private var showSettings = false
+    @State private var showVpnEditor = false
     @State private var policyProduct: MonitoredProduct = .claude
     @State private var showSource = false
     @State private var showMigration = false
@@ -579,151 +581,326 @@ struct SwitcherPage: View {
     /// catalog instead of one shape copied per service.
     private var protectionPolicyPanel: some View {
         let policy = AIPolicyCatalog.service(for: policyProduct)
+        let gates = PrelaunchGateDescriptor.descriptors(for: policyProduct)
+        let columns = [GridItem(.flexible(), spacing: 12), GridItem(.flexible(), spacing: 12)]
         return Surface(p) {
-            VStack(alignment: .leading, spacing: 10) {
-                HStack {
-                    SectionHeading(title: "会话处置策略", p: p)
-                    Spacer()
-                    Picker("策略适用的应用", selection: $policyProduct) {
-                        ForEach(MonitoredProduct.allCases) { Text($0.title).tag($0) }
-                    }.pickerStyle(.segmented).labelsHidden().fixedSize()
+            VStack(alignment: .leading, spacing: 14) {
+                // Header: 02 · AI 应用专属配置 + Brand Pill Switcher + Live Channel Badge
+                HStack(alignment: .center, spacing: 10) {
+                    Text("02 · AI 应用配置")
+                        .font(WatchTypography.small.weight(.semibold))
+                        .foregroundStyle(p.secondary)
+                        .padding(.horizontal, 8).padding(.vertical, 3)
+                        .background(p.elevated, in: RoundedRectangle(cornerRadius: 5))
+                    HStack(spacing: 4) {
+                        ForEach(MonitoredProduct.allCases) { product in
+                            let selected = policyProduct == product
+                            Button {
+                                withAnimation(.easeInOut(duration: 0.15)) { policyProduct = product }
+                            } label: {
+                                HStack(spacing: 6) {
+                                    BrandLogo(brand: product == .claude ? .claude : .chatgpt, size: 14)
+                                    Text(product.title)
+                                        .font(selected ? WatchTypography.captionStrong : WatchTypography.caption)
+                                }
+                                .foregroundStyle(selected ? p.text : p.secondary)
+                                .padding(.horizontal, 11).padding(.vertical, 5)
+                                .background(
+                                    selected ? p.surface : Color.clear,
+                                    in: RoundedRectangle(cornerRadius: 6)
+                                )
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 6)
+                                        .strokeBorder(selected ? p.border.opacity(0.85) : Color.clear, lineWidth: 1)
+                                )
+                                .contentShape(Rectangle())
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                    .padding(3)
+                    .background(p.elevated, in: RoundedRectangle(cornerRadius: 8))
+                    Spacer(minLength: 8)
+                    Badge(
+                        text: channelState(policyProduct)?.protectionScopeLabel ?? "通道回执待读取",
+                        color: p.mint
+                    )
+                    PageLink(title: "查看连接路径", p: p) { openNetwork(policyProduct) }
                 }
-                Text(policy.subtitle).font(WatchTypography.caption).foregroundStyle(p.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-                ForEach(policy.criteria) { criterion in
-                    Divider()
-                    policyCell(criterion, in: policy)
-                }
-                if let note = policy.note {
-                    InlineNotice(title: "可配置动作少于 Claude", detail: note,
-                                 symbol: "exclamationmark.triangle", tint: p.amber, p: p)
-                }
+
                 Divider()
-                if store.hasUnsavedSettings {
-                    draftActions
-                } else {
-                    Label(channelState(policyProduct)?.policy_sync_label_zh ?? "执行回执待读取",
-                          systemImage: "doc.text.magnifyingglass")
-                        .font(WatchTypography.caption).foregroundStyle(p.secondary)
+
+                // Sub-panel A: 受控桌面入口 (Opt-in) & Claude 会话详情
+                VStack(alignment: .leading, spacing: 10) {
+                    if let entryControl = managedEntryControl {
+                        ManagedEntryPanel(control: entryControl, product: policyProduct, p: p)
+                            .clipShape(RoundedRectangle(cornerRadius: 9))
+                            .overlay(RoundedRectangle(cornerRadius: 9).strokeBorder(p.border.opacity(0.6), lineWidth: 1))
+                    }
+                    if policyProduct == .claude, let evidence = store.sessionDisplayEvidence {
+                        DisclosureGroup("Claude 当前会话基线详情") {
+                            sessionGuardCard(evidence).padding(.top, 8)
+                        }
+                        .disclosureGroupStyle(FullWidthDisclosureStyle(p: p))
+                    }
+                }
+
+                Divider()
+
+                // Sub-panel B: 启动前门禁要求（按当前所选 AI 应用独立配置）
+                VStack(alignment: .leading, spacing: 10) {
+                    HStack(alignment: .firstTextBaseline) {
+                        Label("\(policyProduct.title) 启动前门禁要求", systemImage: "checkmark.shield")
+                            .font(WatchTypography.bodyStrong).foregroundStyle(p.text)
+                        Spacer()
+                        Text("开启项未通过时将阻止受控启动；未开启项仅检测提示")
+                            .font(WatchTypography.small).foregroundStyle(p.secondary)
+                    }
+                    LazyVGrid(columns: columns, spacing: 10) {
+                        ForEach(gates) { gate in
+                            prelaunchGateCard(gate)
+                        }
+                    }
+                    ForEach(store.policyWarnings, id: \.self) {
+                        Text($0).font(WatchTypography.small).foregroundStyle(p.amber)
+                    }
+                }
+                .disabled(store.busy || !store.loaded)
+
+                Divider()
+
+                // Sub-panel C: 运行中异常处置策略（按当前所选 AI 应用独立配置）
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack(alignment: .firstTextBaseline) {
+                        Label(policy.title, systemImage: "bolt.shield")
+                            .font(WatchTypography.bodyStrong).foregroundStyle(p.text)
+                        Spacer()
+                    }
+                    Text(policy.subtitle)
+                        .font(WatchTypography.small).foregroundStyle(p.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    VStack(spacing: 0) {
+                        ForEach(Array(policy.criteria.enumerated()), id: \.element.id) { index, criterion in
+                            if index > 0 { Divider() }
+                            policyCell(criterion, in: policy)
+                                .padding(.horizontal, 12).padding(.vertical, 8)
+                        }
+                    }
+                    .background(p.elevated.opacity(0.35), in: RoundedRectangle(cornerRadius: 9))
+                    .overlay(RoundedRectangle(cornerRadius: 9).strokeBorder(p.border.opacity(0.6), lineWidth: 1))
+                    if let note = policy.note {
+                        InlineNotice(title: "可配置动作少于 Claude", detail: note,
+                                     symbol: "exclamationmark.triangle", tint: p.amber, p: p)
+                    }
+                }
+                .disabled(store.busy || !store.loaded)
+
+                Divider()
+
+                // Sub-panel D: 当前 AI 应用卡片底部一体化保存栏
+                HStack(alignment: .center, spacing: 12) {
+                    Label(
+                        store.hasUnsavedSettings
+                            ? "当前有未保存的 \(policyProduct.title) 保护策略修改"
+                            : (channelState(policyProduct)?.policy_sync_label_zh ?? "当前应用保护策略已同步"),
+                        systemImage: store.hasUnsavedSettings ? "pencil.circle.fill" : "checkmark.circle"
+                    )
+                    .font(WatchTypography.caption)
+                    .foregroundStyle(store.hasUnsavedSettings ? p.amber : p.secondary)
+                    Spacer()
+                    if store.hasUnsavedSettings {
+                        Button("撤销未保存修改") { store.discardChanges() }
+                            .disabled(store.busy)
+                    }
+                    Button("保存 \(policyProduct.title) 设置") {
+                        Task { await store.save(); await store.refreshBackground() }
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(!store.hasUnsavedSettings || store.busy)
                 }
             }
         }
     }
+
+    private func prelaunchGateCard(_ gate: PrelaunchGateDescriptor) -> some View {
+        let isEnabled = store.isOn(gate.setting, fallback: gate.fallback)
+        return HStack(alignment: .center, spacing: 10) {
+            Image(systemName: gate.symbol)
+                .font(.system(size: 13, weight: .medium))
+                .foregroundStyle(isEnabled ? p.blue : p.secondary)
+                .frame(width: 26, height: 26)
+                .background(p.elevated, in: RoundedRectangle(cornerRadius: 6))
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(spacing: 6) {
+                    Text(gate.title).font(WatchTypography.captionStrong).foregroundStyle(p.text)
+                    if let badge = gate.badge {
+                        Text(badge)
+                            .font(WatchTypography.small)
+                            .foregroundStyle(p.blue)
+                            .padding(.horizontal, 5).padding(.vertical, 1)
+                            .background(p.blue.opacity(0.1), in: RoundedRectangle(cornerRadius: 4))
+                    }
+                }
+                Text(gate.detail)
+                    .font(WatchTypography.small)
+                    .foregroundStyle(p.secondary)
+                    .lineLimit(1)
+            }
+            Spacer(minLength: 6)
+            Toggle(gate.title, isOn: store.flag(gate.setting, fallback: gate.fallback))
+                .toggleStyle(.switch)
+                .controlSize(.small)
+                .labelsHidden()
+        }
+        .padding(10)
+        .background(
+            isEnabled ? p.blue.opacity(0.05) : p.elevated.opacity(0.35),
+            in: RoundedRectangle(cornerRadius: 9)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 9)
+                .strokeBorder(isEnabled ? p.blue.opacity(0.35) : p.border.opacity(0.6), lineWidth: 1)
+        )
+    }
+
     private func policyCell(_ criterion: PolicyCriterion, in policy: AIServicePolicy) -> some View {
-        HStack(spacing: 14) {
+        let selected = store.choice(policy.setting(criterion)).wrappedValue
+        let actionTint: Color = selected == "force" ? p.red : selected == "close" ? p.amber : p.blue
+        return HStack(spacing: 12) {
+            Circle().fill(actionTint).frame(width: 6, height: 6)
             Text(criterion.title).font(WatchTypography.body)
             Spacer(minLength: 8)
             Picker(criterion.title, selection: store.choice(policy.setting(criterion))) {
                 ForEach(policy.actions) { Text($0.title).tag($0.id) }
             }
             .labelsHidden()
-            .frame(width: 165)
+            .frame(width: 150)
             .disabled(policy.actions.count < 2)
             .help("选择此应用遇到该项风险时的处置")
         }
     }
+
+    private var draftActions: some View {
+        HStack(spacing: 10) {
+            Button("保存设置") { Task { await store.save(); await store.refreshBackground() } }
+                .buttonStyle(.borderedProminent).disabled(!store.hasUnsavedSettings || store.busy)
+            if store.hasUnsavedSettings {
+                Button("撤销未保存修改") { store.discardChanges() }.disabled(store.busy)
+                Text("未保存").font(WatchTypography.small).foregroundStyle(p.amber)
+            }
+        }
+    }
+
+    private var globalInfrastructurePanel: some View {
+        let columns = [GridItem(.flexible(), spacing: 12), GridItem(.flexible(), spacing: 12)]
+        return Surface(p) {
+            VStack(alignment: .leading, spacing: 14) {
+                HStack(alignment: .center, spacing: 10) {
+                    Text("01 · 公用底座")
+                        .font(WatchTypography.small.weight(.semibold))
+                        .foregroundStyle(p.secondary)
+                        .padding(.horizontal, 8).padding(.vertical, 3)
+                        .background(p.elevated, in: RoundedRectangle(cornerRadius: 5))
+                    SectionHeading(title: "全局守护服务与 VPN 监督基线", p: p)
+                    Spacer(minLength: 8)
+                    if let result = store.background {
+                        Text(result.evidenceSummary + " · " + timeLabel(result.observed_at))
+                            .font(WatchTypography.small).foregroundStyle(p.secondary)
+                    }
+                }
+
+                if let result = store.background {
+                    TimelineView(.explicit(evidenceDisplayDates(until: result.observed_at + 35))) { context in
+                        let stale = !store.backgroundError.isEmpty || context.date.timeIntervalSince1970 - result.observed_at > 35
+                        LazyVGrid(columns: columns, spacing: 10) {
+                            ForEach(result.services) { service in
+                                serviceCard(service, stale: stale)
+                            }
+                        }
+                    }
+                } else {
+                    Text(store.busy ? "正在读取后台…" : "尚无后台状态，请刷新。")
+                        .font(WatchTypography.caption).foregroundStyle(p.secondary).padding(.vertical, 6)
+                }
+
+                Divider()
+
+                vpnExpectationSection
+            }
+        }
+    }
+
+    private func serviceCard(_ service: BackgroundServiceRow, stale: Bool) -> some View {
+        let descriptor = BackgroundServiceCatalog.descriptor(service.id)
+        let tint = stale ? p.secondary : service.healthy ? p.mint : service.state == "inactive" ? p.secondary : p.amber
+        return DisclosureGroup {
+            VStack(alignment: .leading, spacing: 7) {
+                if let summary = service.evidenceSummary {
+                    Text(summary).font(WatchTypography.small).foregroundStyle(p.secondary)
+                }
+                if let desired = service.desired {
+                    Text("保存设置：" + (desired ? "开启" : "关闭") + " · 实际状态见回读结果")
+                        .font(WatchTypography.small).foregroundStyle(p.secondary)
+                }
+                if let successful = service.last_success_at {
+                    Text("最近有效巡检：" + timeLabel(successful)).font(WatchTypography.small).foregroundStyle(p.secondary)
+                }
+                if let checked = service.last_checked {
+                    Text("最近检查：" + timeLabel(checked)).font(WatchTypography.small).foregroundStyle(p.secondary)
+                }
+                HStack {
+                    serviceControls(service, descriptor)
+                }
+                .controlSize(.small)
+                .disabled(store.busy || store.hasUnsavedSettings)
+                Text("来源：" + service.source).font(WatchTypography.small).foregroundStyle(p.secondary)
+            }
+            .padding(.top, 8)
+        } label: {
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(spacing: 8) {
+                    Image(systemName: descriptor.symbol)
+                        .font(.system(size: 13, weight: .medium))
+                        .foregroundStyle(p.blue)
+                        .frame(width: 24, height: 24)
+                        .background(p.elevated, in: RoundedRectangle(cornerRadius: 6))
+                    Text(service.title).font(WatchTypography.bodyStrong).lineLimit(1)
+                    Spacer(minLength: 4)
+                    Badge(text: stale ? "上次状态" : service.statusLabel, color: tint)
+                }
+                Text(service.detail)
+                    .font(WatchTypography.small)
+                    .foregroundStyle(p.secondary)
+                    .lineLimit(1)
+            }
+        }
+        .disclosureGroupStyle(FullWidthDisclosureStyle(p: p))
+        .padding(10)
+        .background(p.elevated.opacity(0.35), in: RoundedRectangle(cornerRadius: 9))
+        .overlay(RoundedRectangle(cornerRadius: 9).strokeBorder(p.border.opacity(0.6), lineWidth: 1))
+    }
+
     private var protectionContent: some View {
         Group {
-            if !store.backgroundError.isEmpty { InlineNotice(title: "后台状态读取未完成", detail: store.backgroundError, symbol: "exclamationmark.triangle", tint: p.amber, p: p) }
-            Surface(p) {
-                SectionHeading(title: "当前会话保护", p: p).padding(.bottom, 12)
-                HStack(alignment: .top, spacing: 20) {
-                    ForEach(MonitoredProduct.allCases) { product in
-                        if product != .claude { Divider() }
-                        Button { openNetwork(product) } label: {
-                            HStack(alignment: .top, spacing: 10) {
-                                BrandLogo(brand: product == .claude ? .claude : .chatgpt, size: 18)
-                                VStack(alignment: .leading, spacing: 6) {
-                                    Text(product.title).font(WatchTypography.bodyStrong)
-                                    Text(channelState(product)?.protectionScopeLabel ?? "通道回执待读取")
-                                        .font(WatchTypography.caption).foregroundStyle(p.secondary)
-                                }
-                                Spacer(minLength: 0)
-                                Image(systemName: "chevron.right").foregroundStyle(p.blue)
-                            }.contentShape(Rectangle())
-                        }.buttonStyle(.plain).help("查看" + product.title + "的连接与保护回执")
-                    }
-                }.fixedSize(horizontal: false, vertical: true)
-                if let evidence = store.sessionDisplayEvidence {
-                    Divider().padding(.vertical, 9)
-                    DisclosureGroup("Claude 会话详情") { sessionGuardCard(evidence).padding(.top, 8) }
-                        .disclosureGroupStyle(FullWidthDisclosureStyle(p: p))
-                }
+            if !store.backgroundError.isEmpty {
+                InlineNotice(title: "后台状态读取未完成", detail: store.backgroundError, symbol: "exclamationmark.triangle", tint: p.amber, p: p)
             }
             if let facts = store.background?.facts, facts.state == "fail" {
                 InlineNotice(title: "当前保护风险", detail: facts.risks?.compactMap { $0.reason ?? $0.id }.joined(separator: "\n") ?? "后端已报告当前风险。",
                              symbol: "exclamationmark.shield", tint: p.red, p: p)
             }
-            Surface(p) {
-                SectionHeading(title: "后台服务", p: p)
-                if let result = store.background {
-                    Text(result.evidenceSummary + " · " + timeLabel(result.observed_at))
-                        .font(WatchTypography.small).foregroundStyle(p.secondary).padding(.vertical, 6)
-                    serviceRows(result.services.filter { !isMaintenanceService($0) }, observedAt: result.observed_at)
-                } else {
-                    Text(store.busy ? "正在读取后台…" : "尚无后台状态，请刷新。")
-                        .font(WatchTypography.caption).foregroundStyle(p.secondary).padding(.top, 8)
-                }
-            }
-            protectionPolicyPanel
-            if let result = store.background {
-                let maintenance = result.services.filter(isMaintenanceService)
-                if !maintenance.isEmpty {
-                    Surface(p) {
-                        DisclosureGroup {
-                            serviceRows(maintenance, observedAt: result.observed_at)
-                        } label: {
-                            Text("时区守护与自动更新").font(WatchTypography.bodyStrong)
-                        }.disclosureGroupStyle(FullWidthDisclosureStyle(p: p))
-                    }
-                }
-            }
             recoveryPanel
+            globalInfrastructurePanel
+            protectionPolicyPanel
             Surface(p) {
-                DisclosureGroup("启动要求与高级维护", isExpanded: $showSettings) { settingsPanel.padding(.top, 14) }
-                    .disclosureGroupStyle(FullWidthDisclosureStyle(p: p))
-            }
-        }
-    }
-    private func isMaintenanceService(_ service: BackgroundServiceRow) -> Bool {
-        service.id == "watchdog" || service.id == "updater"
-    }
-
-    private func serviceRows(_ services: [BackgroundServiceRow], observedAt: Double) -> some View {
-        TimelineView(.explicit(evidenceDisplayDates(until: observedAt + 35))) { context in
-            let stale = !store.backgroundError.isEmpty || context.date.timeIntervalSince1970 - observedAt > 35
-            ForEach(services) { service in
-                Divider()
-                serviceRow(service, stale: stale)
+                DisclosureGroup("底层发布源与系统辅助维护", isExpanded: $showSettings) {
+                    settingsPanel.padding(.top, 12)
+                }
+                .disclosureGroupStyle(FullWidthDisclosureStyle(p: p))
             }
         }
     }
 
-    private func serviceRow(_ service: BackgroundServiceRow, stale: Bool) -> some View {
-        let descriptor = BackgroundServiceCatalog.descriptor(service.id)
-        let tint = stale ? p.secondary : service.healthy ? p.mint : service.state == "inactive" ? p.secondary : p.amber
-        return DisclosureGroup {
-            VStack(alignment: .leading, spacing: 8) {
-                Text(service.detail).font(WatchTypography.body).fixedSize(horizontal: false, vertical: true)
-                if let summary = service.evidenceSummary { Text(summary).font(WatchTypography.small).foregroundStyle(p.secondary) }
-                if let desired = service.desired { Text("保存设置：" + (desired ? "开启" : "关闭") + " · 实际状态见回读结果").font(WatchTypography.small).foregroundStyle(p.secondary) }
-                if let successful = service.last_success_at { Text("最近有效巡检：" + timeLabel(successful)).font(WatchTypography.small).foregroundStyle(p.secondary) }
-                if let checked = service.last_checked { Text("最近检查：" + timeLabel(checked)).font(WatchTypography.small).foregroundStyle(p.secondary) }
-                HStack {
-                    serviceControls(service, descriptor)
-                }.disabled(store.busy || store.hasUnsavedSettings)
-                Text("来源：" + service.source).font(WatchTypography.small).foregroundStyle(p.secondary)
-            }.padding(.bottom, 10)
-        } label: {
-            HStack(spacing: 9) {
-                Image(systemName: descriptor.symbol).foregroundStyle(p.blue)
-                    .frame(width: 26, height: 26).background(p.elevated, in: RoundedRectangle(cornerRadius: 6))
-                Text(service.title).font(WatchTypography.bodyStrong)
-                Spacer(minLength: 4)
-                Badge(text: stale ? "上次状态" : service.statusLabel, color: tint)
-            }.padding(.vertical, 7)
-        }.disclosureGroupStyle(FullWidthDisclosureStyle(p: p))
-    }
     /// What a service offers is read from its descriptor — which setting its
     /// switch owns, how the action reads and what it requires first — instead
     /// of comparing the service id against a list of known names.
@@ -785,105 +962,93 @@ struct SwitcherPage: View {
         value.tone == "danger" ? p.red : value.tone == "warning" ? p.amber : value.tone == "success" ? p.mint : p.secondary
     }
     private var settingsPanel: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            Text("这一节只决定启动前哪些检查会阻止受控启动；运行中会话的处置由上面的「会话处置策略」决定，两处互不替代。")
-                .font(WatchTypography.caption).foregroundStyle(p.secondary).fixedSize(horizontal: false, vertical: true)
-            Text("代理客户端、地区、时区和网络服务使用自动识别与已确认的参考，不提供手工软件选择。以下要求继续参与启动预检。")
+        VStack(alignment: .leading, spacing: 12) {
+            Text(store.updateSourceIsBuiltin
+                 ? "已内置官方 GitHub 发布源（anyun-hy/agent-watch），日常检查更新请直接使用左下角「检查更新」；下方仅在需要自定义测试源或维护系统辅助组件时使用。"
+                 : "此处供本项目发布维护使用。未内置公钥且未手动填写发布源与固定公钥时，自动更新显示尚不可用。")
                 .font(WatchTypography.caption).foregroundStyle(p.secondary)
-            Text("受控启动按当前实测环境独立检查；无需填写国家、时区、DNS 或出口 IP。")
-                .font(WatchTypography.small).foregroundStyle(p.secondary)
-            Toggle("启动前要求 IPv6 已关闭", isOn: store.flag(Setting.requireIPv6Off))
-            Toggle("启动前要求 Claude 使用英文", isOn: store.flag(Setting.requireEnglish))
-            Label("DNS 与 UDP/STUN 探针", systemImage: "lock.shield")
-                .font(WatchTypography.bodyStrong).foregroundStyle(p.text)
-            Text("两项检测始终运行并在面板显示结果。它们测量的是探针自身的 UDP/DNS 路径，不代表 Claude 的实际连接；默认只提示、不阻止受控启动。勾选后对应探针失败将阻止受控启动。运行中的会话由「Claude 会话处置策略」按出口变化处置，与这里的开关无关。")
-                .font(WatchTypography.caption).foregroundStyle(p.secondary).fixedSize(horizontal: false, vertical: true)
-            Toggle("启动前要求 DNS 递归出口无泄漏", isOn: store.flag(Setting.requireDNS))
-            Toggle("启动前要求 UDP/STUN 出口一致", isOn: store.flag(Setting.requireStun))
-            ForEach(store.policyWarnings, id: \.self) { Text($0).font(WatchTypography.caption).foregroundStyle(p.amber) }
-            Toggle("启动前要求代理规则覆盖通过", isOn: store.flag(Setting.requirePinnedRules))
-            vpnExpectationSection
-            DisclosureGroup("发布源与工具维护", isExpanded: $showSource) {
-                VStack(alignment: .leading, spacing: 12) {
-                    Text(store.updateSourceIsBuiltin
-                         ? "已内置官方 GitHub 发布源（anyun-hy/agent-watch），无需手动填写即可检查与更新；下方仅在需要自定义测试源时覆盖。"
-                         : "此处供本项目发布维护使用。未内置公钥且未手动填写发布源与固定公钥时，自动更新显示尚不可用。")
-                    TextField("本项目 HTTPS 发布清单（留空则使用内置源）", text: store.text(Setting.updateURL)).textFieldStyle(.roundedBorder)
-                    Text("固定 RSA 公钥（PEM，留空则使用内置公钥）").font(WatchTypography.caption)
-                    TextEditor(text: store.text(Setting.updatePublicKey)).font(WatchTypography.mono).frame(height: 100)
-                    HStack {
-                        Button("检查本项目更新") {
-                            Task {
-                                await store.perform(["update"], refresh: false)
-                                updateResult = store.failure ? nil : store.message
-                            }
-                        }.disabled(!store.updateSourceReady || store.hasUnsavedSettings)
-                        if let available = store.updateStatus, available.isAvailable {
-                            Button("下载并安装 \(available.versionLabel)…") {
-                                confirm(
-                                    "下载并安装更新 \(available.versionLabel)",
-                                    "将从已验签发布源下载完整更新并保留全部配置、账号与初始化状态（无需重新初始化）。替换期间将短暂关闭监控窗口，如核心网关组件变动将请求一次管理员授权，完成后自动重开新版。",
-                                    ["update", "--apply", "--detach", "--relaunch"],
-                                    action: "下载并安装更新"
-                                )
-                            }.buttonStyle(.borderedProminent).disabled(store.busy || store.hasUnsavedSettings)
-                        }
-                        Button("更新系统辅助组件…") {
-                            confirm("更新系统辅助组件", "需要管理员认证，更新本工具固定辅助程序；不会切换时区、语言或原版保镖。", ["services", "refresh-admin", "--apply"], action: "更新辅助组件")
-                        }.disabled(store.hasUnsavedSettings)
-                        Button("查看操作记录") { Task { await store.perform(["logs"], refresh: false); showLogs = !store.failure } }
-                    }
-                    if let updateResult { Text(updateResult).textSelection(.enabled) }
-                }.font(WatchTypography.caption).padding(.top, 12)
-            }.disclosureGroupStyle(FullWidthDisclosureStyle(p: p))
-        }.disabled(store.busy || !store.loaded)
+            TextField("本项目 HTTPS 发布清单（留空则使用内置源）", text: store.text(Setting.updateURL)).textFieldStyle(.roundedBorder)
+            Text("固定 RSA 公钥（PEM，留空则使用内置公钥）").font(WatchTypography.caption)
+            TextEditor(text: store.text(Setting.updatePublicKey)).font(WatchTypography.mono).frame(height: 84)
+            HStack(spacing: 10) {
+                if store.hasUnsavedSettings {
+                    Button("保存发布源设置") { Task { await store.save(); await store.refreshBackground() } }
+                        .buttonStyle(.borderedProminent).disabled(store.busy)
+                    Button("撤销修改") { store.discardChanges() }.disabled(store.busy)
+                }
+                Button("更新系统辅助组件…") {
+                    confirm("更新系统辅助组件", "需要管理员认证，更新本工具固定辅助程序；不会切换时区、语言或原版保镖。", ["services", "refresh-admin", "--apply"], action: "更新辅助组件")
+                }.disabled(store.hasUnsavedSettings)
+                Button("查看操作记录") { Task { await store.perform(["logs"], refresh: false); showLogs = !store.failure } }
+            }
+            if let updateResult { Text(updateResult).textSelection(.enabled) }
+        }
+        .font(WatchTypography.caption)
+        .disabled(store.busy || !store.loaded)
     }
+
     private var vpnExpectationSection: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Label("只读 VPN 监督预期（不修改外部 VPN / TAG 配置）", systemImage: "network.badge.shield.half.filled")
-                .font(WatchTypography.bodyStrong).foregroundStyle(p.text)
-            Text(store.savedVpnExpectationSummary)
-                .font(WatchTypography.caption).foregroundStyle(p.secondary)
-            if let syncState = store.policySyncState {
-                Text(syncState.labelZh)
-                    .font(WatchTypography.caption)
-                    .foregroundStyle(syncState == .applyFailed ? p.red : syncState == .applied ? p.secondary : p.amber)
-            }
-            HStack(spacing: 8) {
-                TextField("预期运行模式（如 rule / global）", text: Binding(
-                    get: { store.vpnExpectationDraft.running_mode ?? "" },
-                    set: { store.updateVpnExpectationDraft(runningMode: $0) }
-                )).textFieldStyle(.roundedBorder)
-                TextField("预期代理组", text: Binding(
-                    get: { store.vpnExpectationDraft.proxy_group },
-                    set: { store.updateVpnExpectationDraft(proxyGroup: $0) }
-                )).textFieldStyle(.roundedBorder)
-                TextField("预期节点", text: Binding(
-                    get: { store.vpnExpectationDraft.expected_node ?? "" },
-                    set: { store.updateVpnExpectationDraft(expectedNode: $0) }
-                )).textFieldStyle(.roundedBorder)
-            }
-            HStack(spacing: 12) {
-                Button("确认保存 VPN 监督预期") {
-                    Task { await store.confirmAndSaveVpnExpectation() }
+            HStack(alignment: .center, spacing: 10) {
+                Image(systemName: "network.badge.shield.half.filled")
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(p.blue)
+                    .frame(width: 24, height: 24)
+                    .background(p.elevated, in: RoundedRectangle(cornerRadius: 6))
+                VStack(alignment: .leading, spacing: 3) {
+                    HStack(spacing: 8) {
+                        Text("只读 VPN 监督预期").font(WatchTypography.bodyStrong).foregroundStyle(p.text)
+                        if let syncState = store.policySyncState {
+                            Badge(
+                                text: syncState.labelZh,
+                                color: syncState == .applyFailed ? p.red : syncState == .applied ? p.mint : p.amber
+                            )
+                        }
+                    }
+                    Text(store.savedVpnExpectationSummary)
+                        .font(WatchTypography.small).foregroundStyle(p.secondary)
+                }
+                Spacer(minLength: 8)
+                Button(showVpnEditor ? "收起修改" : "修改 VPN 预期…") {
+                    withAnimation(.easeInOut(duration: 0.15)) { showVpnEditor.toggle() }
                 }
                 .buttonStyle(.bordered)
-                .disabled(store.busy)
-                Text("仅写入 Watch 本地策略，不切换节点、模式、TUN 或系统代理。")
+                .controlSize(.small)
+            }
+            if showVpnEditor {
+                Divider()
+                HStack(spacing: 8) {
+                    TextField("预期运行模式（如 rule / global）", text: Binding(
+                        get: { store.vpnExpectationDraft.running_mode ?? "" },
+                        set: { store.updateVpnExpectationDraft(runningMode: $0) }
+                    )).textFieldStyle(.roundedBorder)
+                    TextField("预期代理组", text: Binding(
+                        get: { store.vpnExpectationDraft.proxy_group },
+                        set: { store.updateVpnExpectationDraft(proxyGroup: $0) }
+                    )).textFieldStyle(.roundedBorder)
+                    TextField("预期节点", text: Binding(
+                        get: { store.vpnExpectationDraft.expected_node ?? "" },
+                        set: { store.updateVpnExpectationDraft(expectedNode: $0) }
+                    )).textFieldStyle(.roundedBorder)
+                    Button("确认保存 VPN 预期") {
+                        Task {
+                            await store.confirmAndSaveVpnExpectation()
+                            showVpnEditor = false
+                        }
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+                    .disabled(store.busy)
+                }
+                Text("仅写入 Watch 本地只读比对基线，不修改外部 VPN / TAG 客户端设置。")
                     .font(WatchTypography.small).foregroundStyle(p.secondary)
             }
         }
-        .padding(.vertical, 6)
+        .padding(10)
+        .background(p.elevated.opacity(0.35), in: RoundedRectangle(cornerRadius: 9))
+        .overlay(RoundedRectangle(cornerRadius: 9).strokeBorder(p.border.opacity(0.6), lineWidth: 1))
     }
 
-    private var draftActions: some View {
-        HStack {
-            Button("保存设置") { Task { await store.save(); await store.refreshBackground() } }
-                .buttonStyle(.borderedProminent).disabled(!store.hasUnsavedSettings || store.busy)
-            Button("撤销未保存修改") { store.discardChanges() }.disabled(!store.hasUnsavedSettings || store.busy)
-            if store.hasUnsavedSettings { Text("未保存").font(WatchTypography.caption).foregroundStyle(p.amber) }
-        }
-    }
     @ViewBuilder private var recoveryPanel: some View {
         if store.setupRecoveryRequired {
             Surface(p) {
@@ -895,28 +1060,6 @@ struct SwitcherPage: View {
         }
         if store.updateRecoveryRequired {
             Button("恢复未完成升级") { confirm("恢复整包更新", "依据升级事务记录恢复应用与后台组件。", ["update", "--recover", "--apply"], action: "恢复整包更新") }.disabled(store.busy)
-        }
-        if let available = store.updateStatus, available.isAvailable, !store.updateRecoveryRequired {
-            Surface(p) {
-                HStack(alignment: .center, spacing: 12) {
-                    Image(systemName: "arrow.down.circle.fill").foregroundStyle(p.blue)
-                    VStack(alignment: .leading, spacing: 3) {
-                        Text("发现新版本 \(available.versionLabel)").font(WatchTypography.bodyStrong)
-                        Text(available.message ?? "已完成签名校验，可原地升级并保留全部配置与账号（无需重新初始化）。")
-                            .font(WatchTypography.caption).foregroundStyle(p.secondary)
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
-                    Spacer(minLength: 8)
-                    Button("下载并安装更新…") {
-                        confirm(
-                            "下载并安装更新 \(available.versionLabel)",
-                            "将从已验签发布源下载完整更新并保留全部配置、账号与初始化状态（无需重新初始化）。替换期间将短暂关闭监控窗口，如核心网关组件变动将请求一次管理员授权，完成后自动重开新版。",
-                            ["update", "--apply", "--detach", "--relaunch"],
-                            action: "下载并安装更新"
-                        )
-                    }.buttonStyle(.borderedProminent).disabled(store.busy || store.hasUnsavedSettings)
-                }
-            }
         }
     }
     private var changeReview: some View {

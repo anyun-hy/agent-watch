@@ -1304,10 +1304,13 @@ fn evidence_expiry_caps_lease_and_prevents_infinite_renewal_on_process_events() 
     let mut supervisor =
         fixture_supervisor(store.clone(), Some(enforcer.clone()), None).unwrap();
 
-    // Seed egress observed at `now` (GUARD_EGRESS_TTL = 10.0 -> expires at `now + GUARD_EGRESS_TTL`)
+    // Seed egress with 10s of TTL remaining so its expiry (`now + 10.0`) is
+    // shorter than `DEFAULT_PERMIT_TTL` (`60.0s`) and caps permit renewal.
+    let egress_at = now - GUARD_EGRESS_TTL + 10.0;
+    let egress_expiry = egress_at + GUARD_EGRESS_TTL;
     supervisor
         .handle_event(SupervisionEvent::EnvironmentUpdated {
-            egress: fixture_egress(now, "1.1.1.1", "JP"),
+            egress: fixture_egress(egress_at, "1.1.1.1", "JP"),
             local_guard: json!({"proxy": "ok", "tun": "ok"}),
             observed_at: now,
         })
@@ -1325,9 +1328,9 @@ fn evidence_expiry_caps_lease_and_prevents_infinite_renewal_on_process_events() 
         ChannelPermitState::Permitted
     );
 
-    // At `now + 4.0` (only 6s of egress TTL left before `now + GUARD_EGRESS_TTL`), a
+    // At `now + 4.0` (only 6s of egress TTL left before `egress_expiry`), a
     // ProcessInventoryUpdated event arrives without any new egress sample.
-    // The renewed permit's `valid_until` must be capped at `now + GUARD_EGRESS_TTL` (NOT `now + 14.0`)!
+    // The renewed permit's `valid_until` must be capped at `egress_expiry`!
     let snap_renewed = supervisor
         .handle_event(SupervisionEvent::ProcessInventoryUpdated {
             family: "claude".into(),
@@ -1343,12 +1346,11 @@ fn evidence_expiry_caps_lease_and_prevents_infinite_renewal_on_process_events() 
     let frame = claude_watch_runtime::channel_policy_status::read_frame(&store);
     let valid_until_4 = frame["authoritative_permits"]["claude"]["valid_until"].as_f64().unwrap();
     assert!(
-        (valid_until_4 - (now + GUARD_EGRESS_TTL)).abs() < 1e-6,
-        "valid_until ({valid_until_4}) must be capped at evidence expiry ({})",
-        now + GUARD_EGRESS_TTL
+        (valid_until_4 - egress_expiry).abs() < 1e-6,
+        "valid_until ({valid_until_4}) must be capped at evidence expiry ({egress_expiry})"
     );
 
-    // At `now + GUARD_EGRESS_TTL`, egress evidence has expired.
+    // At `egress_expiry`, egress evidence has expired.
     // Even though the session in SessionStore was Active and ProcessInventoryUpdated
     // continues arriving, ChannelSupervisor must refuse to renew Permitted and revoke!
     let snap_expired = supervisor
@@ -1356,7 +1358,7 @@ fn evidence_expiry_caps_lease_and_prevents_infinite_renewal_on_process_events() 
             family: "claude".into(),
             desktops: vec![(claude_desktop.clone(), true, "u501:900:1".into())],
             processes: vec![desktop_bound(&claude_desktop)],
-            observed_at: now + GUARD_EGRESS_TTL,
+            observed_at: egress_expiry,
         })
         .unwrap();
     assert_eq!(

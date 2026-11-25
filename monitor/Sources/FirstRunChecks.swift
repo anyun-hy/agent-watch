@@ -381,14 +381,15 @@ final class FirstRunChecks: InitializationChecking {
         // separate, explicit step only after DNS, WebRTC and precheck passed.
         store.switcher.setupGuard = enableProtection || store.switcher.isOn(Setting.guardEnabled)
         store.switcher.setupWatchdog = enableProtection || store.switcher.isOn(Setting.timezoneWatchdog)
-        store.switcher.setupUpdater = store.switcher.isOn(Setting.autoUpdate)
+        store.switcher.setupUpdater = (!store.switcher.isFixture && store.switcher.updateSourceReady)
+            || store.switcher.isOn(Setting.autoUpdate)
         await store.switcher.previewEnvironment(candidateID: candidateID)
         guard let plan = store.switcher.setupPlan else {
             return .failed(code: "setup_preview_unavailable", detail: store.switcher.message.isEmpty ? "环境预览不可用" : store.switcher.message)
         }
         guard plan.candidate_id == candidateID,
               plan.expires_at > Date().timeIntervalSince1970, Self.allowed(plan.actions), contextMatches,
-              !enableProtection || plan.actions.allSatisfy({ $0.id == "watchdog" }) else {
+              !enableProtection || plan.actions.allSatisfy({ ["watchdog", "updater"].contains($0.id) }) else {
             return .failed(code: "setup_preview_invalid", detail: "环境预览不可用、已变化或包含范围外操作；未执行变更。请重新检查。")
         }
         if setupWasApproved && approvedContext == boundContext && plan.actions.isEmpty

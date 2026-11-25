@@ -1239,8 +1239,10 @@ final class SwitcherStore: ObservableObject {
     }
     /// Read-only accessors. Every read goes through a declared handle so no
     /// call site carries a key literal.
-    func isOn(_ key: FlagSetting) -> Bool {
-        settings[key.key] as? Bool ?? false
+    func isOn(_ key: FlagSetting, fallback: FlagSetting? = nil) -> Bool {
+        if let value = settings[key.key] as? Bool { return value }
+        if let fallback { return settings[fallback.key] as? Bool ?? false }
+        return false
     }
     func value(_ key: TextSetting) -> String {
         settings[key.key] as? String ?? ""
@@ -1252,8 +1254,8 @@ final class SwitcherStore: ObservableObject {
             self.markDraft()
         })
     }
-    func flag(_ key: FlagSetting) -> Binding<Bool> {
-        Binding(get: { self.isOn(key) }, set: { self.settings[key.key] = $0; self.markDraft() })
+    func flag(_ key: FlagSetting, fallback: FlagSetting? = nil) -> Binding<Bool> {
+        Binding(get: { self.isOn(key, fallback: fallback) }, set: { self.settings[key.key] = $0; self.markDraft() })
     }
     /// Three-state action selector. The fallback travels with the key, so a
     /// service is never read with another service's default.
