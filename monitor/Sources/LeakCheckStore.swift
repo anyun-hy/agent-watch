@@ -43,6 +43,11 @@ final class LeakCheckStore: ObservableObject {
         return contextProvider?()
     }
     func start(_ kind: LeakKind) { start(kind, force: false) }
+    func autoLoadIfNeeded(_ kind: LeakKind) {
+        guard !isFixture, evidenceTransport == nil else { return }
+        guard state(kind).result == nil, !state(kind).running, currentContext() != nil else { return }
+        start(kind, force: false)
+    }
     private func start(_ kind: LeakKind, force: Bool) {
         guard !state(kind).running else { return }
         guard let context = currentContext(), !context.isEmpty else {

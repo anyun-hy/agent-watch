@@ -69,6 +69,13 @@ struct AIInspectorPage: View {
         .font(WatchTypography.body).foregroundStyle(p.text)
         .frame(maxWidth: 1120, alignment: .leading)
         .padding(.top, 24)
+        .task(id: service) {
+            if !probes.isFixture && state.result == nil && !state.running {
+                probes.start(service)
+            }
+            store.leakChecks.autoLoadIfNeeded(.dns)
+            store.leakChecks.autoLoadIfNeeded(.webrtc)
+        }
     }
 
     private var heading: some View {

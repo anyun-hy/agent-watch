@@ -80,10 +80,18 @@ impl ReceiptStore {
     fn display_probe(kind: claude_watch_core::evidence::ProbeKind, receipt: &Value) -> Value {
         use claude_watch_core::evidence::ProbeKind;
         let Some(finished) = receipt[if kind == ProbeKind::Dns { "finished_at" } else { "sampled_at" }].as_f64() else { return Value::Null };
+        let mut observations = receipt["observations"].as_array().cloned().unwrap_or_default();
+        if let Some(locals) = receipt.get("local_observations").and_then(Value::as_array) {
+            observations.extend(locals.iter().cloned());
+        }
+        let default_scope = match kind {
+            ProbeKind::Dns => "原生多源权威 DNS 递归出口检测",
+            ProbeKind::WebRtc => "原生 ICE 网卡与双栈 STUN 候选检测",
+        };
         json!({"kind":kind.label(),"status":receipt["status"],
             "startedAt":receipt["started_at"].as_f64().unwrap_or(finished),"finishedAt":finished,
-            "scope":receipt["scope"].as_str().unwrap_or("后台 WebKit 检测；仅覆盖本次采样路径"),
-            "observations":receipt["observations"].as_array().cloned().unwrap_or_default(),
+            "scope":receipt["scope"].as_str().unwrap_or(default_scope),
+            "observations":observations,
             "errors":receipt["errors"].as_array().cloned().unwrap_or_default(),
             "contextChanged":receipt.pointer("/comparison/reason").is_some_and(|v| v=="context_changed"),"details":[]})
     }

@@ -37,12 +37,6 @@ RUNTIME_COMPONENTS = (
     "watch-gateway-broker",
     "ControlledEntry",
     "watch-native-collector.zsh",
-    "watch-leak-worker",
-    "netcoffee_probe.html",
-    "netcoffee_probe.js",
-    "netcoffee_probe.css",
-    "ipleak_probe.html",
-    "ipleak_probe.js",
     "BuildIdentity.json",
     "BuildInfo.plist",
 )

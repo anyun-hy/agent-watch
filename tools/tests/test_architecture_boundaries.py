@@ -36,6 +36,14 @@ class ArchitectureBoundaries(unittest.TestCase):
         self.assertIn('SwitcherCommandRunner.run(["evidence", "refresh", "--apply"]', store)
         for retired in ["monitor/Sources/DNSRefreshBridge.swift",
                         "monitor/Sources/DNSLeakRecordReceipt.swift",
+                        "monitor/Sources/NetCoffeeLeakRunner.swift",
+                        "monitor/Sources/IPLeakDNSRunner.swift",
+                        "monitor/Sources/IPLeakDNSRetryRunner.swift",
+                        "monitor/tools/BackgroundLeakWorker.swift",
+                        "monitor/Resources/ipleak_probe.html",
+                        "monitor/Resources/ipleak_probe.js",
+                        "monitor/Resources/netcoffee_probe.html",
+                        "monitor/Resources/netcoffee_probe.js",
                         "crates/watch-runtime/src/leak_refresh.rs"]:
             self.assertFalse((ROOT / retired).exists(), retired)
 

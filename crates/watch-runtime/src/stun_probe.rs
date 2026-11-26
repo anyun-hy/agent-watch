@@ -12,13 +12,13 @@ use std::{
 };
 
 pub const SERVERS: [(&str, u16); 4] = [
-    ("stun.miwifi.com", 3478),
-    ("stun.chat.bilibili.com", 3478),
-    ("stun.l.google.com", 19302),
     ("stun.cloudflare.com", 3478),
+    ("stun.l.google.com", 19302),
+    ("stun1.l.google.com", 19302),
+    ("stun2.l.google.com", 19302),
 ];
-pub const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(3);
-pub const RETRY_DELAY: Duration = Duration::from_millis(200);
+pub const ATTEMPT_TIMEOUT: Duration = Duration::from_millis(1500);
+pub const RETRY_DELAY: Duration = Duration::from_millis(120);
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Endpoint {
     pub host: String,

@@ -70,21 +70,21 @@ private struct LeakInspectorPage: View {
                 .background(p.elevated, in: RoundedRectangle(cornerRadius: 9))
             }
             InspectorHeading(title: title,
-                subtitle: isDNS ? "递归解析出口 · 与同轮公网出口国家核对" : "当前检测 WebView · ICE / STUN 与 HTTP 出口核对",
+                subtitle: isDNS ? "原生多源权威递归解析出口 · 与同轮公网出口国家核对" : "原生本机双栈网卡与并发 STUN · 与同轮公网出口核对",
                 p: p) {
                     Button {
                         state.running ? store.cancel(kind) : store.start(kind)
                     } label: {
-                        Label(state.running ? "取消检测" : isDNS ? "检测 DNS" : "检测 WebRTC",
-                              systemImage: state.running ? "stop.fill" : "play.fill").font(WatchTypography.bodyStrong)
+                        Label(state.running ? "取消检测" : (latestResult == nil ? (isDNS ? "检测 DNS" : "检测 WebRTC") : "重新检测"),
+                              systemImage: state.running ? "stop.fill" : "arrow.clockwise").font(WatchTypography.bodyStrong)
                     }.buttonStyle(.borderedProminent).tint(style.action)
                         .accessibilityLabel(state.running ? "取消\(title)" : latestResult == nil ? "开始\(title)" : "重新运行\(title)")
                 }
             if state.running, let progress = currentProgress { Label(progress,systemImage:"arrow.triangle.2.circlepath").font(.callout).foregroundStyle(style.network) }
             InspectorStatus(verdict: state.verdict, running: state.running,
-                            source: isDNS ? "DNS · 递归解析器" : "WebRTC · ICE / STUN",
+                            source: isDNS ? "DNS · 权威递归回显" : "ICE · 网卡与并发 STUN",
                             symbol: isDNS ? Page.dns.symbol : Page.webrtc.symbol, p: p)
-            SamplingEvidence(source: isDNS ? "IPLeak · 本机 WebView 查询" : "本机 WebView · ICE 候选",
+            SamplingEvidence(source: isDNS ? "Akamai / Google 权威 DNS 回显" : "本机活跃网卡与并发 STUN",
                              timeLabel: showingPreviousSuccessfulResult ? "上次有效样本" : state.running ? "上次完成" : "完成于",
                              timestamp: result?.finishedAt, p: p)
             if let error = diagnosticLog.error ?? LeakDiagnosticTrace.shared.error {
@@ -114,12 +114,13 @@ private struct LeakInspectorPage: View {
             }
             if !isDNS { settings }
             details
-            Label(isDNS ? "本机 WebView 发起查询，IPLeak 返回 DNS 观测；不代表所有 AI 应用。"
-                  : "仅代表当前检测 WebView，不代表 AI 应用或其他浏览器。", systemImage: "info.circle")
+            Label(isDNS ? "原生并发查询系统生效 DNS 解析器的上游递归出口；不代表独立浏览器内单独配置的私有 DoH。"
+                  : "直接核对本机活跃网卡直连地址与多路并发 STUN 反射出口；受控 AI 进程在沙箱内默认额外封锁直连 UDP。", systemImage: "info.circle")
                 .font(.caption).foregroundStyle(p.secondary)
                 .fixedSize(horizontal: false, vertical: true)
         }.font(WatchTypography.body).foregroundStyle(p.text)
             .frame(maxWidth: 1120, alignment: .leading).padding(.top, 24)
+            .task(id: kind) { store.autoLoadIfNeeded(kind) }
     }
 
     private var addressComparison: some View {

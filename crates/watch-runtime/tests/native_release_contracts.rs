@@ -277,7 +277,7 @@ fn validate_bundle_uses_plutil_json_for_all_metadata_without_reading_plist_bytes
 }
 
 #[test]
-fn background_evidence_bundle_requires_all_nine_hashed_files_and_arm64_worker() {
+fn native_bundle_validates_without_retired_webkit_worker() {
     let app = std::env::temp_dir().join(format!("cw-evidence-release-{}.app", Uuid::new_v4()));
     let resources = app.join("Contents/Resources");
     fs::create_dir_all(app.join("Contents/MacOS")).unwrap();
@@ -289,10 +289,6 @@ fn background_evidence_bundle_requires_all_nine_hashed_files_and_arm64_worker() 
         "watch-process-control",
         "watch-admin.sh",
         "watch-native-collector.zsh",
-        "watch-leak-worker",
-        "netcoffee_probe.html",
-        "netcoffee_probe.js",
-        "netcoffee_probe.css",
     ];
     for name in required {
         fs::write(resources.join(name), []).unwrap();
@@ -305,7 +301,7 @@ fn background_evidence_bundle_requires_all_nine_hashed_files_and_arm64_worker() 
     let info = r#"{"CFBundleIdentifier":"io.local.watchpanel","CFBundleExecutable":"AgentWatch","CFBundleShortVersionString":"2.5.0","CFBundleVersion":"250"}"#;
     let manifest = serde_json::json!({
         "Architecture":"arm64", "ProductVersion":"2.5.0", "BackendVariant":"rust-candidate",
-        "RuntimeSchema":2, "BackgroundEvidenceSchema":1, "RuntimeHashes":hashes,
+        "RuntimeSchema":2, "RuntimeHashes":hashes,
     })
     .to_string();
     let replies = vec![
@@ -316,64 +312,14 @@ fn background_evidence_bundle_requires_all_nine_hashed_files_and_arm64_worker() 
         ok("arm64"),
         ok("arm64"),
         ok(&manifest),
-        ok("arm64"),
     ];
     let mut release = native(replies);
     assert_eq!(release.validate_bundle(&app).unwrap().version, "2.5.0");
-    assert!(release.executor.calls.iter().any(|call| {
-        call.program == Path::new("/usr/bin/lipo")
-            && call
-                .args
-                .last()
-                .is_some_and(|path| path.ends_with("watch-leak-worker"))
+    assert!(!release.executor.calls.iter().any(|call| {
+        call.args
+            .last()
+            .is_some_and(|path| path.ends_with("watch-leak-worker"))
     }));
-
-    for name in ["ipleak_probe.html", "ipleak_probe.js"] {
-        fs::write(resources.join(name), []).unwrap();
-    }
-    let mut manifest_v2: serde_json::Value = serde_json::from_str(&manifest).unwrap();
-    manifest_v2["BackgroundEvidenceSchema"] = serde_json::json!(2);
-    for name in ["ipleak_probe.html", "ipleak_probe.js"] {
-        manifest_v2["RuntimeHashes"][name] = serde_json::json!(empty_hash);
-    }
-    let manifest_v2 = manifest_v2.to_string();
-    let replies_v2 = || {
-        vec![
-            ok(info),
-            ok(""),
-            ok("arm64"),
-            ok("arm64"),
-            ok("arm64"),
-            ok("arm64"),
-            ok(&manifest_v2),
-            ok("arm64"),
-        ]
-    };
-    assert_eq!(
-        native(replies_v2()).validate_bundle(&app).unwrap().version,
-        "2.5.0"
-    );
-    fs::remove_file(resources.join("ipleak_probe.js")).unwrap();
-    assert_eq!(
-        native(replies_v2()).validate_bundle(&app).unwrap_err().code,
-        "release_identity_mismatch"
-    );
-
-    fs::remove_file(resources.join("netcoffee_probe.js")).unwrap();
-    let mut missing = native(vec![
-        ok(info),
-        ok(""),
-        ok("arm64"),
-        ok("arm64"),
-        ok("arm64"),
-        ok("arm64"),
-        ok(&manifest),
-        ok("arm64"),
-    ]);
-    assert_eq!(
-        missing.validate_bundle(&app).unwrap_err().code,
-        "release_identity_mismatch"
-    );
     fs::remove_dir_all(app).unwrap();
 }
 #[test]
@@ -510,8 +456,7 @@ fn packaged_seatbelt_manifest_accepts_pinned_build_identity_and_rejects_unlisted
     // evidence v2, native controlled entry, and diagnostic build provenance.
     let required = [
         "watch-engine", "watch-native-observer", "watch-process-control", "watch-admin.sh",
-        "watch-native-collector.zsh", "watch-leak-worker", "netcoffee_probe.html",
-        "netcoffee_probe.js", "netcoffee_probe.css", "ipleak_probe.html", "ipleak_probe.js",
+        "watch-native-collector.zsh",
         "watch-sandbox-launcher", "watch-gateway-broker", "ControlledEntry", "BuildIdentity.json",
     ];
     let identity = serde_json::json!({"schema":1,"app_version":"4.0.0","app_build":"400",
@@ -524,11 +469,11 @@ fn packaged_seatbelt_manifest_accepts_pinned_build_identity_and_rejects_unlisted
     }
     let manifest = serde_json::json!({"Architecture":"arm64","ProductVersion":"4.0.0",
         "BackendVariant":"rust-candidate","NetworkBackend":"seatbelt","RuntimeSchema":2,
-        "BackgroundEvidenceSchema":2,"RuntimeHashes":hashes});
+        "RuntimeHashes":hashes});
     let info = r#"{"CFBundleIdentifier":"io.local.watchpanel","CFBundleExecutable":"AgentWatch","CFBundleShortVersionString":"4.0.0","CFBundleVersion":"400"}"#;
     let validate = |manifest: &serde_json::Value| {
         let replies = vec![ok(info), ok(""), ok("arm64"), ok("arm64"), ok("arm64"), ok("arm64"),
-            ok(&manifest.to_string()), ok("arm64"), ok("arm64"), ok("arm64"), ok("arm64")];
+            ok(&manifest.to_string()), ok("arm64"), ok("arm64"), ok("arm64")];
         let mut release = native(replies);
         let result = release.validate_bundle(&app.0);
         assert!(release.executor.calls.iter().all(|call| matches!(call.program.to_str(),

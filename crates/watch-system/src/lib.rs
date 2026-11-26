@@ -1395,3 +1395,75 @@ mod macos {
         }
     }
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InterfaceAddress {
+    pub interface: String,
+    pub ip: std::net::IpAddr,
+}
+
+/// Enumerate active non-loopback network interface addresses (IPv4 & non-link-local IPv6)
+/// via `getifaddrs(3)` in sub-millisecond time for native ICE host-candidate inspection.
+pub fn active_interface_addresses() -> Vec<InterfaceAddress> {
+    use std::ffi::CStr;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    struct IfAddrsGuard(*mut libc::ifaddrs);
+    impl Drop for IfAddrsGuard {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                unsafe { libc::freeifaddrs(self.0) };
+            }
+        }
+    }
+
+    let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
+    if unsafe { libc::getifaddrs(&mut head) } != 0 || head.is_null() {
+        return Vec::new();
+    }
+    let _guard = IfAddrsGuard(head);
+    let mut out = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    let mut cur = head;
+    while !cur.is_null() {
+        let ifa = unsafe { &*cur };
+        cur = ifa.ifa_next;
+        let flags = ifa.ifa_flags as i32;
+        if (flags & libc::IFF_UP) == 0 || (flags & libc::IFF_LOOPBACK) != 0 {
+            continue;
+        }
+        if ifa.ifa_name.is_null() || ifa.ifa_addr.is_null() {
+            continue;
+        }
+        let name = unsafe { CStr::from_ptr(ifa.ifa_name) }
+            .to_string_lossy()
+            .into_owned();
+        if name.starts_with("lo") || name.starts_with("llw") || name.starts_with("awdl") {
+            continue;
+        }
+        let family = unsafe { (*ifa.ifa_addr).sa_family } as i32;
+        let ip = if family == libc::AF_INET {
+            let sin = unsafe { &*(ifa.ifa_addr as *const libc::sockaddr_in) };
+            let octets = sin.sin_addr.s_addr.to_ne_bytes();
+            let v4 = Ipv4Addr::from(octets);
+            if v4.is_loopback() || v4.is_link_local() || v4.is_unspecified() {
+                continue;
+            }
+            IpAddr::V4(v4)
+        } else if family == libc::AF_INET6 {
+            let sin6 = unsafe { &*(ifa.ifa_addr as *const libc::sockaddr_in6) };
+            let v6 = Ipv6Addr::from(sin6.sin6_addr.s6_addr);
+            if v6.is_loopback() || v6.is_unspecified() || (v6.segments()[0] & 0xffc0) == 0xfe80 {
+                continue;
+            }
+            IpAddr::V6(v6)
+        } else {
+            continue;
+        };
+        if seen.insert((name.clone(), ip)) {
+            out.push(InterfaceAddress { interface: name, ip });
+        }
+    }
+    out
+}
+

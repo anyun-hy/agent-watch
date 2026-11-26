@@ -53,28 +53,20 @@ class RustCandidatePackagingTests(unittest.TestCase):
         self.assertIn('Agent Watch.app', text)
         self.assertIn('Refusing to build into an installed application path.', text)
         self.assertIn('<key>BackendVariant</key><string>$CW_BACKEND_VARIANT</string>', text)
-        self.assertIn('BACKGROUND_LEAK_WORKER', text)
-        self.assertIn('watch-leak-worker', text)
-        self.assertIn('netcoffee_probe.html', text)
-        self.assertIn('<key>BackgroundEvidenceSchema</key><integer>$BACKGROUND_EVIDENCE_SCHEMA</integer>', text)
-        self.assertIn('BACKGROUND_EVIDENCE_SCHEMA=2', text)
+        # DNS/WebRTC evidence is collected in-process by the Rust engine. The
+        # retired WebView helper must not be built, and the manifest must omit
+        # BackgroundEvidenceSchema so v4.2.5 updaters skip the helper check.
+        self.assertNotIn('BACKGROUND_LEAK_WORKER', text)
+        self.assertNotIn('BackgroundEvidenceSchema', text)
+        self.assertNotIn('BACKGROUND_EVIDENCE_SCHEMA', text)
+        self.assertIn('rm -f "$APP/Contents/Resources/watch-leak-worker"', text)
 
-    def test_background_runtime_helper_has_a_fixed_runtime_contract_test(self):
-        test = ROOT / "monitor/tests/run_background_leak_worker_runtime_test.sh"
-        text = test.read_text(encoding="utf-8")
-        self.assertIn('-D BACKGROUND_LEAK_WORKER', text)
-        self.assertIn("BackgroundEvidenceSchema", text)
-        self.assertIn("RuntimeHashes", text)
-        self.assertIn("('--dns', '--webrtc')", text)
-        self.assertIn("start_new_session=True", text)
-
-    def test_background_dns_pipeline_exercises_the_real_webkit_script_offline(self):
-        test = ROOT / "monitor/tests/run_background_dns_pipeline_test.sh"
-        text = test.read_text(encoding="utf-8")
-        self.assertIn("ipleak_probe.js", text)
-        self.assertIn("dnsdetection/", text)
-        self.assertIn("window.fetch", text)
-        self.assertIn("BACKGROUND_LEAK_WORKER_TEST", text)
+    def test_retired_webview_probe_tests_are_gone(self):
+        for retired in ("monitor/tests/run_background_leak_worker_runtime_test.sh",
+                        "monitor/tests/run_background_dns_pipeline_test.sh",
+                        "monitor/tests/run_background_leak_worker_test.sh",
+                        "monitor/tools/BackgroundLeakWorker.swift"):
+            self.assertFalse((ROOT / retired).exists(), retired)
 
     def test_component_builder_queries_paths_instead_of_hardcoding_native_sources(self):
         text = COMPONENTS.read_text(encoding="utf-8")

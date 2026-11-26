@@ -285,11 +285,10 @@ class UnifiedRunnerTests(unittest.TestCase):
         self.assertFalse(coverage["missing"])
         self.assertFalse(coverage["duplicates"])
         self.assertEqual(coverage["swift_test_count"], coverage["swift_mapped_count"])
-        self.assertTrue(next(s for s in steps if s.id == "swift.NetCoffeeLiveCheck").excluded_reason)
+        self.assertTrue(next(s for s in steps if s.id == "swift.UIReviewApp").excluded_reason)
         fixture = next(s for s in steps if s.id == "swift.BackendReceiptDecodeTests")
         self.assertIn('results "with quotes"', fixture.prepare[0]["destination"])
-        self.assertEqual(next(s for s in steps if s.id == "webkit.resident_runtime").commands[0][-1], "--fixture")
-        self.assertIn("macos.gui_session", next(s for s in steps if s.id == "webkit.resident_runtime").dependencies)
+        self.assertFalse(any(s.id == "webkit.resident_runtime" for s in steps))
 
     def test_default_and_native_levels_select_only_their_reviewed_commands(self):
         for args, level in (([], 1), (["--level", "2"], 2)):

@@ -5,9 +5,9 @@ use crate::{
 };
 use serde::{Deserialize, Serialize};
 
-// Two sequential native probes have an 80-second bound each. Leave time for
-// the local IPC handoff; callers must not terminate them at a 20-second UI limit.
-pub const REQUEST_TIMEOUT_SECONDS: u64 = 180;
+// Native Rust DNS and ICE probes finish in sub-second time on healthy networks
+// with bounded 5-second fallbacks; keep a tight ceiling for two probes + IPC.
+pub const REQUEST_TIMEOUT_SECONDS: u64 = 25;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]

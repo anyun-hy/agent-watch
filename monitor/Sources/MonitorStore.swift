@@ -575,6 +575,18 @@ final class MonitorStore: ObservableObject {
     }
     private func refreshEnvironmentQuality(_ result: CurrentEnvironmentReceipt) {
         if let receipt = result.netcoffee_lookup { netCoffee.ingest(receipt) }
+        if let raw = result.rows.first(where: { $0.id == "egress" })?.current,
+           let candidate = raw.components(separatedBy: " / ").first,
+           let ip = LeakIPAddress(candidate.trimmingCharacters(in: .whitespacesAndNewlines)),
+           ip.isPublic {
+            if netCoffee.selectedIP.isEmpty {
+                netCoffee.selectedForPage(ip.canonical)
+                if netCoffee.query.isEmpty { netCoffee.query = ip.canonical }
+            }
+            if !switcher.isFixture && netCoffee.report(ip.canonical) == nil {
+                netCoffee.fetch(ip.canonical)
+            }
+        }
     }
     func showConnections(_ product: MonitoredProduct) {
         networkSelection.product = product

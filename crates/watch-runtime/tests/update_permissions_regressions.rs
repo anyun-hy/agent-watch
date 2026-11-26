@@ -7,7 +7,7 @@ use std::{collections::BTreeMap, fs, io::Write, os::unix::fs::{symlink, Permissi
 const APP: &str = "app/Agent Watch.app";
 const BIN: &str = "app/Agent Watch.app/Contents/MacOS/AgentWatch";
 const COMPONENTS: &[&str] = &["watch-engine", "watch-native-observer", "watch-process-control",
-    "watch-admin.sh", "watch-native-collector.zsh", "watch-leak-worker"];
+    "watch-admin.sh", "watch-native-collector.zsh"];
 struct Fixture { root: PathBuf }
 impl Fixture {
     fn new() -> Self {

@@ -234,44 +234,6 @@
       "safety_notes": "Decodes only the committed normal review fixture extracted into this run's artifact directory; no installed status or live environment collection."
     },
     {
-      "id": "swift.BackgroundLeakWorkerTests",
-      "kind": "script",
-      "test_files": [
-        "monitor/tests/BackgroundLeakWorkerTests.swift"
-      ],
-      "sources": [
-        "monitor/Sources/IdentityPresentation.swift",
-        "monitor/Sources/BundledBackendVariant.swift",
-        "monitor/Sources/LeakCheckModels.swift",
-        "monitor/Sources/NetCoffeeModels.swift",
-        "monitor/Sources/NetCoffeeLeakRunner.swift",
-        "monitor/Sources/IPLeakDNSRunner.swift",
-        "monitor/Sources/IPLeakDNSRetryRunner.swift",
-        "monitor/tools/BackgroundLeakWorker.swift"
-      ],
-      "defines": [
-        "COFFEE_BRIDGE_TEST",
-        "IPLEAK_BRIDGE_TEST"
-      ],
-      "args": [
-        "--run"
-      ],
-      "frameworks": [
-        "AppKit",
-        "WebKit"
-      ],
-      "dependencies": [
-        "macos.gui_session"
-      ],
-      "fixture_only": true,
-      "script": "monitor/tests/run_background_leak_worker_test.sh",
-      "success_markers": [
-        "BackgroundLeakWorkerTests: fixed resource selection and injected DNS/WebRTC receipts passed"
-      ],
-      "safety_notes": "Builds/ad-hoc-signs an owned temporary .app and launches only that test app. Both JS run implementations are replaced with local receipts before execution. Require the completion marker and inspect combined stdout/stderr: open exit alone is insufficient.",
-      "recipe_ref": "monitor/tests/run_background_leak_worker_test.sh"
-    },
-    {
       "id": "swift.ClaudeLoginProbeTests",
       "kind": "swift",
       "test_files": [
@@ -626,43 +588,6 @@
       "safety_notes": "UI_REVIEW, explicit fixture stores, injected permission/mutation callbacks and owned temporary storage; one owned /bin/sh progress fixture."
     },
     {
-      "id": "swift.IPLeakBridgeTests",
-      "kind": "script",
-      "test_files": [
-        "monitor/tests/IPLeakBridgeTests.swift",
-        "monitor/tests/IPLeakRetryTests.swift"
-      ],
-      "sources": [
-        "monitor/Sources/*.swift"
-      ],
-      "defines": [
-        "UI_REVIEW",
-        "IPLEAK_BRIDGE_TEST"
-      ],
-      "args": [
-        "--fixture"
-      ],
-      "frameworks": [
-        "SwiftUI",
-        "AppKit",
-        "WebKit"
-      ],
-      "dependencies": [
-        "macos.gui_session"
-      ],
-      "fixture_only": true,
-      "script": "monitor/tests/run_ipleak_bridge_test.sh",
-      "success_markers": [
-        "IPLeak native retry: bounded recovery, timeout and cancellation passed",
-        "IPLeakBridgeTests: local page, WebKit, JS and native result passed with mocked network"
-      ],
-      "safety_notes": "Existing runner builds and runs both mapped tests once. Retry uses FakeDNSRunner; bridge injects fetch responses. Temporary signed app only; fixture mode does not read installed proxy state.",
-      "excluded_modes": {
-        "--live": "Real IPLeak/WebRTC network probes and installed proxy-snapshot read are outside the isolated suite."
-      },
-      "recipe_ref": "monitor/tests/run_ipleak_bridge_test.sh"
-    },
-    {
       "id": "swift.LeakCheckTests",
       "kind": "swift",
       "test_files": [
@@ -770,22 +695,6 @@
       "dependencies": [],
       "fixture_only": true,
       "safety_notes": "Synthetic timestamps and context strings only."
-    },
-    {
-      "id": "swift.NetCoffeeLiveCheck",
-      "kind": "excluded",
-      "test_files": [
-        "monitor/tests/NetCoffeeLiveCheck.swift"
-      ],
-      "sources": [],
-      "defines": [],
-      "args": [],
-      "frameworks": [
-        "Foundation"
-      ],
-      "dependencies": [],
-      "fixture_only": false,
-      "reason": "Standalone live DNS/WebRTC diagnostic performs real external network probes and writes a caller-specified report; outside the isolated test suite."
     },
     {
       "id": "swift.NetCoffeeStoreTests",
@@ -896,41 +805,6 @@
       "dependencies": [],
       "fixture_only": true,
       "safety_notes": "Refresh gate and macOS file publication events for owned temporary files, including atomic replacement and rotation."
-    },
-    {
-      "id": "swift.ResidentWebViewTests",
-      "kind": "script",
-      "test_files": [
-        "monitor/tests/ResidentWebViewTests.swift"
-      ],
-      "sources": [
-        "monitor/Sources/IdentityPresentation.swift",
-        "monitor/Sources/BundledBackendVariant.swift",
-        "monitor/Sources/LeakCheckModels.swift",
-        "monitor/Sources/NetCoffeeModels.swift",
-        "monitor/Sources/NetCoffeeLeakRunner.swift",
-        "monitor/Sources/IPLeakDNSRunner.swift",
-        "monitor/Sources/IPLeakDNSRetryRunner.swift"
-      ],
-      "defines": [
-        "COFFEE_BRIDGE_TEST",
-        "IPLEAK_BRIDGE_TEST"
-      ],
-      "args": [],
-      "frameworks": [
-        "AppKit",
-        "WebKit"
-      ],
-      "dependencies": [
-        "macos.gui_session"
-      ],
-      "fixture_only": true,
-      "script": "monitor/tests/run_resident_webview_tests.sh",
-      "success_markers": [
-        "ResidentWebViewTests passed: page reuse, new DNS session, cancellation, timeout and abnormal-process recovery; all network mocked"
-      ],
-      "safety_notes": "Temporary signed .app; injected fetch/RTC plus a temporary stub watch-engine cover all outbound primitives. Exercises real local WebKit lifecycle only.",
-      "recipe_ref": "monitor/tests/run_resident_webview_tests.sh"
     },
     {
       "id": "swift.ReviewReceiptDecodeTests",

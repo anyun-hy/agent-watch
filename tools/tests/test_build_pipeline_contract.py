@@ -44,10 +44,10 @@ class BuildPipelineContract(unittest.TestCase):
         self.assertIn('ACTUAL_VERSION', PACKAGE)
         self.assertIn('/usr/bin/codesign --verify --deep --strict', PACKAGE)
 
-    def test_swift_worker_is_built_and_not_shadowed(self):
-        self.assertIn('-D BACKGROUND_LEAK_WORKER', APP_BUILD)
-        self.assertIn('watch-leak-worker.$CW_BUILD_ARCH', APP_BUILD)
-        self.assertIn('cp "$ROOT/build/watch-leak-worker.$CW_BUILD_ARCH" "$APP/Contents/Resources/watch-leak-worker"', APP_BUILD)
+    def test_retired_webkit_leak_worker_is_absent(self):
+        self.assertNotIn('-D BACKGROUND_LEAK_WORKER', APP_BUILD)
+        self.assertNotIn('watch-leak-worker.$CW_BUILD_ARCH', APP_BUILD)
+        self.assertNotIn('BackgroundLeakWorker.swift', APP_BUILD)
 
     def test_build_has_no_installer_or_delete_command(self):
         self.assertNotIn('app-uninstall --apply', APP_BUILD)

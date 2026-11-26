@@ -227,7 +227,7 @@ impl VpnObservationState {
             || known(&a.rules_digest, &b.rules_digest)
     }
 
-    fn healthy(sample: &VpnObservation) -> bool {
+    pub fn healthy(sample: &VpnObservation) -> bool {
         sample.consistency.is_consistent() && sample.source_error.is_none() && sample.source_instance.is_some()
     }
 

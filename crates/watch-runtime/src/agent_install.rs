@@ -374,13 +374,6 @@ fn install_mode<E: FixedCommandExecutor>(
             return Err(err("runtime_missing", "缺少原生运行组件校验项"));
         }
     }
-    if crate::background_evidence::supported_manifest(&manifest)? {
-        for &name in crate::background_evidence::extra_files(&manifest)? {
-            if !hashes.contains_key(name) {
-                return Err(err("runtime_missing", "缺少后台DNS/WebRTC检测组件校验项"));
-            }
-        }
-    }
     if manifest["NetworkBackend"] == "seatbelt" && !hashes.contains_key("watch-sandbox-launcher") {
         return Err(err("runtime_missing", "缺少沙盒启动组件校验项"));
     }
@@ -410,7 +403,6 @@ fn install_mode<E: FixedCommandExecutor>(
                 &stage.join(rel),
                 &bytes,
                 if COMPONENTS.contains(&name.as_str())
-                    || name == crate::background_evidence::WORKER
                     || name == "watch-sandbox-launcher"
                     || name == "watch-gateway-broker"
                     || name == "ControlledEntry"

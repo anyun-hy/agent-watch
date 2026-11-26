@@ -32,7 +32,6 @@ struct NativeEvidence {
     host: super::runtime::Host,
     desktop: NativeDesktop<Arc<claude_watch_runtime::commands::SystemRunner>>,
     stop: Arc<AtomicBool>,
-    executor: background_evidence::ProbeExecutor,
 }
 fn next_review_delay(failures: &mut u32, incomplete: bool, due: Option<f64>, now: f64) -> Option<Duration> {
     let remaining = due.map(|at| {
@@ -110,12 +109,15 @@ impl EvidenceSystem for NativeEvidence {
         )
     }
     fn collect(&mut self, kind: ProbeKind) -> Result<Value> {
-        background_evidence::collect_native(
-            &self.host.storage,
-            &self.host.runner,
-            &mut self.executor,
-            kind,
-        )
+        Ok(match kind {
+            ProbeKind::Dns => claude_watch_runtime::native_leak_probes::collect_dns(
+                self.host.runner.as_ref(),
+                &self.host.network,
+            ),
+            ProbeKind::WebRtc => {
+                claude_watch_runtime::native_leak_probes::collect_webrtc(&self.host.network)
+            }
+        })
     }
     fn revalidate(&mut self) -> Result<(Value, Value)> {
         let network = self.host.network.clone();
@@ -186,13 +188,10 @@ pub fn spawn(paths: Paths, stop: Arc<AtomicBool>) -> Result<EvidenceWorker> {
     let worker = thread::Builder::new()
         .name("claude-background-evidence".into())
         .spawn(move || {
-            let executor = background_evidence::ProbeExecutor::new(stop.clone())
-                .with_diagnostics(host.storage.clone());
             let mut system = NativeEvidence {
                 host,
                 desktop,
                 stop: stop.clone(),
-                executor,
             };
             let events = EventStore::new(store.clone());
             let server = match claude_watch_runtime::evidence_client::EvidenceServer::bind(&store) {

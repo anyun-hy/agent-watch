@@ -49,6 +49,7 @@ mod managed_entry_transaction;
 pub mod monitor_activity;
 pub mod monitor_snapshot;
 pub mod native;
+pub mod native_leak_probes;
 pub mod native_listener;
 pub mod native_notifications;
 pub mod network_client;

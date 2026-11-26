@@ -656,7 +656,6 @@ fn package_release_update_script_output_verifies_end_to_end_in_rust_updater() {
         "watch-gateway-broker",
         "ControlledEntry",
         "watch-native-collector.zsh",
-        "watch-leak-worker",
         "BuildInfo.plist",
         "BuildIdentity.json",
     ] {

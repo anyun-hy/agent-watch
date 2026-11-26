@@ -166,41 +166,6 @@ fn native_runtime_installs_without_legacy_backend_or_account_mutation() {
 }
 
 #[test]
-fn background_components_are_hash_checked_and_installed_with_correct_modes() {
-    let (root, store, source, mut fake, uid) = fixture();
-    fake.manifest["BackgroundEvidenceSchema"] = json!(1);
-    for name in claude_watch_runtime::background_evidence::EXTRA_FILES {
-        fs::write(source.join(name), name.as_bytes()).unwrap();
-        fake.manifest["RuntimeHashes"][name] = json!(sha256(name.as_bytes()));
-    }
-    agent_install::install(&store, &source, uid, &mut fake).unwrap();
-    for name in claude_watch_runtime::background_evidence::EXTRA_FILES {
-        let target = store.paths.watch().join("runtime").join(name);
-        assert_eq!(fs::read(&target).unwrap(), name.as_bytes());
-        assert_eq!(
-            fs::metadata(target).unwrap().mode() & 0o777,
-            if name == "watch-leak-worker" {
-                0o700
-            } else {
-                0o600
-            }
-        );
-    }
-    fs::remove_dir_all(root).unwrap();
-}
-
-#[test]
-fn advertised_background_worker_cannot_install_with_missing_assets() {
-    let (root, store, source, mut fake, uid) = fixture();
-    fake.manifest["BackgroundEvidenceSchema"] = json!(1);
-    let error = agent_install::install(&store, &source, uid, &mut fake).unwrap_err();
-    assert_eq!(error.code, "runtime_missing");
-    assert_eq!(fake.bootstrap, 0);
-    assert!(!store.paths.watch().join("runtime").exists());
-    fs::remove_dir_all(root).unwrap();
-}
-
-#[test]
 fn install_waits_for_delayed_agent_and_preserves_existing_logs() {
     let (root, store, source, mut fake, uid) = fixture();
     let logs = store.paths.watch().join("logs");

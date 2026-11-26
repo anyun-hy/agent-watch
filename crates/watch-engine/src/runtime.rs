@@ -302,11 +302,6 @@ pub fn dispatch_read(request: &Request, paths: Paths) -> Result<Option<Value>> {
                 "watch-admin.sh",
                 "watch-native-collector.zsh",
             ];
-            if claude_watch_runtime::background_evidence::supported_manifest(&manifest)? {
-                required.extend_from_slice(claude_watch_runtime::background_evidence::extra_files(
-                    &manifest,
-                )?);
-            }
             if manifest["NetworkBackend"] == "seatbelt"
                 || manifest["RuntimeHashes"]["watch-sandbox-launcher"].is_string()
             {

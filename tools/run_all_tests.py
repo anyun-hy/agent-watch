@@ -294,8 +294,6 @@ def build_plan(run_dir: Path) -> tuple[list[Step], dict]:
               "--test", "live_listener_diagnostics", "system_runner_reports_listener_evidence_without_mutation",
               "--", "--ignored", "--exact", "--nocapture", "--test-threads=1"]], dependencies=["rust.build"],
              notes=["Uses two owned ephemeral loopback listeners and real kernel collection; checks the exact selected endpoint, PID and birth identity. Does not require or modify the VPN listener."]),
-        Step("webkit.resident_runtime", "test", [["bash", "monitor/tests/run_resident_worker_tests.sh", "--fixture"]],
-             dependencies=["rust.build", "macos.gui_session"], timeout_seconds=600),
         Step("rust.signed_peer_build", "build", [["cargo", "test", "--locked", "-p", "claude-watch-system", "--lib",
               "--no-run", "--message-format=json"]], dependencies=["rust.build"]),
         Step("rust.signed_peer", "test", [

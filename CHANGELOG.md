@@ -2,6 +2,15 @@
 
 该摘要根据现有源码和版本发布记录整理。后续版本遵循语义化版本（SemVer）：缺陷修复递增 patch，功能/品牌升级递增 minor，破坏性架构变更递增 major。
 
+## 4.2.6 — 2026-11-26
+
+- **DNS / WebRTC 泄漏检测改为 Rust 进程内原生探针（秒级出结果）**：
+  - DNS：零依赖 RFC 1035 TXT 编解码，向系统当前递归解析器并发查询 Akamai `whoami.ds.akahelp.net` 与 Google `o-o.myaddr.l.google.com` 回显，UDP 截断或被拦截时自动改用 TCP；与代理 HTTP trace 出口并行比较，归属信息使用 30 分钟共享缓存（Net.Coffee 为主、IPLeak 为后备）。
+  - WebRTC：`getifaddrs` 枚举本机 host 候选（识别未受保护的全局 IPv6），并发多 STUN 服务器取得 srflx 映射，达到法定数量后提前返回，不再等待失联服务器超时；私有地址作为本地观察保留展示。
+- **退役 `watch-leak-worker` 与离屏 WKWebView 采集链**：删除 `BackgroundLeakWorker`、`NetCoffeeLeakRunner`、`IPLeakDNSRunner`/`RetryRunner` 及 `ipleak_probe`/`netcoffee_probe` 页面资源与对应测试；构建、更新验签、运行组件安装同步移除该组件，`BuildInfo.plist` 不再声明 `BackgroundEvidenceSchema`（v4.2.5 应用内更新可直接跳过旧组件校验）。证据请求超时由 `180s` 收紧至 `25s`。
+- **`network_change` 广播本地快速核对**：收到普通网络变更通知时，先在数十毫秒内核对默认 IPv4 路由、内核监听进程身份与 TAG 控制器状态；全部未变且观测健康则原地续期、不断开 AI 连接，任一变化或失败仍立即失效并按原流程重新核验。
+- **网络检测三页即开即显**：「AI 连通检测」「泄漏检测」「IP 评分」打开时自动载入最近结果，没有结果时自动检测一次；IP 评分自动绑定当前观测出口，不再出现空白的「未检测」页面。
+
 ## 4.2.5 — 2026-11-26
 
 - **「IP 一致性」变更时间轴与不折行详情弹窗重构**：

@@ -45,12 +45,20 @@ final class NetCoffeeStore: ObservableObject {
         guard let ip = LeakIPAddress(receipt.query), ip.isPublic else { return }
         if validLookup(receipt, for: ip.canonical) {
             reports[ip.canonical] = receipt
+            if selectedIP.isEmpty {
+                selectedIP = ip.canonical
+                if query.isEmpty { query = ip.canonical }
+            }
             if message?.hasPrefix("Net.Coffee") == true { message = nil }
         } else {
             if let historical = decodeLastGood(receipt.last_good), validLookup(historical, for: ip.canonical) {
                 // Keep historical queriedAt unchanged: this is display evidence,
                 // never a renewed current-environment lookup.
                 reports[ip.canonical] = historical
+                if selectedIP.isEmpty {
+                    selectedIP = ip.canonical
+                    if query.isEmpty { query = ip.canonical }
+                }
             }
             message = "Net.Coffee 查询未完成：" + (receipt.error ?? receipt.status)
         }

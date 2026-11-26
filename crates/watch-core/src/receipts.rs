@@ -235,20 +235,26 @@ fn comparison(state: &str, reason: &str, detail: &str) -> Value {
     json!({"state":state,"reason":reason,"detail":detail})
 }
 
-/// The IPLeak response binds each resolver and the HTTP reference to one
-/// bounded session. Country values must come from that response, not the
-/// independently mutable presentation fields of the observations.
-fn ipleak_evidence(raw: &Value) -> Option<(BTreeMap<String, String>, BTreeSet<String>, String)> {
+/// Validates structured DNS evidence from either the native Rust multi-source
+/// collector (`"provider": "native"`) or historical IPLeak sessions (`"session"`).
+fn dns_evidence(
+    raw: &Value,
+) -> Option<(&'static str, BTreeMap<String, String>, BTreeSet<String>, String)> {
     let text = raw.as_str().filter(|v| v.len() <= 512_000)?;
     let value: Value = serde_json::from_str(text).ok()?;
-    let session = value["session"].as_str()?;
-    if session.len() != 40
-        || !session
-            .bytes()
-            .all(|v| v.is_ascii_digit() || (b'a'..=b'f').contains(&v))
-    {
-        return None;
-    }
+    let provider = if value.get("provider").and_then(Value::as_str) == Some("native") {
+        "native"
+    } else {
+        let session = value["session"].as_str()?;
+        if session.len() != 40
+            || !session
+                .bytes()
+                .all(|v| v.is_ascii_digit() || (b'a'..=b'f').contains(&v))
+        {
+            return None;
+        }
+        "ipleak"
+    };
     let servers = value["dns_servers"]
         .as_object()
         .filter(|v| v.len() <= 127)?;
@@ -268,7 +274,7 @@ fn ipleak_evidence(raw: &Value) -> Option<(BTreeMap<String, String>, BTreeSet<St
     let rows = value["geoip"].as_array().filter(|v| v.len() <= 32)?;
     for row in rows {
         let address = public(&row["ip"])?;
-        if !resolvers.contains(&address) {
+        if !resolvers.contains(&address) && address != http {
             return None;
         }
         let code = country(&row["country_code"]);
@@ -280,13 +286,14 @@ fn ipleak_evidence(raw: &Value) -> Option<(BTreeMap<String, String>, BTreeSet<St
         }
         countries.insert(address, code);
     }
-    Some((countries, resolvers, http))
+    Some((provider, countries, resolvers, http))
 }
 
 pub fn record_dns(probe: &Value, local: &Value, expected: Option<&str>, now: f64) -> Result<Value> {
     let (started, finished) = check_probe(probe, "dns", now)?;
-    let evidence = ipleak_evidence(&probe["externalJSON"]);
-    let codes = evidence.as_ref().map(|v| &v.0);
+    let evidence = dns_evidence(&probe["externalJSON"]);
+    let provider = evidence.as_ref().map_or("ipleak", |v| v.0);
+    let codes = evidence.as_ref().map(|v| &v.1);
     let mut dns = BTreeSet::new();
     let mut http = BTreeSet::new();
     let mut observations = Vec::new();
@@ -310,7 +317,7 @@ pub fn record_dns(probe: &Value, local: &Value, expected: Option<&str>, now: f64
             missing = true;
             continue;
         };
-        let in_evidence = evidence.as_ref().is_some_and(|(_, resolvers, reference)| {
+        let in_evidence = evidence.as_ref().is_some_and(|(_, _, resolvers, reference)| {
             if text(row, "kind") == "http" {
                 &address == reference
             } else {
@@ -322,10 +329,22 @@ pub fn record_dns(probe: &Value, local: &Value, expected: Option<&str>, now: f64
             continue;
         };
         bucket.insert((address, code.clone()));
-        observations.push(json!({"address":row["address"],"kind":row["kind"],
-            "country":code,"source":clipped(row,"source",160)}));
+        let mut clean_row = json!({"address":row["address"],"kind":row["kind"],
+            "country":code,"source":clipped(row,"source",160)});
+        if provider == "native" {
+            if let Some(fam) = row.get("family").and_then(Value::as_u64).filter(|&f| f == 4 || f == 6) {
+                clean_row["family"] = json!(fam);
+            }
+            for field in ["region", "city", "isp"] {
+                let val = clipped(row, field, 120);
+                if !val.is_empty() {
+                    clean_row[field] = json!(val);
+                }
+            }
+        }
+        observations.push(clean_row);
     }
-    if let Some((_, resolvers, reference)) = &evidence {
+    if let Some((_, _, resolvers, reference)) = &evidence {
         if resolvers
             .iter()
             .any(|address| !dns.iter().any(|(ip, _)| ip == address))
@@ -402,15 +421,18 @@ pub fn record_dns(probe: &Value, local: &Value, expected: Option<&str>, now: f64
         )
     };
     let context = local_context(local, expected, false)?;
+    let is_native = provider == "native";
     Ok(bind_receipt(
         json!({"schema":1,"status":probe["status"],"observed_at":now,"recorded_at":now,
         "started_at":started,"finished_at":finished,"sampled_at":finished,
         "display_expires_at":finished+DNS_DISPLAY_TTL,"launch_expires_at":finished+DNS_LAUNCH_TTL,
-        "context":context,"context_id":context,"provider":"ipleak",
-        "dns":{"egress_ips":dns.iter().map(|v|v.0.clone()).collect::<Vec<_>>(),"countries":dns_countries,"source":"IPLeak.net WebView authoritative DNS"},
-        "http":{"egress_ips":http.iter().map(|v|v.0.clone()).collect::<Vec<_>>(),"countries":http_countries,"source":"IPLeak.net WebView HTTP reference"},
+        "context":context,"context_id":context,"provider":provider,
+        "dns":{"egress_ips":dns.iter().map(|v|v.0.clone()).collect::<Vec<_>>(),"countries":dns_countries,
+            "source":if is_native {"原生多源权威 DNS 回显"} else {"IPLeak.net WebView authoritative DNS"}},
+        "http":{"egress_ips":http.iter().map(|v|v.0.clone()).collect::<Vec<_>>(),"countries":http_countries,
+            "source":if is_native {"原生代理 HTTP 参考"} else {"IPLeak.net WebView HTTP reference"}},
         "comparison":compare,"observations":observations,"errors":errors(&probe["errors"]),"query_error":query_error(&probe["errors"]),
-        "scope":probe.get("scope").and_then(Value::as_str).unwrap_or("IPLeak.net DNS 泄漏检测")}), local,
+        "scope":probe.get("scope").and_then(Value::as_str).unwrap_or(if is_native {"原生多源权威 DNS 递归出口检测"} else {"IPLeak.net DNS 泄漏检测"})}), local,
     ))
 }
 pub fn dns_last_valid(receipt: &Value, context: &str, now: f64) -> bool {
@@ -422,7 +444,7 @@ pub fn dns_last_valid(receipt: &Value, context: &str, now: f64) -> bool {
                 && (0.0..=90.0).contains(&(recorded - finished))
         });
     receipt["schema"] == 1
-        && text(receipt, "provider") == "ipleak"
+        && matches!(text(receipt, "provider"), "native" | "ipleak")
         && valid_time
         && !context.is_empty()
         && text(receipt, "context") == context
@@ -442,8 +464,8 @@ fn dns_state(
     if receipt["schema"] != 1 {
         return result("unknown", "DNS 泄漏检测尚未完成");
     }
-    if text(receipt, "provider") != "ipleak" {
-        return result("unknown", "请使用 IPLeak 重新检测 DNS 出口");
+    if !matches!(text(receipt, "provider"), "native" | "ipleak") {
+        return result("unknown", "请重新检测 DNS 递归出口");
     }
     let (Some(finished), Some(recorded), Some(expires)) = (
         number(&receipt["finished_at"]),
@@ -570,6 +592,8 @@ pub fn record_webrtc(
     let mut references = BTreeSet::new();
     let mut candidates = BTreeSet::new();
     let mut cn = Vec::new();
+    let is_native = text(probe, "provider") == "native";
+    let mut local_observations = Vec::new();
     for row in probe["observations"].as_array().into_iter().flatten() {
         if !row.is_object() {
             return Err(CoreError::new(
@@ -577,10 +601,17 @@ pub fn record_webrtc(
                 "WebRTC 地址记录无效",
             ));
         }
+        let kind = text(row, "kind");
         let Some(address) = public(&row["address"]) else {
+            if is_native && kind == "host" && !text(row, "address").is_empty() && local_observations.len() < 32 {
+                let mut local_row = json!({"address":clipped(row,"address",80),"kind":"host","source":clipped(row,"source",160)});
+                if let Some(fam) = row.get("family").and_then(Value::as_u64).filter(|&f| f == 4 || f == 6) {
+                    local_row["family"] = json!(fam);
+                }
+                local_observations.push(local_row);
+            }
             continue;
         };
-        let kind = text(row, "kind");
         if !matches!(kind, "http" | "host" | "srflx" | "prflx") {
             continue;
         }
@@ -604,7 +635,19 @@ pub fn record_webrtc(
         if code == "CN" {
             cn.push(address.clone());
         }
-        clean.push(json!({"address":address,"kind":kind,"country":code,"source":clipped(row,"source",160)}));
+        let mut clean_row = json!({"address":address,"kind":kind,"country":code,"source":clipped(row,"source",160)});
+        if is_native {
+            if let Some(fam) = row.get("family").and_then(Value::as_u64).filter(|&f| f == 4 || f == 6) {
+                clean_row["family"] = json!(fam);
+            }
+            for field in ["region", "city", "isp"] {
+                let val = clipped(row, field, 120);
+                if !val.is_empty() {
+                    clean_row[field] = json!(val);
+                }
+            }
+        }
+        clean.push(clean_row);
     }
     let mismatch =
         !references.is_empty() && !candidates.is_empty() && !candidates.is_subset(&references);
@@ -629,12 +672,18 @@ pub fn record_webrtc(
         "WebRTC 未取得完整的同轮 HTTP 出口与公网候选"
     };
     let diagnostic = expected_ip_diagnostic(&json!(clean), text(probe,"expected_ip"))?;
-    Ok(bind_receipt(
-        json!({"schema":1,"kind":"webrtc","status":probe["status"],"started_at":started,"sampled_at":finished,"recorded_at":now,
+    let mut receipt = json!({"schema":1,"kind":"webrtc","status":probe["status"],"started_at":started,"sampled_at":finished,"recorded_at":now,
         "display_expires_at":finished+DNS_DISPLAY_TTL,"context_id":context,
         "risk":{"state":state,"detail":detail,"cn_candidates":cn},"diagnostic":diagnostic,
-        "observations":clean,"errors":errors(&probe["errors"])}), local,
-    ))
+        "observations":clean,"errors":errors(&probe["errors"])});
+    if is_native {
+        receipt["provider"] = json!("native");
+        receipt["scope"] = json!(probe.get("scope").and_then(Value::as_str).unwrap_or("原生 ICE 网卡与双栈 STUN 候选检测"));
+        if !local_observations.is_empty() {
+            receipt["local_observations"] = json!(local_observations);
+        }
+    }
+    Ok(bind_receipt(receipt, local))
 }
 pub fn webrtc_status(receipt: &Value, context: &str, now: f64) -> Value {
     webrtc_status_for_network(receipt, context, None, now)
@@ -796,10 +845,11 @@ pub fn dns_row(status: &Value) -> Value {
     if cached {
         detail += "；此为历史显示，最新失败仍阻止受控启动";
     }
+    let is_native = text(&receipt, "provider") == "native";
     json!({"id":"dns","name":"DNS","state":if cached{"cached"}else{status.get("state").and_then(Value::as_str).unwrap_or("unknown")},
-        "detail":detail,"scope":"IPLeak.net DNS 泄漏采样；不代表所有应用或浏览器 DoH","required":true,
+        "detail":detail,"scope":if is_native {"原生多源权威 DNS 递归出口检测；不代表独立浏览器私有 DoH"} else {"IPLeak.net DNS 泄漏采样；不代表所有应用或浏览器 DoH"},"required":true,
         "current":current,"reference":format!("同轮 HTTP 出口国家 {}",if http_countries.is_empty(){"未确认"}else{&http_countries}),
-        "source":"IPLeak.net 权威 DNS 记录 + 同轮 HTTP 参考","sampled_at":receipt["finished_at"],
+        "source":if is_native {"Akamai / Google 权威 DNS 回显 + 同轮代理 HTTP 参考"} else {"IPLeak.net 权威 DNS 记录 + 同轮 HTTP 参考"},"sampled_at":receipt["finished_at"],
         "query_error":if status["state"]=="unknown"{status.get("detail").cloned().unwrap_or(Value::Null)}else{json!("")},
         "display_cached":cached,"last_valid":truthy(&status["last_valid"]["available"])})
 }

@@ -17,9 +17,4 @@ enum BundledBackendVariant {
               let raw = values["BackendVariant"] as? String else { return nil }
         return raw == "rust-candidate" ? .rustCandidate : nil
     }
-
-    static func backgroundEvidenceSchema(from resourceDirectory: URL) -> Int? {
-        let manifest = resourceDirectory.appendingPathComponent("BuildInfo.plist", isDirectory: false)
-        return (NSDictionary(contentsOf: manifest)?["BackgroundEvidenceSchema"] as? NSNumber)?.intValue
-    }
 }

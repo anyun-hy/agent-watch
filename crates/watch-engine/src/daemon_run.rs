@@ -536,6 +536,29 @@ fn spawn_vpn_observation_worker(
                 }
             };
             watch_configs(&mut watcher, &expectation);
+            let read_route_fingerprint = || -> Option<String> {
+                use claude_watch_runtime::commands::{ReadCommand, ReadRunner};
+                let runner = super::runtime::runner().ok()?;
+                let out = runner
+                    .run(ReadCommand::RouteDefaultV4, &[], Duration::from_millis(80), 8 * 1024)
+                    .ok()?;
+                if out.status != 0 {
+                    return None;
+                }
+                let text = out.text().ok()?;
+                let mut gw = "";
+                let mut iface = "";
+                for line in text.lines() {
+                    let trimmed = line.trim();
+                    if let Some(v) = trimmed.strip_prefix("gateway:") {
+                        gw = v.trim();
+                    } else if let Some(v) = trimmed.strip_prefix("interface:") {
+                        iface = v.trim();
+                    }
+                }
+                (!iface.is_empty()).then(|| format!("{iface}|{gw}"))
+            };
+            let mut last_route_fingerprint: Option<String> = None;
             while !stop.load(Ordering::Acquire) {
                 use claude_watch_runtime::vpn_observer::{DEFAULT_VPN_OBSERVATION_TTL_SECONDS, VPN_OBSERVATION_RENEWAL_LEAD_SECONDS};
                 let now = native::now();
@@ -658,7 +681,11 @@ fn spawn_vpn_observation_worker(
                         }
                         NetworkEventKind::DarwinNotification(name) => {
                             if name == "com.apple.system.clock_set" { lease_watchdog.unpark(); }
-                            invalidation = Some(format!("darwin_notification:{name}"));
+                            // Never let a plain `network_change` mask a stronger reason from the
+                            // same batch: the fast path below only applies when it is the sole cause.
+                            if name != "com.apple.system.config.network_change" || invalidation.is_none() {
+                                invalidation = Some(format!("darwin_notification:{name}"));
+                            }
                         }
                         NetworkEventKind::ClockDiscontinuity => {
                             lease_watchdog.unpark();
@@ -669,10 +696,69 @@ fn spawn_vpn_observation_worker(
                     }
                 }
                 if wake { invalidation = Some("system_wake".into()); }
+                // Fast-path debounce for spurious macOS `network_change` broadcasts (e.g. mDNS /
+                // secondary interface DHCP renewal): verify default route + kernel listener PID +
+                // local VPN controller state in ~30-50ms BEFORE revoking the active channel epoch.
+                if !wake
+                    && invalidation.as_deref() == Some("darwin_notification:com.apple.system.config.network_change")
+                    && custom_reader.is_none()
+                    && expectation.configured
+                    && observer.observed_listener_pid().is_some()
+                    && last_route_fingerprint.is_some()
+                {
+                    let current_route = read_route_fingerprint();
+                    if current_route.is_some() && current_route == last_route_fingerprint {
+                        if live_reader.is_none() {
+                            if let Ok(credentials) = resolve_vpn_controller_credentials(&storage, &expectation.proxy_mode) {
+                                live_reader = Some(
+                                    HttpControllerVpnReader::new_live(expectation.proxy_mode.clone(), credentials)
+                                        .with_listener_snapshot_result(Box::new(|timeout| {
+                                            let runner = super::runtime::runner()?;
+                                            claude_watch_runtime::vpn_observer::read_vpn_kernel_snapshot_checked(runner.as_ref(), timeout)
+                                        })),
+                                );
+                            }
+                        }
+                        if let Some(reader) = &live_reader {
+                            let prev_epoch = observer.state.current_epoch();
+                            let mut fast_verified = false;
+                            if let Ok(true) = observer.observe_steady_state_controller(
+                                reader,
+                                &expectation,
+                                native::now(),
+                                collector_loss,
+                                |obs| {
+                                    let publish = || send(obs.clone());
+                                    if let Some(stream) = &listener_stream {
+                                        stream.send_if_no_new_failure(seen_failure.get(), publish)
+                                    } else {
+                                        publish();
+                                        Ok(())
+                                    }
+                                },
+                            ) {
+                                fast_verified = observer.state.current_epoch() == prev_epoch
+                                    && observer.state.current_observation().is_some_and(
+                                        claude_watch_runtime::vpn_observer::VpnObservationState::healthy,
+                                    );
+                            }
+                            if fast_verified {
+                                consecutive_transient_failures = 0;
+                                retry_after = None;
+                                last_steady_check = Some(Instant::now());
+                                sync_watched_pid(&mut watcher, &observer);
+                                // Renewed in place: fall through without invalidating so lease
+                                // renewal and explicit refresh requests in this round still run.
+                                invalidation = None;
+                            }
+                        }
+                    }
+                }
                 let source_changed = invalidation.is_some();
                 if let Some(reason) = invalidation {
                     consecutive_transient_failures = 0;
                     last_steady_check = None;
+                    last_route_fingerprint = None;
                     watcher.set_watched_pids(&[]);
                     if expectation.configured {
                         if let Some(obs) = observer.invalidate_network_event(&reason, &expectation, now) { send(obs); }
@@ -752,6 +838,9 @@ fn spawn_vpn_observation_worker(
                                     consecutive_transient_failures = 0;
                                     retry_after = None;
                                     last_steady_check = Some(Instant::now());
+                                    if last_route_fingerprint.is_none() {
+                                        last_route_fingerprint = read_route_fingerprint();
+                                    }
                                     sync_watched_pid(&mut watcher, &observer);
                                     continue;
                                 }
@@ -873,6 +962,7 @@ fn spawn_vpn_observation_worker(
                         consecutive_transient_failures = 0;
                         retry_after = None;
                         last_steady_check = Some(Instant::now());
+                        last_route_fingerprint = read_route_fingerprint();
                         sync_watched_pid(&mut watcher, &observer);
                     }
                 } else {

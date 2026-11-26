@@ -29,6 +29,11 @@ struct NetCoffeeScorePage: View {
             CoffeeReportView(receipt: store.report(store.selectedIP), running: store.isQuerying, compact: false, p: p)
             Label("评分和风险属性来自第三方，不代表 AI 账号状态，也不能单独证明无泄漏。", systemImage: "info.circle").font(.caption).foregroundStyle(p.secondary)
         }.foregroundStyle(p.text).frame(maxWidth: 1120, alignment: .leading).padding(.top,24)
+            .onAppear {
+                if !store.isFixture && store.selectedIP.isEmpty && !store.isQuerying {
+                    store.start()
+                }
+            }
     }
 }
 

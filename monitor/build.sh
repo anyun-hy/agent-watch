@@ -6,7 +6,6 @@ CW_MACOS_MINIMUM=$(/bin/cat "$ROOT/macos-minimum.txt")
 REPOSITORY_ROOT=$(cd "$ROOT/.." && pwd -P)
 CW_BUILD_ARCH="${CW_BUILD_ARCH:-arm64}"
 CW_BACKEND_VARIANT="${CW_BACKEND_VARIANT:-rust-candidate}"
-BACKGROUND_EVIDENCE_SCHEMA=0
 CW_TARGETS="$CW_BUILD_ARCH"
 # Accept existing and older signing spellings without silently resolving conflicts.
 cw_resolve_signing_aliases() {
@@ -94,7 +93,6 @@ PY
 BACKEND_VERSION=$("$RUST_COMPONENTS_DIR/watch-engine" --version | python3 -c 'import json,sys; print(json.load(sys.stdin)["backend_version"])')
 BACKEND_SHA256=$(/usr/bin/shasum -a 256 "$RUST_COMPONENTS_DIR/watch-engine" | /usr/bin/awk '{print $1}')
 RUNTIME_SCHEMA=2
-BACKGROUND_EVIDENCE_SCHEMA=2
 
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" "$ROOT/build/module-cache"
 SWIFTC=$(xcrun --find swiftc)
@@ -106,13 +104,6 @@ for CW_TARGET_ARCH in $CW_TARGETS; do
     -sdk "$SDK" -module-cache-path "$ROOT/build/module-cache" \
     -framework SwiftUI -framework AppKit -framework WebKit "$ROOT"/Sources/*.swift \
     -o "$ROOT/build/AgentWatch.$CW_TARGET_ARCH"
-  # The Rust component manifest supplies watch-process-control. Do not build
-  # the retired Swift helper: it was overwritten by the Rust staging copy.
-  "$SWIFTC" -swift-version 5 -O -parse-as-library -D BACKGROUND_LEAK_WORKER \
-    -target "$CW_TARGET_ARCH-apple-macosx$CW_MACOS_MINIMUM" -sdk "$SDK" -module-cache-path "$ROOT/build/module-cache" \
-    -framework AppKit -framework WebKit "$ROOT/Sources/IdentityPresentation.swift" "$ROOT/Sources/BundledBackendVariant.swift" \
-    "$ROOT/Sources/LeakCheckModels.swift" "$ROOT/Sources/NetCoffeeModels.swift" "$ROOT/Sources/NetCoffeeLeakRunner.swift" "$ROOT/Sources/IPLeakDNSRunner.swift" "$ROOT/Sources/IPLeakDNSRetryRunner.swift" \
-    "$ROOT/tools/BackgroundLeakWorker.swift" -o "$ROOT/build/watch-leak-worker.$CW_TARGET_ARCH"
 
   # Build the ControlledEntry desktop wrapper binary
   "$SWIFTC" -swift-version 5 -O -parse-as-library \
@@ -121,15 +112,14 @@ for CW_TARGET_ARCH in $CW_TARGETS; do
     -o "$ROOT/build/ControlledEntry.$CW_TARGET_ARCH"
 done
 cp "$ROOT/build/AgentWatch.$CW_BUILD_ARCH" "$APP/Contents/MacOS/AgentWatch"
-cp "$ROOT/build/watch-leak-worker.$CW_BUILD_ARCH" "$APP/Contents/Resources/watch-leak-worker"
 cp "$ROOT/build/ControlledEntry.$CW_BUILD_ARCH" "$APP/Contents/Resources/ControlledEntry"
 
 # Remove retired components from a reused candidate output.
 rm -rf "$APP/Contents/Library/SystemExtensions"
 rm -f "$APP/Contents/embedded.provisionprofile"
 rm -f "$APP/Contents/Resources/webrtc_probe.html" "$APP/Contents/Resources/webrtc_probe.js"
-cp "$ROOT/Resources/netcoffee_probe.html" "$ROOT/Resources/netcoffee_probe.js" "$ROOT/Resources/netcoffee_probe.css" "$ROOT/Resources/watch-admin.sh" "$APP/Contents/Resources/"
-cp "$ROOT/Resources/ipleak_probe.html" "$ROOT/Resources/ipleak_probe.js" "$APP/Contents/Resources/"
+rm -f "$APP/Contents/Resources/watch-leak-worker" "$APP/Contents/Resources/netcoffee_probe."* "$APP/Contents/Resources/ipleak_probe."*
+cp "$ROOT/Resources/watch-admin.sh" "$APP/Contents/Resources/"
 mkdir -p "$APP/Contents/Resources/ThirdParty/ClaudeSwitcher" "$APP/Contents/Resources/ThirdParty/nono"
 cp "$ROOT/Resources/watch-native-collector.zsh" "$APP/Contents/Resources/"
 chmod 700 "$APP/Contents/Resources/watch-native-collector.zsh"
@@ -148,9 +138,9 @@ for key in ("engine", "native_observer", "process_control", "sandbox_launcher", 
     shutil.copy2(source, destination)
     destination.chmod(0o700)
 PY
-chmod 700 "$APP/Contents/Resources/watch-process-control" "$APP/Contents/Resources/watch-sandbox-launcher" "$APP/Contents/Resources/ControlledEntry" "$APP/Contents/Resources/watch-admin.sh" "$APP/Contents/Resources/watch-leak-worker"
+chmod 700 "$APP/Contents/Resources/watch-process-control" "$APP/Contents/Resources/watch-sandbox-launcher" "$APP/Contents/Resources/ControlledEntry" "$APP/Contents/Resources/watch-admin.sh"
 if [[ "$CW_SIGNING_IDENTITY" != - ]]; then
-  for CW_COMPONENT in watch-engine watch-native-observer watch-process-control watch-sandbox-launcher watch-gateway-broker ControlledEntry watch-leak-worker; do
+  for CW_COMPONENT in watch-engine watch-native-observer watch-process-control watch-sandbox-launcher watch-gateway-broker ControlledEntry; do
     CW_COMPONENT_ID="io.local.watchpanel.$CW_COMPONENT"
     if [[ "$CW_COMPONENT" == watch-engine ]]; then CW_COMPONENT_ID=io.local.watchpanel.engine; fi
     /usr/bin/codesign --force --sign "$CW_SIGNING_IDENTITY" "${CW_SIGN_OPTIONS[@]}" --identifier "$CW_COMPONENT_ID" "$APP/Contents/Resources/$CW_COMPONENT"
@@ -159,7 +149,6 @@ if [[ "$CW_SIGNING_IDENTITY" != - ]]; then
 else
   /usr/bin/codesign --force --sign - "$APP/Contents/Resources/watch-process-control"
   /usr/bin/codesign --force --sign - "$APP/Contents/Resources/ControlledEntry"
-  /usr/bin/codesign --force --sign - "$APP/Contents/Resources/watch-leak-worker"
 fi
 # The free local endpoint broker authenticates live engine code, including
 # hardened runtime/library validation. This is an ad-hoc-capable code signature,
@@ -205,7 +194,6 @@ cat > "$APP/Contents/Resources/BuildInfo.plist" <<PLIST
 <key>NetworkBackend</key><string>$CW_NETWORK_BACKEND</string>
 <key>SwitcherSchema</key><integer>1</integer>
 <key>RuntimeSchema</key><integer>$RUNTIME_SCHEMA</integer>
-<key>BackgroundEvidenceSchema</key><integer>$BACKGROUND_EVIDENCE_SCHEMA</integer>
 </dict></plist>
 PLIST
 python3 "$REPOSITORY_ROOT/tools/write-build-identity.py" verify --root "$REPOSITORY_ROOT" --snapshot "$CW_SOURCE_RECEIPT" --version "$APP_VERSION" --build "$BUILD_NUMBER" --resources "$APP/Contents/Resources"
@@ -215,9 +203,9 @@ import hashlib, plistlib, subprocess, sys
 root = Path(sys.argv[1])
 manifest = root / "BuildInfo.plist"
 value = plistlib.loads(manifest.read_bytes())
-forbidden = [p for p in root.rglob("*") if p.suffix == ".py" or p.name in ("claude-watch.sh", "snapshot.sh", "switcher.py")]
-if forbidden: raise SystemExit("The bundle still contains retired Python backend resources")
-files = [root / n for n in ("watch-engine", "watch-native-observer", "watch-admin.sh", "watch-process-control", "watch-sandbox-launcher", "watch-gateway-broker", "ControlledEntry", "watch-native-collector.zsh", "watch-leak-worker", "netcoffee_probe.html", "netcoffee_probe.js", "netcoffee_probe.css", "ipleak_probe.html", "ipleak_probe.js", "BuildIdentity.json")]
+forbidden = [p for p in root.rglob("*") if p.suffix == ".py" or p.name in ("claude-watch.sh", "snapshot.sh", "switcher.py", "watch-leak-worker")]
+if forbidden: raise SystemExit("The bundle still contains retired backend resources")
+files = [root / n for n in ("watch-engine", "watch-native-observer", "watch-admin.sh", "watch-process-control", "watch-sandbox-launcher", "watch-gateway-broker", "ControlledEntry", "watch-native-collector.zsh", "BuildIdentity.json")]
 value["RuntimeHashes"] = {str(p.relative_to(root)): hashlib.sha256(p.read_bytes()).hexdigest() for p in files}
 helper = root / "watch-sandbox-launcher"
 signature = subprocess.run(["/usr/bin/codesign", "--display", "--verbose=4", helper], capture_output=True, text=True, check=True).stderr

@@ -648,23 +648,6 @@ impl<E: FixedCommandExecutor> LifecycleOs for NativeRelease<E> {
             "watch-admin.sh",
             "watch-native-collector.zsh",
         ];
-        if crate::background_evidence::supported_manifest(&manifest)? {
-            required.extend_from_slice(crate::background_evidence::extra_files(&manifest)?);
-            let out = self.require(
-                "/usr/bin/lipo",
-                &[
-                    "-archs".into(),
-                    resources
-                        .join(crate::background_evidence::WORKER)
-                        .display()
-                        .to_string(),
-                ],
-                Duration::from_secs(10),
-            )?;
-            if out.stdout.split_whitespace().collect::<Vec<_>>() != ["arm64"] {
-                return Err(error("release_identity_mismatch", "后台检测组件不是arm64"));
-            }
-        }
         for component in ["watch-sandbox-launcher", "watch-gateway-broker"] {
             if manifest["NetworkBackend"] != "seatbelt" && !hashes.contains_key(component) {
                 continue;

@@ -7,11 +7,7 @@ use claude_watch_runtime::{
 };
 use serde_json::{json, Value};
 use support::oracle;
-use std::{
-    fs,
-    path::{Path, PathBuf},
-    process::Command,
-};
+use std::{fs, path::PathBuf};
 use uuid::Uuid;
 
 const NOW: f64 = 1_700_000_000.0;
@@ -202,35 +198,38 @@ fn ipleak_evidence_is_bound_to_the_session_and_observed_addresses() {
 }
 
 #[test]
-fn real_ipleak_collector_payload_reaches_the_backend_gate() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap();
-    let output = Command::new("node")
-        .arg(root.join("monitor/tests/test_ipleak_probe.cjs"))
-        .arg("--emit-fixture")
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let probe: Value = serde_json::from_slice(&output.stdout).unwrap();
-    let now = probe["finishedAt"].as_f64().unwrap() + 1.0;
-    let receipt = receipts::record_dns(&probe, &local(), None, now).unwrap();
-    assert_eq!(receipt["provider"], "ipleak");
+fn native_collector_payload_reaches_the_backend_gate() {
+    let now = NOW;
+    let probe = json!({
+        "provider": "native",
+        "kind": "dns",
+        "status": "complete",
+        "startedAt": now - 0.18,
+        "finishedAt": now,
+        "contextChanged": false,
+        "errors": [],
+        "observations": [
+            {"kind": "http", "address": "1.1.1.1", "country": "JP", "source": "Cloudflare Trace", "family": 4},
+            {"kind": "resolver", "address": "8.8.8.8", "country": "JP", "source": "Akamai TXT", "family": 4}
+        ],
+        "externalJSON": json!({
+            "provider": "native",
+            "dns_servers": {"8.8.8.8": 2},
+            "http": {"address": "1.1.1.1", "country": "JP"},
+            "geoip": [{"ip": "8.8.8.8", "country_code": "JP"}]
+        }).to_string()
+    });
+    let receipt = receipts::record_dns(&probe, &local(), None, now + 1.0).unwrap();
+    assert_eq!(receipt["provider"], "native");
     assert_eq!(receipt["comparison"]["state"], "ok");
     assert_eq!(
-        receipts::dns_status(&receipt, &json!({}), "ctx", true, now, |v| v.to_string())["state"],
+        receipts::dns_status(&receipt, &json!({}), "ctx", true, now + 1.0, |v| v.to_string())["state"],
         "ok"
     );
     let mut invalid = probe;
     invalid["contextChanged"] = json!(true);
     assert_ne!(
-        receipts::record_dns(&invalid, &local(), None, now).unwrap()["comparison"]["state"],
+        receipts::record_dns(&invalid, &local(), None, now + 1.0).unwrap()["comparison"]["state"],
         "ok"
     );
 }
