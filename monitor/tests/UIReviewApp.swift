@@ -31,9 +31,9 @@ struct ClaudeWatchUIReviewApp: App {
             CommandMenu("验收页面") {
                 ForEach(Array(Page.orderedPages.enumerated()), id: \.element) { index, page in
                     if index < 10 {
-                        Button(page.rawValue) { session.store.page = page }
+                        Button(page.sidebarTitle) { session.store.page = page }
                             .keyboardShortcut(KeyEquivalent(Character(index == 9 ? "0" : String(index + 1))), modifiers: .command)
-                    } else { Button(page.rawValue) { session.store.page = page } }
+                    } else { Button(page.sidebarTitle) { session.store.page = page } }
                 }
             }
             CommandMenu("验收尺寸") {

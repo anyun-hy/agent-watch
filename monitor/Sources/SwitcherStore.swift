@@ -4,11 +4,14 @@ import Foundation
 import SwiftUI
 
 struct HistoryEntry: Decodable, Identifiable {
-    var id: String { ip + (role ?? "") }
+    var id: String { (role ?? "item") + ":" + ip + ":" + String(first_seen ?? 0) }
     let ip: String
     var role: String? = nil
     var node: String? = nil
     var label: String? = nil
+    var confirmed_at: Double? = nil
+    var first_seen: Double? = nil
+    var last_seen: Double? = nil
 }
 
 struct EnvironmentCheckRow: Decodable, Identifiable {
@@ -42,6 +45,9 @@ struct EnvironmentCheckRow: Decodable, Identifiable {
     // IP History & Baseline
     var confirmed_ip: String? = nil
     var baseline_changed: Bool? = nil
+    var confirmed_at: Double? = nil
+    var last_baseline_seen_at: Double? = nil
+    var changed_detected_at: Double? = nil
     var history_entries: [HistoryEntry]? = nil
     var statusLabel: String {
         switch state {
@@ -369,6 +375,7 @@ struct BackgroundServiceReceipt: Decodable {
     var egress_reference: EgressReference?
     var facts: ProtectionFacts?
     var session_guard: SessionGuardStatus?
+    var openai_session_guard: SessionGuardStatus? = nil
     var backend_diagnostics: BackendInitializationDiagnostics?
     var backend_alive: Bool? = nil
     var protection_ready: Bool? = nil
@@ -1184,12 +1191,18 @@ final class SwitcherStore: ObservableObject {
                      actionTitle: "保存当前并打开 \(slot.id)")
     }
 
-    var sessionDisplayEvidence: SessionProtectionEvidence? {
+    func sessionEvidence(for product: MonitoredProduct) -> SessionProtectionEvidence? {
         guard let value = background else { return nil }
-        return SessionProtectionEvidence.fromBackground(value, error: backgroundError)
+        return SessionProtectionEvidence.fromBackground(value, product: product, error: backgroundError)
+    }
+    func sessionPresentation(for product: MonitoredProduct) -> SessionProtectionPresentation {
+        sessionEvidence(for: product)?.presentation(at: loginClock.timeIntervalSince1970) ?? .unavailable(error: backgroundError)
+    }
+    var sessionDisplayEvidence: SessionProtectionEvidence? {
+        sessionEvidence(for: .claude)
     }
     var sessionDisplay: SessionProtectionPresentation {
-        sessionDisplayEvidence?.presentation(at: loginClock.timeIntervalSince1970) ?? .unavailable(error: backgroundError)
+        sessionPresentation(for: .claude)
     }
     /// First-run path: only raises the system consent prompt. It must NOT open
     /// System Settings, otherwise the Settings window covers the prompt and the

@@ -7,13 +7,36 @@ enum Page: String, CaseIterable {
     case claudeAI = "Claude AI 检测", gptAI = "GPT / Codex 检测"
     case switcher = "启动与账号", environment = "环境状态", protection = "后台保护"
     static let primaryPages: [Page] = [.environment, .switcher, .protection]
-    static let monitorPages: [Page] = [.overview, .network, .processes, .events]
+    static let monitorPages: [Page] = [.network, .processes, .events]
     static var orderedPages: [Page] { primaryPages + monitorPages + diagnosticPages }
-    static func restored(_ value: String) -> Page { value == "安全启动与账号" ? .environment : Page(rawValue: value) ?? .environment }
+    static func restored(_ value: String) -> Page {
+        switch value {
+        case "安全启动与账号", "监控概览": return .environment
+        case "AI 连通检测": return .claudeAI
+        case "泄漏检测": return .dns
+        default: return Page(rawValue: value) ?? .environment
+        }
+    }
     var isPrimary: Bool { Self.primaryPages.contains(self) }
     var isLeakCheck: Bool { self == .dns || self == .webrtc }
     var isManualCheck: Bool { isLeakCheck || self == .ipScore || self == .claudeAI || self == .gptAI || isPrimary }
-    static let diagnosticPages: [Page] = [.claudeAI, .gptAI, .ipScore, .dns, .webrtc]
+    static let diagnosticPages: [Page] = [.claudeAI, .dns, .ipScore]
+
+    var sidebarTitle: String {
+        switch self {
+        case .claudeAI, .gptAI: return "AI 连通检测"
+        case .dns, .webrtc: return "泄漏检测"
+        default: return rawValue
+        }
+    }
+
+    func matchesSidebarItem(_ item: Page) -> Bool {
+        switch item {
+        case .claudeAI: return self == .claudeAI || self == .gptAI
+        case .dns: return self == .dns || self == .webrtc
+        default: return self == item
+        }
+    }
     var symbol: String {
         switch self {
         case .overview: return "square.grid.2x2"

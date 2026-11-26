@@ -380,3 +380,59 @@ fn footer_message_appends_online_detection_failure_reason() {
     assert!(out["message"].as_str().unwrap_or("").contains("未完成"));
     let _ = fs::remove_dir_all(home);
 }
+
+#[test]
+fn ip_history_enriches_change_timestamps_and_recent_runs() {
+    let (home, store) = store();
+    fs::create_dir_all(store.paths.base()).unwrap();
+    store
+        .atomic_json(
+            &store.paths.base().join("confirmed-environment.json"),
+            &json!({
+                "confirmed_at": NOW - 7200.0,
+                "values": {
+                    "ip": "106.178.154.248",
+                    "node": "日本家宽 11|3x JP"
+                }
+            }),
+        )
+        .unwrap();
+    store
+        .atomic_json(
+            &store.paths.base().join("ip-history.json"),
+            &json!([
+                {"time": NOW - 9000.0, "ip": "1.0.0.1"},
+                {"time": NOW - 7200.0, "ip": "106.178.154.248"},
+                {"time": NOW - 600.0,  "ip": "106.178.154.248"},
+                {"time": NOW - 120.0,  "ip": "106.178.150.201"},
+                {"time": NOW - 10.0,   "ip": "106.178.150.201"}
+            ]),
+        )
+        .unwrap();
+    let mut observed = audit();
+    observed["display_facts"]["online"]["trace"]["ip"] = json!("106.178.150.201");
+    let out = receipt(&store, observed, session(), false).unwrap();
+    let history = out["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == "ip_history")
+        .unwrap();
+    assert_eq!(history["state"], json!("warn"));
+    assert_eq!(history["confirmed_ip"], json!("106.178.154.248"));
+    assert_eq!(history["confirmed_at"], json!(NOW - 7200.0));
+    assert_eq!(history["last_baseline_seen_at"], json!(NOW - 600.0));
+    assert_eq!(history["changed_detected_at"], json!(NOW - 120.0));
+    let entries = history["history_entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 3);
+    assert_eq!(entries[0]["role"], json!("current"));
+    assert_eq!(entries[0]["ip"], json!("106.178.150.201"));
+    assert_eq!(entries[0]["first_seen"], json!(NOW - 120.0));
+    assert_eq!(entries[0]["last_seen"], json!(NOW - 10.0));
+    assert_eq!(entries[1]["role"], json!("confirmed_baseline"));
+    assert_eq!(entries[1]["ip"], json!("106.178.154.248"));
+    assert_eq!(entries[1]["last_seen"], json!(NOW - 600.0));
+    assert_eq!(entries[2]["role"], json!("history"));
+    assert_eq!(entries[2]["ip"], json!("1.0.0.1"));
+    let _ = fs::remove_dir_all(home);
+}

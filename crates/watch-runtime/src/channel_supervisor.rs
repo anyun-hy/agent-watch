@@ -3164,23 +3164,30 @@ impl ChannelSupervisor {
             upstream_endpoint: self.upstream_endpoint.clone(),
             issued_at: now,
         };
-        let silent_renewal = permit.state == ChannelPermitState::Permitted
-            && self.tracks.get(family).is_some_and(|t| {
-                t.permit_generation == permit.permit_generation
-                    && t.session_id == permit.session_id
-                    && t.policy_sync_state == PolicySyncState::Applied
-                    && t.current_permit.as_ref().is_some_and(|old| {
-                        old.state == ChannelPermitState::Permitted
-                            && old.reason_code == permit.reason_code
-                            && old.policy_version == permit.policy_version
-                            && old.vpn_epoch == permit.vpn_epoch
-                    })
-                    && t.latest_receipt.as_ref().is_some_and(|old_r| {
-                        old_r.enforcement_state == ChannelEnforcementState::Forwarding
-                            && old_r.error_code.is_none()
-                    })
-                    && t.commanded_processes == command.allowed_processes
-            });
+        let silent_renewal = matches!(
+            permit.state,
+            ChannelPermitState::Permitted | ChannelPermitState::PendingVerification
+        ) && self.tracks.get(family).is_some_and(|t| {
+            let expected_enforcement = if permit.state == ChannelPermitState::Permitted {
+                ChannelEnforcementState::Forwarding
+            } else {
+                ChannelEnforcementState::Blocked
+            };
+            t.permit_generation == permit.permit_generation
+                && t.session_id == permit.session_id
+                && t.policy_sync_state == PolicySyncState::Applied
+                && t.current_permit.as_ref().is_some_and(|old| {
+                    old.state == permit.state
+                        && old.reason_code == permit.reason_code
+                        && old.policy_version == permit.policy_version
+                        && old.vpn_epoch == permit.vpn_epoch
+                })
+                && t.latest_receipt.as_ref().is_some_and(|old_r| {
+                    old_r.enforcement_state == expected_enforcement
+                        && old_r.error_code.is_none()
+                })
+                && t.commanded_processes == command.allowed_processes
+        });
         if let Some(track) = self.tracks.get_mut(family) {
             track.commanded_processes = command.allowed_processes.clone();
             track.session_id = permit.session_id.clone();
@@ -3365,7 +3372,10 @@ impl ChannelSupervisor {
         };
         let suppress_steady_log = silent_renewal
             && accepted
-            && receipt_for_log.enforcement_state == ChannelEnforcementState::Forwarding
+            && matches!(
+                receipt_for_log.enforcement_state,
+                ChannelEnforcementState::Forwarding | ChannelEnforcementState::Blocked
+            )
             && receipt_for_log.error_code.is_none();
         if changed && !suppress_steady_log {
             if let Some(logger) = &self.diagnostics {

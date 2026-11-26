@@ -72,18 +72,45 @@ struct AIInspectorPage: View {
     }
 
     private var heading: some View {
-        InspectorHeading(title: service.title,
-            subtitle: service == .claude ? "核对 Claude 服务响应、诊断出口与应用连接。" : "核对 ChatGPT 与 OpenAI API 的服务响应、诊断出口与应用连接。", p: p) {
-            Button {
-                state.running ? probes.cancel(service) : probes.start(service)
-            } label: {
-                Label(state.running ? "取消检测" : service == .claude ? "检测 Claude" : "检测 GPT / Codex",
-                      systemImage: state.running ? "stop.fill" : "play.fill")
-                    .font(WatchTypography.bodyStrong)
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 8) {
+                HStack(spacing: 4) {
+                    ForEach([AIService.claude, AIService.gpt], id: \.self) { candidate in
+                        let selected = candidate == service
+                        Button {
+                            store.page = candidate == .claude ? .claudeAI : .gptAI
+                        } label: {
+                            HStack(spacing: 6) {
+                                BrandLogo(brand: candidate == .claude ? .claude : .chatgpt, size: 14)
+                                Text(candidate == .claude ? "Claude" : "ChatGPT / Codex")
+                                    .font(selected ? WatchTypography.captionStrong : WatchTypography.caption)
+                            }
+                            .foregroundStyle(selected ? p.text : p.secondary)
+                            .padding(.horizontal, 12).padding(.vertical, 6)
+                            .background(selected ? p.surface : Color.clear, in: RoundedRectangle(cornerRadius: 7))
+                            .overlay(RoundedRectangle(cornerRadius: 7).strokeBorder(selected ? p.border.opacity(0.85) : Color.clear, lineWidth: 1))
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+                .padding(3)
+                .background(p.elevated, in: RoundedRectangle(cornerRadius: 9))
+                Spacer()
             }
-            .buttonStyle(.borderedProminent)
-            .tint(state.running ? p.secondary : accent)
-            .accessibilityLabel(state.running ? "取消 \(service.title)" : result == nil ? "开始 \(service.title)" : "重新运行 \(service.title)")
+            InspectorHeading(title: service.title,
+                subtitle: service == .claude ? "核对 Claude 服务响应、诊断出口与应用连接。" : "核对 ChatGPT 与 OpenAI API 的服务响应、诊断出口与应用连接。", p: p) {
+                Button {
+                    state.running ? probes.cancel(service) : probes.start(service)
+                } label: {
+                    Label(state.running ? "取消检测" : service == .claude ? "检测 Claude" : "检测 GPT / Codex",
+                          systemImage: state.running ? "stop.fill" : "play.fill")
+                        .font(WatchTypography.bodyStrong)
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(state.running ? p.secondary : accent)
+                .accessibilityLabel(state.running ? "取消 \(service.title)" : result == nil ? "开始 \(service.title)" : "重新运行 \(service.title)")
+            }
         }
     }
 

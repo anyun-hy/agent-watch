@@ -524,6 +524,84 @@ fn cache_rows(store: &StateStore, audit: &Value, rows: &mut [Value], persist: bo
     Ok(())
 }
 
+#[derive(Clone, Debug)]
+struct IpHistoryRun {
+    ip: String,
+    first_seen: f64,
+    last_seen: f64,
+}
+
+#[derive(Default, Debug)]
+struct IpHistoryTimeline {
+    runs: Vec<IpHistoryRun>,
+    current_run: Option<IpHistoryRun>,
+    last_baseline_seen_at: Option<f64>,
+    changed_detected_at: Option<f64>,
+}
+
+fn summarize_ip_history(store: &StateStore, address: &str, baseline: &str) -> IpHistoryTimeline {
+    let raw = store
+        .read_json(&store.paths.base().join("ip-history.json"), Value::Null)
+        .unwrap_or(Value::Null);
+    let mut runs: Vec<IpHistoryRun> = Vec::new();
+    if let Some(items) = raw.as_array() {
+        for item in items {
+            let ip = valid_ip(&item["ip"]);
+            let Some(at) = number(&item["time"]) else {
+                continue;
+            };
+            if ip.is_empty() {
+                continue;
+            }
+            if let Some(last) = runs.last_mut().filter(|r| r.ip == ip) {
+                if at < last.first_seen {
+                    last.first_seen = at;
+                }
+                if at > last.last_seen {
+                    last.last_seen = at;
+                }
+            } else {
+                runs.push(IpHistoryRun {
+                    ip,
+                    first_seen: at,
+                    last_seen: at,
+                });
+            }
+        }
+    }
+    let current_run = (!address.is_empty()).then(|| {
+        runs.last()
+            .filter(|r| r.ip == address)
+            .cloned()
+            .or_else(|| runs.iter().rev().find(|r| r.ip == address).cloned())
+    }).flatten();
+    let last_baseline_seen_at = (!baseline.is_empty())
+        .then(|| {
+            runs.iter()
+                .rev()
+                .find(|r| r.ip == baseline)
+                .map(|r| r.last_seen)
+        })
+        .flatten();
+    let changed_detected_at = if !address.is_empty() && !baseline.is_empty() && address != baseline {
+        if let Some(baseline_idx) = runs.iter().rposition(|r| r.ip == baseline) {
+            runs.get(baseline_idx + 1..)
+                .and_then(|after| after.iter().find(|r| r.ip == address).or_else(|| after.first()))
+                .map(|r| r.first_seen)
+        } else {
+            current_run.as_ref().map(|r| r.first_seen)
+        }
+    } else {
+        None
+    };
+    IpHistoryTimeline {
+        runs,
+        current_run,
+        last_baseline_seen_at,
+        changed_detected_at,
+    }
+}
+
 fn apply_session_rows(
     store: &StateStore,
     rows: &mut [Value],
@@ -575,6 +653,11 @@ fn apply_session_rows(
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_owned();
+    let confirmed_at = confirmed_env.as_ref().and_then(|v| {
+        number(&v["confirmed_at"])
+            .or_else(|| number(&v["accepted_at"]))
+            .or_else(|| number(&v["observed_at"]))
+    });
     let is_confirmed_baseline = session_baseline.is_empty() && !confirmed_ip.is_empty();
     let baseline = if session_baseline.is_empty() {
         confirmed_ip.clone()
@@ -587,6 +670,7 @@ fn apply_session_rows(
     let locked_change =
         state == "locked" && text(&session["reason"], "code") == "egress_ip_changed";
     let different = !address.is_empty() && address != baseline;
+    let timeline = summarize_ip_history(store, address, &baseline);
     let (row_state, detail) = if is_confirmed_baseline && different {
         (
             "warn",
@@ -611,26 +695,72 @@ fn apply_session_rows(
         } else {
             address
         });
-        row["reference"] = json!(format!("确认基准 {baseline}"));
+        row["reference"] = json!(format!(
+            "{} {baseline}",
+            if is_confirmed_baseline {
+                "确认基准"
+            } else {
+                "会话基准"
+            }
+        ));
         row["detail"] = json!(detail);
         row["source"] = json!("本轮实测出口 / 系统已确认基准 (confirmed-environment.json)");
         row["required"] = json!(different);
         row["confirmed_ip"] = json!(baseline);
         row["baseline_changed"] = json!(different);
+        if let Some(at) = confirmed_at {
+            row["confirmed_at"] = json!(at);
+        }
+        if let Some(at) = timeline.last_baseline_seen_at {
+            row["last_baseline_seen_at"] = json!(at);
+        }
+        if different {
+            if let Some(at) = timeline.changed_detected_at {
+                row["changed_detected_at"] = json!(at);
+            }
+        }
         let mut history_entries = Vec::new();
         if !address.is_empty() {
-            history_entries.push(json!({
+            let mut entry = json!({
                 "ip": address,
                 "role": "current",
                 "label": "当前实测出口",
-            }));
+            });
+            if let Some(run) = timeline.current_run.as_ref() {
+                entry["first_seen"] = json!(run.first_seen);
+                entry["last_seen"] = json!(run.last_seen);
+            }
+            history_entries.push(entry);
         }
         if !confirmed_ip.is_empty() {
-            history_entries.push(json!({
+            let mut entry = json!({
                 "ip": confirmed_ip,
                 "node": confirmed_node,
                 "role": "confirmed_baseline",
                 "label": "已确认基准",
+            });
+            if let Some(at) = confirmed_at {
+                entry["confirmed_at"] = json!(at);
+            }
+            if let Some(run) = timeline.runs.iter().rev().find(|run| run.ip == confirmed_ip) {
+                entry["first_seen"] = json!(run.first_seen);
+                entry["last_seen"] = json!(run.last_seen);
+            }
+            history_entries.push(entry);
+        }
+        for run in timeline
+            .runs
+            .iter()
+            .rev()
+            .filter(|run| run.ip != address && run.ip != confirmed_ip)
+            .take(5)
+        {
+            history_entries.push(json!({
+                "ip": run.ip,
+                "role": "history",
+                "label": "历史出口",
+                "first_seen": run.first_seen,
+                "last_seen": run.last_seen,
             }));
         }
         row["history_entries"] = json!(history_entries);

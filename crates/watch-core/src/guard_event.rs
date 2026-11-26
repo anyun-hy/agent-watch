@@ -25,7 +25,11 @@ pub const NON_POLICY_REASONS: &[&str] = &[
     "vpn_observation_unknown", "vpn_observation_stale", "vpn_refresh_pending",
     "egress_evidence_expired", "permit_lease_expired", "awaiting_recovery_verification",
     "unmanaged_existing_processes", "process_observation_changed",
-    "process_observation_stale",
+    "process_observation_stale", "evidence_vpn_epoch_mismatch",
+    "recovery_verification_failed", "async_audit_retry_wait",
+    "audit_context_changed", "channel_inventory_incomplete",
+    "sleep_wake_reverify_required", "enforcement_receipt_expired",
+    "enforcement_receipt_failed",
     "none", "other",
 ];
 

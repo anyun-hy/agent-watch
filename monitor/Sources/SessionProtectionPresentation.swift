@@ -5,13 +5,14 @@ struct SessionProtectionEvidence {
     let session: SessionGuardStatus
     let observedAt: Double
     let backendReady: Bool
+    var product: MonitoredProduct = .claude
     var readError: String = ""
 
-    static func fromBackground(_ receipt: BackgroundServiceReceipt, error: String = "") -> Self? {
-        guard let session = receipt.session_guard else { return nil }
+    static func fromBackground(_ receipt: BackgroundServiceReceipt, product: MonitoredProduct = .claude, error: String = "") -> Self? {
+        guard let session = (product == .claude ? receipt.session_guard : receipt.openai_session_guard) else { return nil }
         let backendReady = receipt.protection_ready ?? ((receipt.guard_backend_healthy ?? receipt.backend_healthy) &&
             receipt.services.first(where: { $0.id == "guard" })?.healthy == true)
-        return .init(session: session, observedAt: (session.state == "idle" || session.state == "missing" || session.state == "pending") ? receipt.observed_at : (session.sampled_at ?? 0), backendReady: backendReady, readError: error)
+        return .init(session: session, observedAt: (session.state == "idle" || session.state == "missing" || session.state == "pending") ? receipt.observed_at : (session.sampled_at ?? 0), backendReady: backendReady, product: product, readError: error)
     }
 
     func isStale(at now: Double) -> Bool {
@@ -23,7 +24,7 @@ struct SessionProtectionEvidence {
         if !readError.isEmpty && session.state != "risk" && session.state != "locked" && session.phase != "locked" {
             return .init(title: "保护状态读取失败", detail: "保留上次记录：" + readError, symbol: "exclamationmark.triangle", tone: "warning")
         }
-        return .make(session, stale: isStale(at: now), backendReady: backendReady)
+        return .make(session, product: product, stale: isStale(at: now), backendReady: backendReady)
     }
 }
 
@@ -40,9 +41,11 @@ struct SessionProtectionPresentation {
                      symbol: "exclamationmark.triangle", tone: "warning")
     }
 
-    static func make(_ session: SessionGuardStatus, stale: Bool = false, backendReady: Bool = true) -> Self {
+    static func make(_ session: SessionGuardStatus, product: MonitoredProduct = .claude, stale: Bool = false, backendReady: Bool = true) -> Self {
+        let appName = product == .claude ? "Claude" : "ChatGPT / Codex"
+        let launchName = product == .claude ? "Claude" : "ChatGPT"
         if session.state == "risk" || session.state == "locked" || session.phase == "locked" {
-            let stop = session.stop_state == "confirmed" ? "Claude 已确认退出。" : (session.stop_state == "failed" ? "退出失败（\(session.stop_error ?? "未知错误")），待后台重试。" : "正在等待退出确认。")
+            let stop = session.stop_state == "confirmed" ? "\(appName) 已确认退出。" : (session.stop_state == "failed" ? "退出失败（\(session.stop_error ?? "未知错误")），待后台重试。" : "正在等待退出确认。")
             return .init(title: "会话保护已触发",
                          detail: (session.reason?.detail ?? "保护检测命中阻断条件。") + " " + stop,
                          symbol: "pause.circle", tone: "danger")
@@ -57,7 +60,10 @@ struct SessionProtectionPresentation {
         }
         switch session.state {
         case "idle":
-            return .init(title: idleTitle, detail: idleDetail, symbol: "shield", tone: "info")
+            let detail = product == .claude
+                ? idleDetail
+                : "后台保护待命，无需操作。\(appName) 已关闭；下次使用时通过受控启动执行完整校验。"
+            return .init(title: idleTitle, detail: detail, symbol: "shield", tone: "info")
         case "safe":
             if ["egress_unconfirmed", "risk_evidence_missing", "risk_evidence_unavailable"].contains(session.reason?.code ?? "") {
                 return .init(title: "本轮保护检测未完成", detail: session.reason?.detail ?? "正在重试采样。",
@@ -66,11 +72,11 @@ struct SessionProtectionPresentation {
             return .init(title: "保护运行中", detail: "会话基准与当前出口已核对。", symbol: "checkmark.shield", tone: "success")
         case "pending":
             if session.phase == "rechecking" {
-                return .init(title: "正在复核新进程", detail: "旧会话已结束，正在重新核验 Claude 身份和网络；出口保护继续运行。", symbol: "clock", tone: "info")
+                return .init(title: "正在复核新进程", detail: "旧会话已结束，正在重新核验 \(appName) 身份和网络；出口保护继续运行。", symbol: "clock", tone: "info")
             }
-            return .init(title: "正在建立受控会话", detail: "正在绑定 Claude 启动进程，完成后自动更新。", symbol: "clock", tone: "info")
+            return .init(title: "正在建立受控会话", detail: "正在绑定 \(appName) 启动进程，完成后自动更新。", symbol: "clock", tone: "info")
         case "missing":
-            return .init(title: "等待受控启动", detail: "使用“检查并启动 Claude”时自动建立会话，无需手动配置。", symbol: "shield", tone: "info")
+            return .init(title: "等待受控启动", detail: "使用“启动 \(launchName)”受控启动时自动建立会话，无需手动配置。", symbol: "shield", tone: "info")
         default:
             return .init(title: "本轮保护检测未完成", detail: session.reason?.detail ?? "尚未取得有效的本轮保护检测结果，正在等待下一轮采样。",
                          symbol: "clock", tone: "info")

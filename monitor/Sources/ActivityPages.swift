@@ -115,6 +115,7 @@ struct EventTimelinePage: View {
     @State private var requestID = UUID()
     @State private var exportingDiagnostics = false
     @State private var diagnosticExportResult: DiagnosticExportResult?
+    @State private var showOperationLog = false
     @ObservedObject private var diagnosticLog = DiagnosticLogStatus.shared
 
     private let filters = ["关键", "需关注", "网络", "进程", "采样", "全部"]
@@ -241,6 +242,22 @@ struct EventTimelinePage: View {
                 if store.automatic && !showingOlder && !loading { await loadHistory(reset: true) }
             }
         }
+        .sheet(isPresented: $showOperationLog) {
+            VStack(alignment: .leading, spacing: 16) {
+                HStack {
+                    Text("工具操作记录").font(WatchTypography.pageTitle)
+                    Spacer()
+                    Button("关闭") { showOperationLog = false }
+                }
+                Text("环境确认、账号切换与后台维护的最近操作记录。").font(WatchTypography.caption).foregroundStyle(p.secondary)
+                ScrollView {
+                    Text(store.switcher.operationLog.isEmpty ? "暂无操作记录" : store.switcher.operationLog)
+                        .font(WatchTypography.mono).textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }.frame(height: 360)
+            }
+            .padding(24).frame(width: 720).foregroundStyle(p.text).background(p.surface)
+        }
     }
 
     private var controls: some View {
@@ -272,6 +289,14 @@ struct EventTimelinePage: View {
                     .controlSize(.small).disabled(loading)
             }
             Menu("日志操作") {
+                Button("查看工具操作记录…") {
+                    Task {
+                        await store.switcher.perform(["logs"], refresh: false)
+                        if !store.switcher.failure { showOperationLog = true }
+                    }
+                }
+                .disabled(store.switcher.busy)
+                Divider()
                 if hasHistoryBackend {
                     Button(exportingDiagnostics ? "正在导出…" : "导出诊断包…") { exportDiagnostics() }
                         .disabled(exportingDiagnostics)

@@ -5,6 +5,37 @@ private enum GraphNodeID: String {
     case code, desktop, managed, gateway, tag, node, service
 }
 
+/// Read-only entry status footer for the monitoring graph; configuration lives solely in Background Protection.
+private struct ManagedEntryReadonlyStrip: View {
+    @ObservedObject var control: ManagedEntryControl
+    let product: MonitoredProduct
+    let p: Palette
+    let onOpenProtection: () -> Void
+    private var state: ManagedEntryControl.State { control.state(for: product) }
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: state.report?.entry_generated == true ? "shield.checkered" : "shield")
+                .foregroundStyle(state.report?.entry_generated == true ? p.mint : p.secondary)
+            Text("受控桌面入口").font(WatchTypography.caption.weight(.medium))
+            if let report = state.report {
+                Badge(text: report.entry_generated ? "已生成" : "未生成",
+                      color: report.entry_generated ? p.mint : p.secondary)
+                Text("· " + report.status_label)
+                    .font(WatchTypography.small).foregroundStyle(p.secondary)
+                    .lineLimit(1)
+            } else {
+                Badge(text: state.busy ? "读取中" : "状态待读取", color: p.secondary)
+            }
+            Spacer(minLength: 12)
+            PageLink(title: "前往后台保护配置", p: p, action: onOpenProtection)
+        }
+        .padding(.horizontal, 23).padding(.vertical, 8)
+        .background(p.elevated.opacity(0.22))
+        .task(id: product) { await control.refresh(for: product) }
+    }
+}
+
 /// Observe the entry controller itself: MonitorStore does not forward its changes.
 struct ManagedEntryPanel: View {
     @ObservedObject var control: ManagedEntryControl
@@ -256,8 +287,13 @@ struct ConnectionGraphView: View {
                 archivedPath(archived)
             }
             Divider()
-            ManagedEntryPanel(control: store.managedEntryControl, product: selectedProduct, p: p)
-                .id(selectedProduct)
+            ManagedEntryReadonlyStrip(
+                control: store.managedEntryControl,
+                product: selectedProduct,
+                p: p,
+                onOpenProtection: { store.page = .protection }
+            )
+            .id(selectedProduct)
         }
         .background {
             ZStack {

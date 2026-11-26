@@ -62,6 +62,7 @@ pub fn dispatch(request: &Request, paths: Paths, uid: u32) -> Result<Option<Valu
             })));
         }
         let _operation = store.lock("operation", None)?;
+        crate::update_dispatch::sweep_stale_update_stages(&paths.base());
         let identity = os.validate_bundle(&installed)?;
         let had_agent = os.stop_agent()?;
         let result: Result<()> = (|| {

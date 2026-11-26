@@ -14,6 +14,12 @@ struct MonitorView: View {
     @State private var sidebarVisibility: NavigationSplitViewVisibility = .all
     @State private var showProxyDetails = false
     @State private var confirmUpdateInstall = false
+    @State private var confirmRecoveryAction: GlobalRecoveryKind?
+
+    private enum GlobalRecoveryKind: Identifiable {
+        case setup, update
+        var id: String { self == .setup ? "setup" : "update" }
+    }
 
     init(store: MonitorStore, startMonitoring: Bool = true, restoresNavigation: Bool = true, refreshAction: (() -> Void)? = nil) {
         self.store = store
@@ -108,6 +114,37 @@ struct MonitorView: View {
                     .overlay(RoundedRectangle(cornerRadius: 9).stroke(p.blue.opacity(0.25), lineWidth: 1))
                     .padding(.horizontal, 20).padding(.bottom, 12)
                 }
+                if switcher.setupRecoveryRequired || switcher.updateRecoveryRequired {
+                    HStack(alignment: .center, spacing: 12) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .font(.system(size: 16, weight: .medium))
+                            .foregroundStyle(p.amber)
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text(switcher.updateRecoveryRequired ? "检测到未完成的应用升级事务" : "检测到未完成的环境或后台变更事务")
+                                .font(WatchTypography.bodyStrong).foregroundStyle(p.text)
+                            Text("新的写操作已暂停；点击右侧恢复按钮将按现有事务记录安全回滚或完成收敛，保留账号与外部修改。")
+                                .font(WatchTypography.caption).foregroundStyle(p.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                        Spacer(minLength: 8)
+                        if switcher.setupRecoveryRequired {
+                            Button("恢复未完成变更…") { confirmRecoveryAction = .setup }
+                                .buttonStyle(.borderedProminent)
+                                .tint(p.amber)
+                                .disabled(switcher.busy)
+                        }
+                        if switcher.updateRecoveryRequired {
+                            Button("恢复未完成升级…") { confirmRecoveryAction = .update }
+                                .buttonStyle(.borderedProminent)
+                                .tint(p.amber)
+                                .disabled(switcher.busy)
+                        }
+                    }
+                    .padding(12)
+                    .background(p.amber.opacity(0.09), in: RoundedRectangle(cornerRadius: 9))
+                    .overlay(RoundedRectangle(cornerRadius: 9).stroke(p.amber.opacity(0.28), lineWidth: 1))
+                    .padding(.horizontal, 20).padding(.bottom, 12)
+                }
                 if let error = store.error {
                     InlineNotice(title: "暂时无法同步检测数据", detail: error,
                                  symbol: "exclamationmark.triangle", tint: p.amber, p: p)
@@ -120,8 +157,8 @@ struct MonitorView: View {
                         case .network: network
                         case .processes: ProcessActivityPage(store: store, p: p)
                         case .events: EventTimelinePage(store: store, p: p)
-                        case .dns: DNSLeakPage(store: store.leakChecks, p: p)
-                        case .webrtc: WebRTCLeakPage(store: store.leakChecks, p: p)
+                        case .dns: DNSLeakPage(store: store.leakChecks, p: p, switchKind: { store.page = $0 == .dns ? .dns : .webrtc })
+                        case .webrtc: WebRTCLeakPage(store: store.leakChecks, p: p, switchKind: { store.page = $0 == .dns ? .dns : .webrtc })
                         case .claudeAI: AIInspectorPage(service: .claude, store: store, probes: store.aiChecks, p: p)
                         case .ipScore: NetCoffeeScorePage(store: store.netCoffee, p: p)
                         case .gptAI: AIInspectorPage(service: .gpt, store: store, probes: store.aiChecks, p: p)
@@ -182,10 +219,28 @@ struct MonitorView: View {
         } message: {
             Text("将从已验签发布源下载完整更新并保留全部配置、账号与初始化状态（无需重新初始化）。替换期间将短暂关闭监控窗口，如核心网关组件变动将请求一次管理员授权，完成后自动重开新版。")
         }
+        .alert(
+            confirmRecoveryAction == .update ? "恢复整包更新" : "恢复未完成变更",
+            isPresented: Binding(get: { confirmRecoveryAction != nil }, set: { if !$0 { confirmRecoveryAction = nil } }),
+            presenting: confirmRecoveryAction
+        ) { kind in
+            Button("取消", role: .cancel) { confirmRecoveryAction = nil }
+            Button(kind == .update ? "恢复整包更新" : "恢复记录中的变更") {
+                confirmRecoveryAction = nil
+                Task {
+                    await switcher.perform(kind == .update ? ["update", "--recover", "--apply"] : ["setup", "recover", "--apply"])
+                    await switcher.refreshBackground()
+                }
+            }
+        } message: { kind in
+            Text(kind == .update
+                 ? "将依据升级事务记录恢复应用与后台组件。"
+                 : "将按现有事务记录恢复仍匹配的设置、原配置与基线。")
+        }
     }
 
     private func taskPage(_ section: SwitcherSection) -> some View {
-        SwitcherPage(store: store.switcher, p: p, desktopPresence: store.desktopPresence,
+        SwitcherPage(store: store.switcher, p: p, monitor: store, desktopPresence: store.desktopPresence,
                      section: section, navigate: { target in
             store.page = target == .environment ? .environment : target == .accounts ? .switcher : .protection
         }, openLeakCheck: { kind in store.page = kind == .dns ? .dns : .webrtc },
@@ -198,18 +253,13 @@ struct MonitorView: View {
     }
 
     private func navRow(_ page: Page) -> some View {
-        let selected = store.page == page
+        let selected = store.page.matchesSidebarItem(page)
         return Button { store.page = page } label: {
             HStack(spacing: 8) {
-                Group {
-                    if page == .claudeAI || page == .gptAI {
-                        BrandLogo(brand: page == .claudeAI ? .claude : .chatgpt, size: 14)
-                    } else {
-                        Image(systemName: page.symbol)
-                            .font(.system(size: 14, weight: .medium)).foregroundStyle(p.blue)
-                    }
-                }.frame(width: 18, height: 18).accessibilityHidden(true)
-                Text(page.rawValue).font(selected ? WatchTypography.bodyStrong : WatchTypography.body)
+                Image(systemName: page.symbol)
+                    .font(.system(size: 14, weight: .medium)).foregroundStyle(p.blue)
+                    .frame(width: 18, height: 18).accessibilityHidden(true)
+                Text(page.sidebarTitle).font(selected ? WatchTypography.bodyStrong : WatchTypography.body)
                     .lineLimit(1).minimumScaleFactor(0.85)
             }
             .foregroundStyle(p.text)
@@ -252,7 +302,7 @@ struct MonitorView: View {
             .onMoveCommand { direction in
                 let pages = Page.orderedPages
                 guard direction == .up || direction == .down,
-                      let index = pages.firstIndex(of: focusedPage ?? store.page) else { return }
+                      let index = pages.firstIndex(where: { (focusedPage ?? store.page).matchesSidebarItem($0) }) else { return }
                 let next = index + (direction == .down ? 1 : -1)
                 guard pages.indices.contains(next) else { return }
                 focusedPage = pages[next]

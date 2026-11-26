@@ -48,6 +48,7 @@ struct AccountSlotCard: View {
 
 struct ChatGPTAccountPanel: View {
     @ObservedObject var store: SwitcherStore
+    var monitor: MonitorStore? = nil
     let presence: WorkspaceDesktopPresence?
     let p: Palette
     var onConfirmPrune: ((AIProductVersionsInfo) -> Void)? = nil
@@ -62,7 +63,7 @@ struct ChatGPTAccountPanel: View {
     var body: some View {
         Surface(p) {
             VStack(alignment: .leading, spacing: 14) {
-                DesktopAccountControls(store: store, product: .openAI, caption: selectionSummary, p: p)
+                DesktopAccountControls(store: store, monitor: monitor, product: .openAI, caption: selectionSummary, p: p)
                 if let state = store.chatGPTAccounts {
                     HStack(spacing: 12) {
                         ForEach(state.accounts) { slot in
@@ -140,6 +141,7 @@ struct ChatGPTAccountPanel: View {
 
 struct DesktopAccountControls: View {
     @ObservedObject var store: SwitcherStore
+    var monitor: MonitorStore? = nil
     let product: MonitoredProduct
     let caption: String
     let p: Palette
@@ -155,6 +157,12 @@ struct DesktopAccountControls: View {
                 BrandLogo(brand: product == .claude ? .claude : .chatgpt, size: 18)
                 SectionHeading(title: moduleTitle, caption: caption, p: p)
                 Spacer(minLength: 6)
+                if let monitor {
+                    GraphLaunchButton(product: product, monitor: monitor, switcher: store,
+                                      processControl: monitor.processControl, p: p).fixedSize()
+                    AIProcessCloseButton(product: product, store: monitor, control: monitor.processControl,
+                                         switcher: store, p: p).fixedSize()
+                }
                 Button {
                     Task {
                         if let reading = await store.loadManualAccount(product), reading.canSave {

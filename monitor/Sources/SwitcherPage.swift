@@ -6,8 +6,8 @@ enum SwitcherSection: String, CaseIterable {
     var caption: String {
         switch self {
         case .environment: return "自动识别代理，按本轮实测出口核对地区、日期与时区；英文语言独立保持。"
-        case .accounts: return "管理 Claude 与 ChatGPT 账号，查看 Claude 启动条件。"
-        case .protection: return "分别核对两套保镖、时区守护和更新任务的实际状态。"
+        case .accounts: return "受控启动 Claude 与 ChatGPT，管理本地 A / B 资料槽位并核验双应用启动条件。"
+        case .protection: return "统一配置公用守护底座、VPN 监督预期与双 AI 门禁及处置策略。"
         }
     }
 }
@@ -15,6 +15,7 @@ enum SwitcherSection: String, CaseIterable {
 struct SwitcherPage: View {
     @ObservedObject var store: SwitcherStore
     let p: Palette
+    var monitor: MonitorStore? = nil
     var desktopPresence: WorkspaceDesktopPresence?
     var section: SwitcherSection = .environment
     var navigate: (SwitcherSection) -> Void = { _ in }
@@ -26,19 +27,18 @@ struct SwitcherPage: View {
     var netCoffee: NetCoffeeStore? = nil
     var managedEntryControl: ManagedEntryControl? = nil
     let finished: () -> Void
+    @AppStorage("returnToOverviewAfterSwitch") private var returnToOverviewAfterSwitch = true
     @State private var showEnvironmentAdjustment = false
     @State private var showSettings = false
     @State private var showVpnEditor = false
     @State private var policyProduct: MonitoredProduct = .claude
+    @State private var launchProduct: MonitoredProduct = .claude
     @State private var showSource = false
     @State private var showMigration = false
     @State private var importPreview: String?
     @State private var updateResult: String?
-    @State private var showDiagnostics = false
     @State private var showAuditHistory = false
-    @State private var showProxyAddress = false
     @State private var showReview = false
-    @State private var showLogs = false
     @State private var confirmation = false
     @State private var pendingTitle = ""
     @State private var pendingMessage = ""
@@ -82,12 +82,11 @@ struct SwitcherPage: View {
                         else { await store.perform(pendingArguments) }
                         await store.refreshBackground()
                         if !store.failure && pendingArguments.contains("switch") &&
-                            store.isOn(Setting.returnToOverview) { finished() }
+                            returnToOverviewAfterSwitch { finished() }
                     }
                 }
             } message: { Text(pendingMessage) }
             .sheet(isPresented: $showReview) { changeReview }
-            .sheet(isPresented: $showLogs) { logSheet }
     }
     private var header: some View {
         HStack(spacing: 16) {
@@ -121,13 +120,9 @@ struct SwitcherPage: View {
         Group {
             auditPanel
             Surface(p) {
-                DisclosureGroup("需要调整环境时：核对候选与具体变更", isExpanded: $showEnvironmentAdjustment) {
+                DisclosureGroup("系统地区、时区与环境对齐修复", isExpanded: $showEnvironmentAdjustment) {
                     environmentAdjustment.padding(.top, 14)
                 }.disclosureGroupStyle(FullWidthDisclosureStyle(p: p))
-            }
-            Surface(p) {
-                DisclosureGroup("独立代理诊断", isExpanded: $showDiagnostics) { diagnosticPanel.padding(.top, 14) }
-                    .disclosureGroupStyle(FullWidthDisclosureStyle(p: p))
             }
         }
     }
@@ -262,12 +257,35 @@ struct SwitcherPage: View {
     }
     private var sessionInspector: some View {
         Surface(p) {
-            VStack(alignment: .leading, spacing: 12) {
-                Text("会话与启动").font(WatchTypography.title)
-                SessionProtectionStatusView(value: store.sessionDisplay, p: p)
-                Text("启动条件按已接受策略单独检查，不使用这里的结果直接放行。")
-                    .font(WatchTypography.caption).foregroundStyle(p.secondary)
-                Button { navigate(.accounts) } label: { Label("查看启动条件与账号", systemImage: "arrow.right") }.buttonStyle(.borderless)
+            VStack(alignment: .leading, spacing: 11) {
+                Text("双 AI 会话与通道").font(WatchTypography.title)
+                ForEach(MonitoredProduct.allCases) { product in
+                    let session = store.sessionPresentation(for: product)
+                    let channel = channelState(product)
+                    let tint = sessionGuardTint(session)
+                    VStack(alignment: .leading, spacing: 5) {
+                        HStack(spacing: 6) {
+                            BrandLogo(brand: product == .claude ? .claude : .chatgpt, size: 14)
+                            Text(product.title).font(WatchTypography.captionStrong)
+                            Spacer(minLength: 4)
+                            Badge(text: channel?.protectionScopeLabel ?? session.title, color: tint)
+                        }
+                        Text(session.title + " · " + session.detail)
+                            .font(WatchTypography.small)
+                            .foregroundStyle(session.tone == "danger" ? p.red : session.tone == "warning" ? p.amber : p.secondary)
+                            .lineLimit(3)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    .padding(9)
+                    .background(p.elevated.opacity(0.45), in: RoundedRectangle(cornerRadius: 8))
+                    .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(p.border.opacity(0.6), lineWidth: 1))
+                }
+                Text("受控启动时按各应用已保存策略独立核验，不使用此处状态直接放行。")
+                    .font(WatchTypography.small).foregroundStyle(p.secondary)
+                HStack(spacing: 12) {
+                    Button { navigate(.accounts) } label: { Label("启动与账号", systemImage: "arrow.right") }.buttonStyle(.borderless)
+                    Button { navigate(.protection) } label: { Label("后台保护", systemImage: "shield.lefthalf.filled") }.buttonStyle(.borderless)
+                }.font(WatchTypography.caption)
             }.foregroundStyle(p.text).frame(maxWidth: .infinity, alignment: .leading)
         }
     }
@@ -295,24 +313,15 @@ struct SwitcherPage: View {
     }
     private var environmentAdjustment: some View {
         VStack(alignment: .leading, spacing: 14) {
-            Text("出口地区、时区和日期格式按实测自动识别；代理客户端可自动识别或手动指定。这里只在确有系统修复时展示具体变更与回滚范围。")
-                .font(WatchTypography.caption).foregroundStyle(p.secondary)
-            Picker("代理客户端", selection: $store.detectMode) {
-                Text("自动识别").tag("auto")
-                Text("TAG / mihomo").tag("tag")
-                Text("Clash Verge").tag("clash-verge")
-                Text("Shadowrocket").tag("shadowrocket")
-                Text("sing-box").tag("sing-box")
-                Text("ClashX").tag("clashx")
-                Text("Surge").tag("surge")
-            }
-            .pickerStyle(.menu).disabled(store.busy)
-            Text("节点钉死基线仅对带控制接口的 TAG/mihomo 类客户端生效；其余客户端按出口 IP 基线保护。")
+            Text("当系统时区、地区格式或 IPv6 与本轮出口不一致时，可在此生成具体的系统环境对齐预览并一键应用；VPN 与代理预期请前往「后台保护 → 01 · 公用底座」管理。")
                 .font(WatchTypography.caption).foregroundStyle(p.secondary)
             HStack {
-                Button { Task { await store.detectEnvironment() } } label: { Label("自动检测并生成调整建议", systemImage: "wand.and.stars") }
+                Button { Task { await store.detectEnvironment() } } label: { Label("自动检测并生成修复建议", systemImage: "wand.and.stars") }
                     .disabled(store.busy || store.hasUnsavedSettings || store.setupRecoveryRequired)
                 Button { Task { await store.inspectEnvironment() } } label: { Label("读取本机与已接受参考", systemImage: "desktopcomputer") }.disabled(store.busy)
+                Button("按已接受参考生成修复预览") {
+                    Task { await store.preview("repair"); showReview = store.plan != nil }
+                }.disabled(store.busy || store.hasUnsavedSettings)
             }
             if let observation = store.environment {
                 environmentValues(store.candidate?.rows ?? observation.rows)
@@ -320,13 +329,9 @@ struct SwitcherPage: View {
             if let candidate = store.candidate {
                 Text("候选采样于 \(timeLabel(candidate.observed_at)) · 有效至 \(timeLabel(candidate.expires_at))").font(WatchTypography.caption).foregroundStyle(p.blue)
                 Toggle("应用候选的地区、日期、时区及所需 IPv6 设置；Claude 保持英文", isOn: $store.setupApplyEnvironment).disabled(store.busy)
-                Text("此入口不停止原版保镖。每项实际系统变更会在下方列出；日常保护按实测环境自动运行。")
-                    .font(WatchTypography.caption).foregroundStyle(p.secondary)
                 Button("预览具体变更") { Task { await store.previewEnvironment() } }.disabled(store.busy || store.hasUnsavedSettings || store.setupRecoveryRequired)
                 if let plan = store.setupPlan {
                     ForEach(plan.actions) { action in changeRow(action) }
-                    Text("确认后仅应用所列系统变更，并更新对应基线。当前后台意愿：Agent Watch 保镖 \(store.setupGuard ? "开启" : "关闭")；时区守护 \(store.setupWatchdog ? "开启" : "关闭")；自动更新 \(store.setupUpdater ? "开启" : "关闭")。")
-                        .font(WatchTypography.caption).foregroundStyle(p.secondary)
                     Button("应用所列系统变更") {
                         pendingTitle = "应用环境修复"
                         pendingMessage = plan.rows.filter { !$0.proposed.isEmpty }.map { $0.title + "：" + $0.target + " → " + $0.proposed }.joined(separator: "\n")
@@ -335,11 +340,6 @@ struct SwitcherPage: View {
                     }.buttonStyle(.borderedProminent).disabled(!store.setupCanConfirm)
                 }
             }
-            Divider()
-            Button("按已接受参考生成修复预览") {
-                Task { await store.preview("repair"); showReview = store.plan != nil }
-            }.disabled(store.busy || store.hasUnsavedSettings)
-            recoveryPanel
         }
     }
     private func environmentValues(_ rows: [EnvironmentValueRow]) -> some View {
@@ -364,7 +364,7 @@ struct SwitcherPage: View {
         Group {
             Surface(p) {
                 VStack(alignment: .leading, spacing: 14) {
-                    DesktopAccountControls(store: store, product: .claude,
+                    DesktopAccountControls(store: store, monitor: monitor, product: .claude,
                                            caption: claudeAccountCaption, p: p)
                     if let conflict = store.accounts?.legacy_conflict {
                         VStack(alignment: .leading, spacing: 8) {
@@ -392,14 +392,18 @@ struct SwitcherPage: View {
                                 }
                             }
                         }
-                        Text("切换时会保存当前资料，再重新打开 Claude 载入所选槽位。")
-                            .font(WatchTypography.caption).foregroundStyle(p.secondary)
+                        HStack {
+                            Text("切换时会保存当前资料，再重新打开 Claude 载入所选槽位。")
+                                .font(WatchTypography.caption).foregroundStyle(p.secondary)
+                            Spacer()
+                            Toggle("切换完成后返回环境状态", isOn: $returnToOverviewAfterSwitch)
+                                .font(WatchTypography.caption)
+                                .controlSize(.small)
+                        }
                     } else {
                         Text(store.loaded ? "尚未取得 Claude 账号槽位资料。" : "正在读取 Claude 账号…")
                             .font(WatchTypography.caption).foregroundStyle(p.secondary)
                     }
-                    Toggle("切换完成后返回环境状态", isOn: store.flag(Setting.returnToOverview)).disabled(store.busy)
-                    if store.hasUnsavedSettings { draftActions }
                     if store.accounts?.recovery_required == true {
                         Button("恢复未完成账号切换") { confirm("恢复账号资料", "将按事务记录找回原目录，保留可能产生的新资料供核对。", ["account", "recover", "--apply"], action: "恢复账号资料") }.disabled(store.busy)
                     }
@@ -423,6 +427,7 @@ struct SwitcherPage: View {
             }
             ChatGPTAccountPanel(
                 store: store,
+                monitor: monitor,
                 presence: desktopPresence,
                 p: p,
                 onConfirmPrune: { info in
@@ -435,9 +440,9 @@ struct SwitcherPage: View {
             )
             launchConditions
             Surface(p) {
-                DisclosureGroup("原版资料迁移与操作记录", isExpanded: $showMigration) {
+                DisclosureGroup("原版切换器资料迁移", isExpanded: $showMigration) {
                     VStack(alignment: .leading, spacing: 12) {
-                        Text("迁移是独立维护操作；原版保镖继续并行。")
+                        Text("迁移是独立维护操作；原版保镖继续并行。工具操作日志已归口至「事件记录 › 日志操作」。")
                         HStack {
                             Button("查看原版可导入资料") {
                                 Task {
@@ -448,13 +453,11 @@ struct SwitcherPage: View {
                             Button("导入原版资料…") {
                                 confirm("导入原版资料", "将导入原版 A/B 存档与工具设置，原版资料及原版保镖保留。请先核对预览。", ["account", "import", "--apply"], action: "导入资料")
                             }
-                            Button("查看操作记录") { Task { await store.perform(["logs"], refresh: false); showLogs = !store.failure } }
                         }.disabled(store.busy || store.hasUnsavedSettings)
                         if let importPreview { Text(importPreview).textSelection(.enabled) }
                     }.font(WatchTypography.caption).padding(.top, 12)
                 }.disclosureGroupStyle(FullWidthDisclosureStyle(p: p))
             }
-            recoveryPanel
         }
     }
     private var claudeAccountCaption: String {
@@ -468,25 +471,57 @@ struct SwitcherPage: View {
         return AccountSlotCard(account: account, summary: presentation.summary, p: p,
                                actionTitle: account.stored ? "切换到 " + account.id : "使用 " + account.id)
     }
+    private var selectedPolicyPreview: EnvironmentPolicyEvaluation? {
+        if launchProduct == .claude { return store.currentPolicyEvaluation }
+        guard let env = store.currentEnvironment,
+              let preview = env.chatgpt_policy_evaluation,
+              SwitcherStore.acceptsDisplayPolicy(preview, for: env, hasUnsavedSettings: store.hasUnsavedSettings) else {
+            return nil
+        }
+        return preview
+    }
     private var launchConditions: some View {
         Surface(p) {
             VStack(alignment: .leading, spacing: 12) {
-                HStack {
-                    SectionHeading(title: "Claude 启动与会话", p: p)
+                HStack(spacing: 10) {
+                    SectionHeading(title: "启动条件与会话核验", p: p)
+                    HStack(spacing: 4) {
+                        ForEach(MonitoredProduct.allCases) { product in
+                            let selected = launchProduct == product
+                            Button {
+                                withAnimation(.easeInOut(duration: 0.15)) { launchProduct = product }
+                            } label: {
+                                HStack(spacing: 6) {
+                                    BrandLogo(brand: product == .claude ? .claude : .chatgpt, size: 13)
+                                    Text(product.title)
+                                        .font(selected ? WatchTypography.captionStrong : WatchTypography.caption)
+                                }
+                                .foregroundStyle(selected ? p.text : p.secondary)
+                                .padding(.horizontal, 10).padding(.vertical, 4)
+                                .background(selected ? p.surface : Color.clear, in: RoundedRectangle(cornerRadius: 6))
+                                .overlay(RoundedRectangle(cornerRadius: 6).strokeBorder(selected ? p.border.opacity(0.85) : Color.clear, lineWidth: 1))
+                                .contentShape(Rectangle())
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                    .padding(3)
+                    .background(p.elevated, in: RoundedRectangle(cornerRadius: 8))
                     Spacer()
-                    Button { Task { await store.checkLaunchConditions() } } label: { Label("检查启动条件", systemImage: "checklist") }.disabled(store.busy || store.hasUnsavedSettings)
+                    Button { Task { await store.checkLaunchConditions() } } label: { Label("重新核验条件", systemImage: "checklist") }
+                        .disabled(store.busy || store.hasUnsavedSettings)
                 }
-                let session = store.sessionDisplay
-                if let result = store.currentPolicyEvaluation {
+                let session = store.sessionPresentation(for: launchProduct)
+                if let result = selectedPolicyPreview {
                     TimelineView(.explicit(evidenceDisplayDates(until: result.expires_at))) { context in
                         let expired = result.expires_at < context.date.timeIntervalSince1970
                         VStack(alignment: .leading, spacing: 9) {
-                            launchSummary(session) {
+                            launchSummary(session, product: launchProduct) {
                                 Label(expired ? "启动要求预览已过期" : result.ready ? "同轮启动要求已满足" : "同轮启动要求尚未满足",
                                       systemImage: expired ? "clock" : result.ready ? "checkmark.circle.fill" : "exclamationmark.triangle")
                                     .foregroundStyle(expired ? p.secondary : result.ready ? p.mint : p.amber)
                             }
-                            Text("环境采样于 " + timeLabel(result.observed_at) + " · 启动时重新核验")
+                            Text("环境采样于 " + timeLabel(result.observed_at) + " · 受控启动时将独立重新核验")
                                 .font(WatchTypography.small).foregroundStyle(p.secondary)
                             ForEach(result.rows.filter { result.blocked.contains($0.id) }) { row in
                                 VStack(alignment: .leading, spacing: 4) {
@@ -516,10 +551,11 @@ struct SwitcherPage: View {
                                      symbol: "exclamationmark.shield", tint: p.red, p: p)
                     }
                 } else {
-                    launchSummary(session) {
+                    launchSummary(session, product: launchProduct) {
                         Label("启动要求待检查", systemImage: "clock").foregroundStyle(p.secondary)
                     }
-                    Text("尚未取得与当前环境同轮的启动要求预览。启动时仍会独立重新检查。").font(WatchTypography.body).foregroundStyle(p.secondary)
+                    Text("尚未取得与当前环境同轮的 \(launchProduct.title) 启动要求预览。点击右上角「重新核验条件」或直接启动时将独立检查。")
+                        .font(WatchTypography.body).foregroundStyle(p.secondary)
                     if !store.detectionError.isEmpty {
                         Text("本轮采样未完成：" + store.detectionError).font(WatchTypography.caption).foregroundStyle(p.amber)
                     }
@@ -562,6 +598,7 @@ struct SwitcherPage: View {
         }
     }
     private func launchSummary<Readiness: View>(_ session: SessionProtectionPresentation,
+                                                 product: MonitoredProduct,
                                                  @ViewBuilder readiness: () -> Readiness) -> some View {
         HStack(alignment: .firstTextBaseline, spacing: 12) {
             readiness()
@@ -569,7 +606,7 @@ struct SwitcherPage: View {
             Label(session.title, systemImage: session.symbol)
                 .help(session.detail).accessibilityHint(session.detail)
             Spacer(minLength: 4)
-            PageLink(title: "查看代理与连接", p: p) { openNetwork(.claude) }.fixedSize()
+            PageLink(title: "查看代理与连接", p: p) { openNetwork(product) }.fixedSize()
         }.font(WatchTypography.bodyStrong)
     }
 
@@ -630,16 +667,16 @@ struct SwitcherPage: View {
 
                 Divider()
 
-                // Sub-panel A: 受控桌面入口 (Opt-in) & Claude 会话详情
+                // Sub-panel A: 受控桌面入口 (Opt-in) & 当前所选应用会话详情
                 VStack(alignment: .leading, spacing: 10) {
                     if let entryControl = managedEntryControl {
                         ManagedEntryPanel(control: entryControl, product: policyProduct, p: p)
                             .clipShape(RoundedRectangle(cornerRadius: 9))
                             .overlay(RoundedRectangle(cornerRadius: 9).strokeBorder(p.border.opacity(0.6), lineWidth: 1))
                     }
-                    if policyProduct == .claude, let evidence = store.sessionDisplayEvidence {
-                        DisclosureGroup("Claude 当前会话基线详情") {
-                            sessionGuardCard(evidence).padding(.top, 8)
+                    if let evidence = store.sessionEvidence(for: policyProduct) {
+                        DisclosureGroup("\(policyProduct.title) 当前会话基线详情") {
+                            sessionGuardCard(evidence, product: policyProduct).padding(.top, 8)
                         }
                         .disclosureGroupStyle(FullWidthDisclosureStyle(p: p))
                     }
@@ -688,10 +725,6 @@ struct SwitcherPage: View {
                     }
                     .background(p.elevated.opacity(0.35), in: RoundedRectangle(cornerRadius: 9))
                     .overlay(RoundedRectangle(cornerRadius: 9).strokeBorder(p.border.opacity(0.6), lineWidth: 1))
-                    if let note = policy.note {
-                        InlineNotice(title: "可配置动作少于 Claude", detail: note,
-                                     symbol: "exclamationmark.triangle", tint: p.amber, p: p)
-                    }
                 }
                 .disabled(store.busy || !store.loaded)
 
@@ -889,7 +922,6 @@ struct SwitcherPage: View {
                 InlineNotice(title: "当前保护风险", detail: facts.risks?.compactMap { $0.reason ?? $0.id }.joined(separator: "\n") ?? "后端已报告当前风险。",
                              symbol: "exclamationmark.shield", tint: p.red, p: p)
             }
-            recoveryPanel
             globalInfrastructurePanel
             protectionPolicyPanel
             Surface(p) {
@@ -926,7 +958,7 @@ struct SwitcherPage: View {
     private func serviceButton(_ title: String, _ setting: FlagSetting, enable: Bool) -> some View {
         Button(title) { Task { await store.previewProtection(setting.key, enable: enable); showReview = store.plan != nil } }
     }
-    private func sessionGuardCard(_ evidence: SessionProtectionEvidence) -> some View {
+    private func sessionGuardCard(_ evidence: SessionProtectionEvidence, product: MonitoredProduct = .claude) -> some View {
         let session = evidence.session
         let value = evidence.presentation(at: store.loginClock.timeIntervalSince1970)
         return VStack(alignment: .leading, spacing: 10) {
@@ -938,10 +970,10 @@ struct SwitcherPage: View {
                             Text("会话基准：" + egressText(baseline)).font(WatchTypography.caption)
                         }
                         if let current = session.current {
-                            Text((session.state == "locked" ? "退出时出口：" : "最近核验出口：") + egressText(current)).font(WatchTypography.caption)
+                            Text((session.state == "locked" ? "阻断时出口：" : "最近核验出口：") + egressText(current)).font(WatchTypography.caption)
                         }
                         if let reason = session.reason, session.state != "idle" {
-                            Text((session.state == "locked" ? "停止原因：" : "检测情况：") + reason.detail).font(WatchTypography.caption).foregroundStyle(sessionGuardTint(value))
+                            Text((session.state == "locked" ? "触发原因：" : "检测情况：") + reason.detail).font(WatchTypography.caption).foregroundStyle(sessionGuardTint(value))
                             if let observed = reason.observed_at {
                                 Text("原因时间：" + timeLabel(observed)).font(WatchTypography.small).foregroundStyle(p.secondary)
                             }
@@ -949,7 +981,7 @@ struct SwitcherPage: View {
                         if let locked = session.locked_at {
                             Text("锁存时间：" + timeLabel(locked)).font(WatchTypography.small).foregroundStyle(p.secondary)
                         }
-                        Text("明确风险时退出 Claude；未知状态不会宣称已完成检测。").font(WatchTypography.small).foregroundStyle(p.secondary)
+                        Text("明确风险时按 \(product.title) 已配置策略立即处置；未知状态不会宣称已完成检测。").font(WatchTypography.small).foregroundStyle(p.secondary)
                     }
                 }
             }
@@ -979,7 +1011,6 @@ struct SwitcherPage: View {
                 Button("更新系统辅助组件…") {
                     confirm("更新系统辅助组件", "需要管理员认证，更新本工具固定辅助程序；不会切换时区、语言或原版保镖。", ["services", "refresh-admin", "--apply"], action: "更新辅助组件")
                 }.disabled(store.hasUnsavedSettings)
-                Button("查看操作记录") { Task { await store.perform(["logs"], refresh: false); showLogs = !store.failure } }
             }
             if let updateResult { Text(updateResult).textSelection(.enabled) }
         }
@@ -1049,19 +1080,6 @@ struct SwitcherPage: View {
         .overlay(RoundedRectangle(cornerRadius: 9).strokeBorder(p.border.opacity(0.6), lineWidth: 1))
     }
 
-    @ViewBuilder private var recoveryPanel: some View {
-        if store.setupRecoveryRequired {
-            Surface(p) {
-                VStack(alignment: .leading, spacing: 10) {
-                    InlineNotice(title: "环境或后台变更待恢复", detail: "新的写操作已暂停。恢复会核对记录，保留外部修改。", symbol: "exclamationmark.triangle", tint: p.amber, p: p)
-                    Button("恢复未完成变更") { confirm("恢复未完成变更", "按现有事务记录恢复仍匹配的设置、原配置与基线。", ["setup", "recover", "--apply"], action: "恢复记录中的变更") }.disabled(store.busy)
-                }
-            }
-        }
-        if store.updateRecoveryRequired {
-            Button("恢复未完成升级") { confirm("恢复整包更新", "依据升级事务记录恢复应用与后台组件。", ["update", "--recover", "--apply"], action: "恢复整包更新") }.disabled(store.busy)
-        }
-    }
     private var changeReview: some View {
         VStack(alignment: .leading, spacing: 16) {
             Text("确认具体变更").font(WatchTypography.pageTitle)
@@ -1092,41 +1110,6 @@ struct SwitcherPage: View {
             }
             Text(action.detail ?? "具体值未返回，请重新生成预览。").font(WatchTypography.caption).foregroundStyle(p.secondary).textSelection(.enabled)
         }.padding(12).frame(maxWidth: .infinity, alignment: .leading).background(p.elevated, in: RoundedRectangle(cornerRadius: 9))
-    }
-    private var logSheet: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            HStack { Text("工具操作记录").font(WatchTypography.pageTitle); Spacer(); Button("关闭") { showLogs = false } }
-            Text("环境确认、账号切换和后台操作的最近记录；监控事件另见事件记录页。").font(WatchTypography.caption).foregroundStyle(p.secondary)
-            ScrollView { Text(store.operationLog.isEmpty ? "暂无操作记录" : store.operationLog).font(WatchTypography.mono).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading) }.frame(height: 360)
-        }.padding(24).frame(width: 720).foregroundStyle(p.text).background(p.surface)
-    }
-    private var diagnosticPanel: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Text("手动测试指定代理到 Claude 网页/API 的传输；支持 HTTP / SOCKS，不保存地址或凭据，也不生成启动许可。")
-                .font(WatchTypography.caption).foregroundStyle(p.secondary)
-            HStack {
-                Group {
-                    if showProxyAddress { TextField("临时诊断代理地址", text: $store.diagnosticProxy) }
-                    else { SecureField("临时诊断代理地址", text: $store.diagnosticProxy) }
-                }.textFieldStyle(.roundedBorder)
-                Button(showProxyAddress ? "隐藏" : "显示") { showProxyAddress.toggle() }
-                Button("诊断传输") { Task { await store.diagnoseProxy() } }.disabled(store.diagnosticProxy.isEmpty)
-            }.disabled(store.busy)
-            if store.diagnosticRunning {
-                HStack(spacing: 8) {
-                    ProgressView().controlSize(.small)
-                    Text("正在诊断代理传输，通常需要数十秒；期间不会保存地址或凭据。")
-                        .font(WatchTypography.caption).foregroundStyle(p.secondary)
-                }
-            }
-            if !store.diagnosticError.isEmpty { Text(store.diagnosticError).foregroundStyle(p.amber) }
-            if let result = store.diagnostic {
-                Text(result.message).font(WatchTypography.caption)
-                ForEach(result.checks) { row in
-                    HStack { Text(row.title); Spacer(); Text(row.accessLabel); if let code = row.http_status { Badge(text: "HTTP \(code)", color: code < 400 ? p.blue : p.amber) } }
-                }.font(WatchTypography.caption)
-            }
-        }
     }
     private func timeLabel(_ epoch: Double) -> String { Date(timeIntervalSince1970: epoch).formatted(date: .numeric, time: .shortened) }
 }
@@ -1233,13 +1216,48 @@ struct EnvironmentCheckTile: View {
                         if showReference, let reference = row.reference {
                             Text("要求：" + reference).font(WatchTypography.small).foregroundStyle(p.secondary).lineLimit(2)
                         }
-                        if row.id == "ip_history" && row.state == "warn" {
-                            Label("与基准不一致，已拦截启动（点击查看）", systemImage: "hand.raised.fill")
-                                .font(WatchTypography.small).foregroundStyle(p.amber)
+                        if row.id == "ip_history" && (row.state == "warn" || row.state == "fail") {
+                            VStack(alignment: .leading, spacing: 4) {
+                                if let changedAt = row.changed_detected_at {
+                                    Label("变更为当前 IP：" + environmentTimelineStamp(changedAt), systemImage: "clock.arrow.circlepath")
+                                        .font(WatchTypography.small).foregroundStyle(p.amber)
+                                } else {
+                                    Label("与基准不一致，已拦截启动", systemImage: "hand.raised.fill")
+                                        .font(WatchTypography.small).foregroundStyle(p.amber)
+                                }
+                                if let confirmedIP = row.confirmed_ip, !confirmedIP.isEmpty {
+                                    let baselineNote: String = {
+                                        if let lastSeen = row.last_baseline_seen_at {
+                                            return "原基准 \(confirmedIP) · 最后在线 \(environmentTimelineStamp(lastSeen))"
+                                        }
+                                        if let confirmedAt = row.confirmed_at {
+                                            return "原基准 \(confirmedIP) · 核准于 \(environmentTimelineStamp(confirmedAt))"
+                                        }
+                                        return "原基准 \(confirmedIP)"
+                                    }()
+                                    Text(baselineNote)
+                                        .font(WatchTypography.small).foregroundStyle(p.secondary)
+                                        .lineLimit(1)
+                                }
+                            }
                         }
                         if let sampled = row.sampled_at {
                             Text((row.state == "cached" ? "上次有效采样：" : (row.sample_reused == true ? "复用采样：" : "采样时间：")) + environmentSummaryTime(sampled))
                                 .font(WatchTypography.small).foregroundStyle(p.secondary)
+                        }
+                        if !stale, row.id == "ip_history", row.state == "warn", let onConfirmBaseline {
+                            HStack(spacing: 8) {
+                                Button {
+                                    onConfirmBaseline()
+                                } label: {
+                                    Label("核准为新基准", systemImage: "checkmark.seal.fill")
+                                }
+                                .buttonStyle(.borderedProminent)
+                                .controlSize(.small)
+                                Text("点击卡片查看完整轨迹")
+                                    .font(WatchTypography.small).foregroundStyle(p.secondary)
+                            }
+                            .padding(.top, 2)
                         }
                     }
                 }.frame(maxWidth: .infinity, minHeight: 48, alignment: .topLeading)
@@ -1467,6 +1485,12 @@ func environmentSummaryTime(_ epoch: Double) -> String {
     Date(timeIntervalSince1970: epoch).formatted(date: .numeric, time: .shortened)
 }
 
+func environmentTimelineStamp(_ epoch: Double) -> String {
+    Date(timeIntervalSince1970: epoch).formatted(
+        .dateTime.month(.twoDigits).day(.twoDigits).hour(.twoDigits(amPM: .omitted)).minute(.twoDigits).second(.twoDigits)
+    )
+}
+
 /// Any ISO 3166-1 alpha-2 code renders as its regional flag via Unicode
 /// regional indicators (same mechanism the backend uses for egress cards).
 /// Non-2-letter input degrades to the plain text instead of garbage.
@@ -1549,7 +1573,7 @@ struct EnvironmentCheckDetails: View {
                     .buttonStyle(.borderless).font(WatchTypography.caption)
                     .accessibilityLabel("复制本项完整检测依据")
             }
-        }.padding(16).frame(width: 390, alignment: .leading)
+        }.padding(16).frame(width: 436, alignment: .leading)
             .foregroundStyle(p.text).background(p.surface)
             .environment(\.colorScheme, p.dark ? .dark : .light)
     }
@@ -1647,18 +1671,55 @@ struct EnvironmentCheckDetails: View {
     @ViewBuilder
     private var ipHistorySection: some View {
         if let entries = row.history_entries, !entries.isEmpty {
-            VStack(alignment: .leading, spacing: 6) {
-                Text("出口历史与基准对比").font(WatchTypography.captionStrong).foregroundStyle(p.secondary)
-                VStack(alignment: .leading, spacing: 5) {
-                    ForEach(entries) { entry in
-                        HStack(alignment: .firstTextBaseline) {
-                            Text(entry.label ?? entry.role ?? "").font(WatchTypography.small).foregroundStyle(p.secondary).frame(width: 90, alignment: .leading)
-                            Text(entry.ip).font(WatchTypography.caption).monospaced()
-                            if let node = entry.node, !node.isEmpty {
-                                Text("(\(node))").font(WatchTypography.small).foregroundStyle(p.secondary)
-                            }
-                            Spacer()
+            VStack(alignment: .leading, spacing: 7) {
+                Text("出口变迁时间轴与基准对比").font(WatchTypography.captionStrong).foregroundStyle(p.secondary)
+                if row.changed_detected_at != nil || row.last_baseline_seen_at != nil {
+                    HStack(spacing: 12) {
+                        if let lastSeen = row.last_baseline_seen_at {
+                            Text("原基准最后在线：" + environmentTimelineStamp(lastSeen))
                         }
+                        if let changedAt = row.changed_detected_at {
+                            Text("新出口首次发现：" + environmentTimelineStamp(changedAt))
+                                .foregroundStyle(p.amber)
+                        }
+                    }
+                    .font(WatchTypography.small)
+                    .foregroundStyle(p.secondary)
+                }
+                VStack(alignment: .leading, spacing: 6) {
+                    ForEach(entries) { entry in
+                        let isCurrent = entry.role == "current"
+                        let isBaseline = entry.role == "confirmed_baseline"
+                        let roleColor: Color = isCurrent ? (row.state == "ok" ? p.mint : p.amber) : isBaseline ? p.blue : p.secondary
+                        VStack(alignment: .leading, spacing: 3) {
+                            HStack(alignment: .center, spacing: 8) {
+                                Text(entry.label ?? entry.role ?? "记录")
+                                    .font(WatchTypography.small.weight(.medium))
+                                    .foregroundStyle(roleColor)
+                                    .padding(.horizontal, 6).padding(.vertical, 2)
+                                    .background(roleColor.opacity(0.12), in: RoundedRectangle(cornerRadius: 4))
+                                Text(entry.ip)
+                                    .font(WatchTypography.captionStrong)
+                                    .monospaced()
+                                    .lineLimit(1)
+                                    .fixedSize(horizontal: true, vertical: false)
+                                Spacer(minLength: 4)
+                                if let node = entry.node, !node.isEmpty {
+                                    Text(node)
+                                        .font(WatchTypography.small)
+                                        .foregroundStyle(p.secondary)
+                                        .lineLimit(1)
+                                }
+                            }
+                            if let stampLine = historyEntryTimeSummary(entry) {
+                                Text(stampLine)
+                                    .font(WatchTypography.small)
+                                    .foregroundStyle(p.secondary)
+                                    .monospacedDigit()
+                            }
+                        }
+                        .padding(.horizontal, 8).padding(.vertical, 6)
+                        .background(p.surface.opacity(0.65), in: RoundedRectangle(cornerRadius: 5))
                     }
                 }
                 .padding(8)
@@ -1667,9 +1728,26 @@ struct EnvironmentCheckDetails: View {
         } else if let confirmed = row.confirmed_ip, !confirmed.isEmpty {
             VStack(alignment: .leading, spacing: 4) {
                 Text("已确认基准 IP").font(WatchTypography.small).foregroundStyle(p.secondary)
-                Text(confirmed).font(WatchTypography.caption).monospaced()
+                Text(confirmed).font(WatchTypography.caption).monospaced().lineLimit(1)
             }
         }
+    }
+
+    private func historyEntryTimeSummary(_ entry: HistoryEntry) -> String? {
+        var parts: [String] = []
+        if let confirmed = entry.confirmed_at {
+            parts.append("基准核准 " + environmentTimelineStamp(confirmed))
+        }
+        if let first = entry.first_seen, let last = entry.last_seen {
+            if abs(last - first) < 5 {
+                parts.append("观测于 " + environmentTimelineStamp(last))
+            } else {
+                parts.append("首次 " + environmentTimelineStamp(first) + " · 最后 " + environmentTimelineStamp(last))
+            }
+        } else if let last = entry.last_seen {
+            parts.append("最后观测 " + environmentTimelineStamp(last))
+        }
+        return parts.isEmpty ? nil : parts.joined(separator: " · ")
     }
 
     private func attributeRow(_ label: String, _ val: String) -> some View {

@@ -3,12 +3,14 @@ import SwiftUI
 struct DNSLeakPage: View {
     @ObservedObject var store: LeakCheckStore
     let p: Palette
-    var body: some View { LeakInspectorPage(kind: .dns, store: store, p: p) }
+    var switchKind: ((LeakKind) -> Void)? = nil
+    var body: some View { LeakInspectorPage(kind: .dns, store: store, p: p, switchKind: switchKind) }
 }
 struct WebRTCLeakPage: View {
     @ObservedObject var store: LeakCheckStore
     let p: Palette
-    var body: some View { LeakInspectorPage(kind: .webrtc, store: store, p: p) }
+    var switchKind: ((LeakKind) -> Void)? = nil
+    var body: some View { LeakInspectorPage(kind: .webrtc, store: store, p: p, switchKind: switchKind) }
 }
 
 /// Displays daemon-owned evidence and submits user detection requests.
@@ -16,6 +18,7 @@ private struct LeakInspectorPage: View {
     let kind: LeakKind
     @ObservedObject var store: LeakCheckStore
     let p: Palette
+    var switchKind: ((LeakKind) -> Void)? = nil
     @ObservedObject private var diagnosticLog = DiagnosticLogStatus.shared
     @State private var detailsExpanded = false
     @State private var localExpanded = false
@@ -40,6 +43,32 @@ private struct LeakInspectorPage: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
+            if let switchKind {
+                HStack(spacing: 4) {
+                    ForEach([LeakKind.dns, LeakKind.webrtc], id: \.self) { candidate in
+                        let selected = candidate == kind
+                        Button {
+                            switchKind(candidate)
+                        } label: {
+                            HStack(spacing: 6) {
+                                Image(systemName: candidate == .dns ? Page.dns.symbol : Page.webrtc.symbol)
+                                    .font(.system(size: 12, weight: .medium))
+                                Text(candidate == .dns ? "DNS 递归出口" : "WebRTC 候选")
+                                    .font(selected ? WatchTypography.captionStrong : WatchTypography.caption)
+                            }
+                            .foregroundStyle(selected ? p.text : p.secondary)
+                            .padding(.horizontal, 12).padding(.vertical, 6)
+                            .background(selected ? p.surface : Color.clear, in: RoundedRectangle(cornerRadius: 7))
+                            .overlay(RoundedRectangle(cornerRadius: 7).strokeBorder(selected ? p.border.opacity(0.85) : Color.clear, lineWidth: 1))
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                    }
+                    Spacer()
+                }
+                .padding(3)
+                .background(p.elevated, in: RoundedRectangle(cornerRadius: 9))
+            }
             InspectorHeading(title: title,
                 subtitle: isDNS ? "递归解析出口 · 与同轮公网出口国家核对" : "当前检测 WebView · ICE / STUN 与 HTTP 出口核对",
                 p: p) {
@@ -124,12 +153,7 @@ private struct LeakInspectorPage: View {
                 Text("自动比较同一轮 DNS 递归出口与 HTTP 公网出口的国家：同国通过；异国显示泄漏风险；任一国家缺失则本轮未完成。无需填写或确认 DNS IP 名单。")
                     .font(.caption).foregroundStyle(p.secondary).fixedSize(horizontal: false, vertical: true)
             } else {
-                Text("预期出口 IP（可选）").font(.callout.weight(.medium))
-                TextField("IPv4 / IPv6，以逗号分隔", text: expected)
-                    .textFieldStyle(.roundedBorder).font(.system(.callout, design: .monospaced))
-                    .disabled(state.running).controlSize(.large)
-                    .accessibilityLabel("预期出口 IP（可选）")
-                Text("填写后由后台显示诊断对照；保护判定仍依据同轮 HTTP 出口。")
+                Text("自动比较当前检测 WebView 的公网 ICE / STUN 候选与同轮 HTTP 公网出口；无需手动填写预期出口 IP。")
                     .font(.caption).foregroundStyle(p.secondary).fixedSize(horizontal: false, vertical: true)
             }
             if let error = state.inputError, !error.isEmpty {

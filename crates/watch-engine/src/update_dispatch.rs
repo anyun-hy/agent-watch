@@ -70,6 +70,38 @@ fn validate_staged_dir(base: &Path, raw: &str) -> Result<PathBuf> {
     Ok(canonical_stage)
 }
 
+pub(crate) fn sweep_stale_update_stages(base: &Path) {
+    let max_age = Duration::from_secs(30 * 60);
+    let Ok(entries) = fs::read_dir(base) else {
+        return;
+    };
+    let now = std::time::SystemTime::now();
+    for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_dir() || file_type.is_symlink() {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some(name_str) = name.to_str() else {
+            continue;
+        };
+        if !name_str.starts_with("update-stage-") {
+            continue;
+        }
+        let is_stale = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|m| now.duration_since(m).ok())
+            .is_some_and(|age| age >= max_age);
+        if is_stale {
+            let _ = fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
 fn install_verified_app(
     storage: &StateStore,
     paths: &Paths,
@@ -96,7 +128,22 @@ fn install_verified_app(
     };
     let install_result = lifecycle.apply(&staged_app);
     let _ = fs::remove_dir_all(stage_dir);
-    let identity = install_result?;
+    let identity = match install_result {
+        Ok(identity) => identity,
+        Err(error) => {
+            record_update_status(
+                storage,
+                &json!({
+                    "schema": 1,
+                    "checked_at": native::now(),
+                    "status": "failed",
+                    "error_code": error.code,
+                    "message": format!("应用更新替换未完成：{}", error.message),
+                }),
+            );
+            return Err(error);
+        }
+    };
     let now = native::now();
     record_update_status(
         storage,
@@ -138,8 +185,16 @@ fn spawn_detached_staged_install(
     stage_dir: &Path,
     relaunch: bool,
 ) -> Result<()> {
-    let exe = std::env::current_exe()
-        .map_err(|_| CoreError::new("update_handoff_failed", "无法定位更新执行引擎"))?;
+    // Prefer the verified staged runtime binary outside `/Applications/Agent Watch.app`
+    // so moving the old app bundle to Trash and resetting TCC never perturbs the
+    // running installer process.
+    let staged_exe = stage_dir.join("payload/runtime/watch-engine");
+    let exe = if staged_exe.is_file() {
+        staged_exe
+    } else {
+        std::env::current_exe()
+            .map_err(|_| CoreError::new("update_handoff_failed", "无法定位更新执行引擎"))?
+    };
     let mut cmd = Command::new(exe);
     cmd.args([
         "--home",
@@ -157,9 +212,24 @@ fn spawn_detached_staged_install(
     if relaunch {
         cmd.arg("--relaunch");
     }
+    let log_dir = paths.watch().join("logs");
+    let _ = fs::create_dir_all(&log_dir);
+    let log_path = log_dir.join("update-install.log");
+    let stdout_cfg = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .map(Stdio::from)
+        .unwrap_or_else(|_| Stdio::null());
+    let stderr_cfg = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .map(Stdio::from)
+        .unwrap_or_else(|_| Stdio::null());
     cmd.stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stdout(stdout_cfg)
+        .stderr(stderr_cfg);
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -245,6 +315,8 @@ pub fn dispatch(request: &Request, paths: Paths) -> Result<Option<Value>> {
             json!({"status":"unavailable","message":"尚未配置本项目发布源和固定公钥；未发起下载"}),
         ));
     };
+
+    sweep_stale_update_stages(&paths.base());
 
     let mut updater = Updater {
         paths: UpdatePaths {

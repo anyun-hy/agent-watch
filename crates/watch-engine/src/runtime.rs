@@ -164,13 +164,28 @@ pub fn session_view(host: &Host) -> Value {
 }
 
 fn session_view_from_frame(host: &Host, frame: &Value, evidence: &Value, now: f64) -> Value {
-    let row = evidence["families"].as_array().and_then(|rows| rows.iter().find(|row| row["family"] == "claude"))
+    session_view_for_family_from_frame(host, "claude", frame, evidence, now)
+}
+
+fn session_view_for_family_from_frame(
+    host: &Host,
+    family: &'static str,
+    frame: &Value,
+    evidence: &Value,
+    now: f64,
+) -> Value {
+    let row = evidence["families"]
+        .as_array()
+        .and_then(|rows| rows.iter().find(|row| row["family"] == family))
         .unwrap_or(&Value::Null);
-    let state = &frame["families"]["claude"];
-    let running = (row["channel_permit"].is_object() && row["channel_permit"]["reason_code"] != "channel_inventory_incomplete")
-        .then(|| !state["active_member_pids"].as_array().is_none_or(Vec::is_empty)
-            || !state["unmanaged_member_pids"].as_array().is_none_or(Vec::is_empty));
-    match SessionStore::new(host.storage.clone()).load(now) {
+    let state = &frame["families"][family];
+    let running = (row["channel_permit"].is_object()
+        && row["channel_permit"]["reason_code"] != "channel_inventory_incomplete")
+        .then(|| {
+            !state["active_member_pids"].as_array().is_none_or(Vec::is_empty)
+                || !state["unmanaged_member_pids"].as_array().is_none_or(Vec::is_empty)
+        });
+    match SessionStore::for_family(host.storage.clone(), family).load(now) {
         Ok(Some(s)) => {
             let mut status = claude_watch_core::session::status(&s, now, running);
             project_session_heartbeat(&mut status, &s.session_id, running, row);
@@ -227,6 +242,8 @@ fn background_from_frame(host: &Host, config: &claude_watch_core::config::Config
     let mut value = services::service_status_with_health(host, config, health, now)?;
     enrich_background_services(&mut value);
     value["session_guard"] = session_view_from_frame(host, frame.value(), evidence, now);
+    value["openai_session_guard"] =
+        session_view_for_family_from_frame(host, "openai", frame.value(), evidence, now);
     value["egress_reference"] = services::latest_egress_reference(&host.storage);
     Ok(value)
 }
@@ -694,14 +711,16 @@ pub fn dispatch_operations(request: &Request, paths: Paths) -> Result<Option<Ope
         storage.atomic_json(&confirmed_path, &confirmed)?;
 
         // 同步清理/解除已停止旧会话上的 IP 阻断锁，避免旧会话阻碍新启动
-        let session_path = storage.paths.session();
-        if session_path.is_file() {
-            if let Ok(mut session) = storage.read_json(&session_path, Value::Null) {
-                let state = session.get("state").and_then(Value::as_str).unwrap_or("");
-                if state == "locked" || state == "ended" {
-                    session["state"] = json!("ended");
-                    session["baseline"]["ip"] = json!(valid_target_ip);
-                    let _ = storage.atomic_json(&session_path, &session);
+        for family in ["claude", "openai"] {
+            let session_path = storage.paths.session_for(family);
+            if session_path.is_file() {
+                if let Ok(mut session) = storage.read_json(&session_path, Value::Null) {
+                    let state = session.get("state").and_then(Value::as_str).unwrap_or("");
+                    if state == "locked" || state == "ended" {
+                        session["state"] = json!("ended");
+                        session["baseline"]["ip"] = json!(valid_target_ip);
+                        let _ = storage.atomic_json(&session_path, &session);
+                    }
                 }
             }
         }
