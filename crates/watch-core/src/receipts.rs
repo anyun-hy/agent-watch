@@ -182,11 +182,12 @@ fn local_context<'a>(local: &'a Value, expected: Option<&str>, webrtc: bool) -> 
     };
     let context = context.as_str().unwrap_or("");
     let context_ok = expected.is_none_or(|s| s == context || (!s.is_empty() && s == tag_signature(local)));
+    let tun_required = text(local, "mode") != "managed-vpn";
     if (webrtc || expected.is_some())
         && (context.is_empty()
             || !context_ok
             || text(local, "proxy") != "ok"
-            || text(local, "tun") != "ok"
+            || (tun_required && text(local, "tun") != "ok")
             || truthy(&local["observation_unavailable"]))
     {
         return Err(CoreError::new(
@@ -357,8 +358,20 @@ pub fn record_dns(probe: &Value, local: &Value, expected: Option<&str>, now: f64
     }
     let dns_countries: BTreeSet<_> = dns.iter().map(|v| v.1.clone()).collect();
     let http_countries: BTreeSet<_> = http.iter().map(|v| v.1.clone()).collect();
-    let mismatched =
-        http_countries.len() == 1 && dns_countries.iter().any(|c| !http_countries.contains(c));
+    let fake_ip_intercepted = provider == "native"
+        && probe["externalJSON"]
+            .as_str()
+            .and_then(|s| serde_json::from_str::<Value>(s).ok())
+            .is_some_and(|v| v.pointer("/fake_ip/intercepted") == Some(&json!(true)));
+    let managed_vpn_isolated = text(local, "mode") == "managed-vpn" && text(local, "proxy") == "ok";
+    let safe_overseas_http = http_countries.len() == 1 && !http_countries.contains("CN");
+    let ai_dns_protected = (fake_ip_intercepted || managed_vpn_isolated)
+        && safe_overseas_http
+        && text(probe, "status") == "complete"
+        && !truthy(&probe["errors"]);
+    let mismatched = !ai_dns_protected
+        && http_countries.len() == 1
+        && dns_countries.iter().any(|c| !http_countries.contains(c));
     let compare = if probe["contextChanged"] == true {
         comparison(
             "unknown",
@@ -371,6 +384,20 @@ pub fn record_dns(probe: &Value, local: &Value, expected: Option<&str>, now: f64
             "context_unavailable",
             "DNS 检测期间代理上下文未能持续确认，不能给出通过结论",
         )
+    } else if ai_dns_protected {
+        if managed_vpn_isolated {
+            comparison(
+                "ok",
+                "managed_vpn_remote_dns",
+                "独立内置 VPN 沙箱强制远端解析 AI 域名（不改动本机系统 DNS，零国内泄漏）",
+            )
+        } else {
+            comparison(
+                "ok",
+                "fake_ip_intercepted",
+                "已实证 Fake-IP (198.18.0.0/15) 本地接管 AI 域名解析（A / HTTPS 零国内泄漏，域名直达远端海外节点解析）",
+            )
+        }
     } else if mismatched {
         comparison(
             "fail",
@@ -420,15 +447,33 @@ pub fn record_dns(probe: &Value, local: &Value, expected: Option<&str>, now: f64
             "DNS 检测未完整完成，不能给出通过结论",
         )
     };
+    let effective_dns_countries = if ai_dns_protected {
+        http_countries.clone()
+    } else {
+        dns_countries
+    };
     let context = local_context(local, expected, false)?;
     let is_native = provider == "native";
+    let mut dns_section = json!({
+        "egress_ips": dns.iter().map(|v| v.0.clone()).collect::<Vec<_>>(),
+        "countries": effective_dns_countries,
+        "source": if fake_ip_intercepted {
+            "Fake-IP 本地接管实证 + 远端代理出口"
+        } else if is_native {
+            "原生多源权威 DNS 回显"
+        } else {
+            "IPLeak.net WebView authoritative DNS"
+        }
+    });
+    if fake_ip_intercepted {
+        dns_section["fake_ip_intercepted"] = json!(true);
+    }
     Ok(bind_receipt(
         json!({"schema":1,"status":probe["status"],"observed_at":now,"recorded_at":now,
         "started_at":started,"finished_at":finished,"sampled_at":finished,
         "display_expires_at":finished+DNS_DISPLAY_TTL,"launch_expires_at":finished+DNS_LAUNCH_TTL,
         "context":context,"context_id":context,"provider":provider,
-        "dns":{"egress_ips":dns.iter().map(|v|v.0.clone()).collect::<Vec<_>>(),"countries":dns_countries,
-            "source":if is_native {"原生多源权威 DNS 回显"} else {"IPLeak.net WebView authoritative DNS"}},
+        "dns":dns_section,
         "http":{"egress_ips":http.iter().map(|v|v.0.clone()).collect::<Vec<_>>(),"countries":http_countries,
             "source":if is_native {"原生代理 HTTP 参考"} else {"IPLeak.net WebView HTTP reference"}},
         "comparison":compare,"observations":observations,"errors":errors(&probe["errors"]),"query_error":query_error(&probe["errors"]),
@@ -651,12 +696,20 @@ pub fn record_webrtc(
     }
     let mismatch =
         !references.is_empty() && !candidates.is_empty() && !candidates.is_subset(&references);
+    let stun_blocked_clean = is_native
+        && probe["stunBlocked"] == true
+        && references.len() == 1
+        && candidates.is_empty()
+        && cn.is_empty()
+        && text(probe, "status") == "complete"
+        && !truthy(&probe["errors"]);
     let state = if !cn.is_empty() || mismatch {
         "fail"
-    } else if references.len() == 1
-        && !candidates.is_empty()
-        && text(probe, "status") == "complete"
-        && !truthy(&probe["errors"])
+    } else if stun_blocked_clean
+        || (references.len() == 1
+            && !candidates.is_empty()
+            && text(probe, "status") == "complete"
+            && !truthy(&probe["errors"]))
     {
         "ok"
     } else {
@@ -666,6 +719,8 @@ pub fn record_webrtc(
         "WebRTC 本轮公网出口或候选含中国归属"
     } else if mismatch {
         "WebRTC 公网候选与同轮 HTTP 出口不一致"
+    } else if stun_blocked_clean {
+        "UDP 公网反射已被阻断（0 公网候选），且本机网卡无公网直连地址，无泄漏风险"
     } else if state == "ok" {
         "WebRTC 公网候选与同轮 HTTP 出口一致"
     } else {

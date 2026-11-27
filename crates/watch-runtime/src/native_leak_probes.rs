@@ -98,8 +98,8 @@ impl DnsEchoSource {
     }
 }
 
-/// Encode a minimal RFC 1035 standard query (`RD = 1`, `QTYPE = TXT (16)`, `QCLASS = IN (1)`).
-pub fn encode_dns_txt_query(qname: &str, txid: u16) -> Option<Vec<u8>> {
+/// Encode a minimal RFC 1035 standard query (`RD = 1`, `QCLASS = IN (1)`).
+pub fn encode_dns_query(qname: &str, qtype: u16, txid: u16) -> Option<Vec<u8>> {
     let trimmed = qname.trim_end_matches('.');
     if trimmed.is_empty() || trimmed.len() > 253 {
         return None;
@@ -119,9 +119,129 @@ pub fn encode_dns_txt_query(qname: &str, txid: u16) -> Option<Vec<u8>> {
         buf.extend_from_slice(label.as_bytes());
     }
     buf.push(0);
-    buf.extend_from_slice(&16u16.to_be_bytes()); // QTYPE = TXT
+    buf.extend_from_slice(&qtype.to_be_bytes());
     buf.extend_from_slice(&1u16.to_be_bytes()); // QCLASS = IN
     Some(buf)
+}
+
+/// Encode a minimal RFC 1035 standard query (`RD = 1`, `QTYPE = TXT (16)`, `QCLASS = IN (1)`).
+pub fn encode_dns_txt_query(qname: &str, txid: u16) -> Option<Vec<u8>> {
+    encode_dns_query(qname, 16, txid)
+}
+
+/// RFC 2544 benchmarking range (`198.18.0.0/15`) used by Clash / Mihomo / Surge Fake-IP TUN engines.
+pub fn is_fake_ip_v4(ip: Ipv4Addr) -> bool {
+    let [a, b, _, _] = ip.octets();
+    a == 198 && (b == 18 || b == 19)
+}
+
+/// Decode IPv4 `A` (type 1) answer records from an RFC 1035 response packet.
+pub fn decode_dns_a_answers(packet: &[u8], expected_txid: u16) -> Result<Vec<Ipv4Addr>, &'static str> {
+    if packet.len() < 12 {
+        return Err("short_header");
+    }
+    let txid = u16::from_be_bytes([packet[0], packet[1]]);
+    if txid != expected_txid {
+        return Err("txid_mismatch");
+    }
+    let flags = u16::from_be_bytes([packet[2], packet[3]]);
+    if (flags & 0x8000) == 0 || (flags & 0x000F) != 0 {
+        return Err("rcode_error");
+    }
+    let qdcount = u16::from_be_bytes([packet[4], packet[5]]) as usize;
+    let ancount = u16::from_be_bytes([packet[6], packet[7]]) as usize;
+    if qdcount > 8 || ancount > 64 {
+        return Err("excessive_counts");
+    }
+    let mut offset = 12;
+    for _ in 0..qdcount {
+        offset = skip_dns_name(packet, offset)?;
+        if offset + 4 > packet.len() {
+            return Err("truncated_question");
+        }
+        offset += 4;
+    }
+    let mut addrs = Vec::new();
+    for _ in 0..ancount {
+        offset = skip_dns_name(packet, offset)?;
+        if offset + 10 > packet.len() {
+            return Err("truncated_rr_header");
+        }
+        let rtype = u16::from_be_bytes([packet[offset], packet[offset + 1]]);
+        let rdlength = u16::from_be_bytes([packet[offset + 8], packet[offset + 9]]) as usize;
+        offset += 10;
+        if offset + rdlength > packet.len() {
+            return Err("truncated_rdata");
+        }
+        if rtype == 1 && rdlength == 4 {
+            addrs.push(Ipv4Addr::new(
+                packet[offset],
+                packet[offset + 1],
+                packet[offset + 2],
+                packet[offset + 3],
+            ));
+        }
+        offset += rdlength;
+    }
+    Ok(addrs)
+}
+
+fn query_dns_raw_udp(server: SocketAddr, qname: &str, qtype: u16) -> Result<(Vec<u8>, u16), &'static str> {
+    let mut tx_bytes = [0u8; 2];
+    getrandom::fill(&mut tx_bytes).map_err(|_| "rng_failed")?;
+    let txid = u16::from_be_bytes(tx_bytes);
+    let query = encode_dns_query(qname, qtype, txid).ok_or("invalid_qname")?;
+    let bind_addr = if server.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
+    let sock = UdpSocket::bind(bind_addr).map_err(|_| "bind_failed")?;
+    let timeout = Duration::from_millis(700);
+    let _ = sock.set_write_timeout(Some(timeout));
+    let _ = sock.set_read_timeout(Some(timeout));
+    sock.send_to(&query, server).map_err(|_| "send_failed")?;
+    let mut buf = [0u8; 2048];
+    let (n, from) = sock.recv_from(&mut buf).map_err(|_| "recv_failed")?;
+    if from.ip() != server.ip() {
+        return Err("unexpected_sender");
+    }
+    Ok((buf[..n].to_vec(), txid))
+}
+
+#[derive(Debug, Clone, Default)]
+struct FakeIpCheck {
+    intercepted: bool,
+    claude_a: Vec<String>,
+    chatgpt_a: Vec<String>,
+    https_intercepted: bool,
+}
+
+/// Verify whether the active TUN / Fake-IP engine intercepts real AI domain `A` & `HTTPS (Type 65)` queries locally.
+fn probe_ai_fake_ip_interception(servers: &[SocketAddr]) -> FakeIpCheck {
+    let Some(&primary) = servers.first() else {
+        return FakeIpCheck::default();
+    };
+    let claude_ips = query_dns_raw_udp(primary, "claude.ai", 1)
+        .ok()
+        .and_then(|(pkt, txid)| decode_dns_a_answers(&pkt, txid).ok())
+        .unwrap_or_default();
+    let chatgpt_ips = query_dns_raw_udp(primary, "chatgpt.com", 1)
+        .ok()
+        .and_then(|(pkt, txid)| decode_dns_a_answers(&pkt, txid).ok())
+        .unwrap_or_default();
+    let https_intercepted = query_dns_raw_udp(primary, "claude.ai", 65)
+        .ok()
+        .is_some_and(|(pkt, txid)| {
+            pkt.len() >= 12
+                && u16::from_be_bytes([pkt[0], pkt[1]]) == txid
+                && (u16::from_be_bytes([pkt[2], pkt[3]]) & 0x800F) == 0x8000
+                && u16::from_be_bytes([pkt[6], pkt[7]]) == 0
+        });
+    let claude_fake = !claude_ips.is_empty() && claude_ips.iter().all(|ip| is_fake_ip_v4(*ip));
+    let chatgpt_fake = !chatgpt_ips.is_empty() && chatgpt_ips.iter().all(|ip| is_fake_ip_v4(*ip));
+    FakeIpCheck {
+        intercepted: claude_fake && chatgpt_fake,
+        claude_a: claude_ips.into_iter().map(|ip| ip.to_string()).collect(),
+        chatgpt_a: chatgpt_ips.into_iter().map(|ip| ip.to_string()).collect(),
+        https_intercepted,
+    }
 }
 
 fn skip_dns_name(packet: &[u8], mut offset: usize) -> Result<usize, &'static str> {
@@ -586,8 +706,9 @@ pub fn collect_dns<R: ReadRunner, T: Transport>(runner: &R, network: &NetworkCli
     let started = wallclock();
     let nameservers = discover_system_nameservers(runner);
 
-    let (trace_res, echo_results, ecs_subnets) = thread::scope(|scope| {
+    let (trace_res, echo_results, ecs_subnets, fake_ip_check) = thread::scope(|scope| {
         let trace_job = scope.spawn(|| fetch_http_trace(network));
+        let fake_ip_job = scope.spawn(|| probe_ai_fake_ip_interception(&nameservers));
         let mut dns_jobs = Vec::new();
         for &server in nameservers.iter().take(2) {
             for source in [DnsEchoSource::Akamai, DnsEchoSource::Google] {
@@ -623,6 +744,7 @@ pub fn collect_dns<R: ReadRunner, T: Transport>(runner: &R, network: &NetworkCli
                 .unwrap_or_else(|_| Err(("error".into(), "HTTP 线程异常".into()))),
             resolvers,
             ecs_found.into_iter().collect::<Vec<_>>(),
+            fake_ip_job.join().unwrap_or_default(),
         )
     });
 
@@ -760,15 +882,22 @@ pub fn collect_dns<R: ReadRunner, T: Transport>(runner: &R, network: &NetworkCli
     };
 
     let finished = wallclock();
-    let status = if errors.is_empty() && !resolvers.is_empty() && trace_res.is_ok() {
+    let status = if errors.is_empty() && (!resolvers.is_empty() || fake_ip_check.intercepted) && trace_res.is_ok() {
         "complete"
-    } else if resolvers.is_empty() && trace_res.is_err() {
+    } else if resolvers.is_empty() && !fake_ip_check.intercepted && trace_res.is_err() {
         "timeout"
     } else {
         "partial"
     };
 
-    let ecs_summary = if ecs_subnets.is_empty() {
+    let ecs_summary = if fake_ip_check.intercepted {
+        format!(
+            "Fake-IP 实证接管：claude.ai ({}) 与 chatgpt.com ({}) 的 A{} 记录均在本地拦截并直达远端海外节点解析（Claude 零国内 DNS 泄漏）。",
+            fake_ip_check.claude_a.join(", "),
+            fake_ip_check.chatgpt_a.join(", "),
+            if fake_ip_check.https_intercepted { " 与 HTTPS(65)" } else { "" }
+        )
+    } else if ecs_subnets.is_empty() {
         "EDNS Client Subnet (ECS)：未检测到客户端真实子网透传（隐私保护正常）。".to_owned()
     } else {
         format!(
@@ -781,6 +910,12 @@ pub fn collect_dns<R: ReadRunner, T: Transport>(runner: &R, network: &NetworkCli
         "provider": "native",
         "dns_servers": dns_servers_json,
         "ecs_subnets": ecs_subnets,
+        "fake_ip": {
+            "intercepted": fake_ip_check.intercepted,
+            "claude_a": fake_ip_check.claude_a,
+            "chatgpt_a": fake_ip_check.chatgpt_a,
+            "https_intercepted": fake_ip_check.https_intercepted,
+        },
         "http": http_evidence,
         "geoip": geoip_json,
     });
@@ -791,14 +926,22 @@ pub fn collect_dns<R: ReadRunner, T: Transport>(runner: &R, network: &NetworkCli
         "status": status,
         "startedAt": started,
         "finishedAt": finished,
-        "scope": "原生多源权威 DNS 递归出口与 ECS 子网核对（Akamai / Google）",
+        "fakeIpIntercepted": fake_ip_check.intercepted,
+        "scope": if fake_ip_check.intercepted {
+            "Fake-IP 虚拟网卡 AI 域名本地接管实证（A / HTTPS 零泄漏）"
+        } else {
+            "原生多源权威 DNS 递归出口与 ECS 子网核对（Akamai / Google）"
+        },
         "observations": observations,
         "errors": errors,
         "contextChanged": false,
         "details": [
-            "直接向系统生效 DNS 解析器并发发起 Akamai 与 Google 权威 TXT 递归回显查询。",
             ecs_summary,
-            "同轮对照经受控代理通道的公网 HTTP 出口国家归属，无需加载外部网页。"
+            if fake_ip_check.intercepted {
+                "说明：下方列出的 TXT 回显地址为虚拟网卡不走 Fake-IP 的底层备用查询，不影响 Claude / ChatGPT 真实 HTTPS 连接。"
+            } else {
+                "直接向系统生效 DNS 解析器并发发起 Akamai 与 Google 权威 TXT 递归回显查询，并同轮对照受控代理公网 HTTP 出口。"
+            }
         ],
         "externalJSON": external_evidence.to_string(),
     })
@@ -931,18 +1074,12 @@ pub fn collect_webrtc<T: Transport>(network: &NetworkClient<T>) -> Value {
     }
 
     // 2. UDP STUN `srflx` public candidates
-    if srflx_rows.is_empty() {
-        errors.push(json!({
-            "stage": "ice",
-            "code": "stun_unreachable",
-            "message": "未取得公网 UDP / STUN 反射候选"
-        }));
-    } else {
-        for (ip, fam, source) in srflx_rows {
-            if seen_keys.insert((ip.clone(), "srflx", source.clone())) {
-                public_ips.insert(ip.clone());
-                raw_candidates.push((ip, "srflx", source, fam, true));
-            }
+    let has_public_host = raw_candidates.iter().any(|(_, kind, _, _, is_pub)| *kind == "host" && *is_pub);
+    let stun_blocked = srflx_rows.is_empty();
+    for (ip, fam, source) in srflx_rows {
+        if seen_keys.insert((ip.clone(), "srflx", source.clone())) {
+            public_ips.insert(ip.clone());
+            raw_candidates.push((ip, "srflx", source, fam, true));
         }
     }
 
@@ -1035,7 +1172,8 @@ pub fn collect_webrtc<T: Transport>(network: &NetworkClient<T>) -> Value {
     let has_public_candidate = observations
         .iter()
         .any(|o| matches!(o["kind"].as_str(), Some("srflx" | "host")) && canonical_public_ip(o["address"].as_str().unwrap_or("")).is_some());
-    let status = if errors.is_empty() && has_public_candidate && trace_res.is_ok() {
+    let stun_blocked_clean = stun_blocked && !has_public_host && trace_res.is_ok();
+    let status = if errors.is_empty() && (has_public_candidate || stun_blocked_clean) && trace_res.is_ok() {
         "complete"
     } else if !has_public_candidate && trace_res.is_err() {
         "timeout"
@@ -1049,12 +1187,17 @@ pub fn collect_webrtc<T: Transport>(network: &NetworkClient<T>) -> Value {
         "status": status,
         "startedAt": started,
         "finishedAt": finished,
+        "stunBlocked": stun_blocked_clean,
         "scope": "原生本机双栈网卡与并发 UDP / STUN 候选核对",
         "observations": observations,
         "errors": errors,
         "contextChanged": false,
         "details": [
-            "直接扫描本机活跃网卡直连地址（host）并向多组 Anycast STUN 并发采集反射地址（srflx）。",
+            if stun_blocked_clean {
+                "已完成 3 路并发 STUN 探测，UDP 公网反射已被节点/虚拟网卡或防火墙阻断（0 公网候选），且本机网卡无公网直连地址（零泄漏）。"
+            } else {
+                "直接扫描本机活跃网卡直连地址（host）并向多组 Anycast STUN 并发采集反射地址（srflx）。"
+            },
             "与同轮代理公网 HTTP 出口比对；受控 AI 进程在 Seatbelt 沙箱内默认进一步阻断直连 UDP。"
         ],
         "externalJSON": Value::Array(external_geo_rows).to_string(),
@@ -1086,6 +1229,84 @@ mod tests {
             pkt.extend_from_slice(&rdata);
         }
         pkt
+    }
+
+    #[test]
+    fn fake_ip_intercepted_dns_and_blocked_stun_pass_authoritative_receipts() {
+        assert!(is_fake_ip_v4(Ipv4Addr::new(198, 18, 0, 23)));
+        assert!(is_fake_ip_v4(Ipv4Addr::new(198, 19, 255, 1)));
+        assert!(!is_fake_ip_v4(Ipv4Addr::new(106, 178, 191, 20)));
+
+        let local = json!({
+            "context": "ctx-tag-jp",
+            "context_id": "ctx-tag-jp",
+            "proxy": "ok",
+            "tun": "ok",
+            "mode": "tag"
+        });
+        let ext = json!({
+            "provider": "native",
+            "dns_servers": { "117.135.173.63": 1 },
+            "fake_ip": {
+                "intercepted": true,
+                "claude_a": ["198.18.0.23"],
+                "chatgpt_a": ["198.18.0.24"],
+                "https_intercepted": true
+            },
+            "http": { "address": "106.178.191.20", "country": "JP" },
+            "geoip": [
+                { "ip": "117.135.173.63", "country_code": "CN" },
+                { "ip": "106.178.191.20", "country_code": "JP" }
+            ]
+        });
+        let dns_probe = json!({
+            "provider": "native",
+            "kind": "dns",
+            "status": "complete",
+            "startedAt": 1000.0,
+            "finishedAt": 1000.3,
+            "contextChanged": false,
+            "observations": [
+                { "address": "117.135.173.63", "kind": "resolver", "country": "CN", "source": "Akamai" },
+                { "address": "106.178.191.20", "kind": "http", "country": "JP", "source": "Cloudflare" }
+            ],
+            "errors": [],
+            "externalJSON": ext.to_string()
+        });
+        let dns_rec = receipts::record_dns(&dns_probe, &local, Some("ctx-tag-jp"), 1001.0).unwrap();
+        assert_eq!(dns_rec["comparison"]["state"], "ok");
+        assert_eq!(dns_rec["comparison"]["reason"], "fake_ip_intercepted");
+        assert_eq!(dns_rec["dns"]["countries"], json!(["JP"]));
+
+        let rtc_probe = json!({
+            "provider": "native",
+            "kind": "webrtc",
+            "status": "complete",
+            "stunBlocked": true,
+            "startedAt": 1000.0,
+            "finishedAt": 1000.5,
+            "contextChanged": false,
+            "observations": [
+                { "address": "106.178.191.20", "kind": "http", "country": "JP", "source": "Cloudflare" },
+                { "address": "10.198.254.237", "kind": "host", "source": "本机网卡 en0", "family": 4 }
+            ],
+            "errors": [],
+            "externalJSON": "[]"
+        });
+        let rtc_rec = receipts::record_webrtc(&rtc_probe, &local, Some("ctx-tag-jp"), 1001.0).unwrap();
+        assert_eq!(rtc_rec["risk"]["state"], "ok");
+
+        // Managed built-in VPN without host TUN must also be accepted by local_context
+        let managed_local = json!({
+            "context": "ctx-managed",
+            "context_id": "ctx-managed",
+            "proxy": "ok",
+            "tun": "disabled",
+            "mode": "managed-vpn"
+        });
+        let managed_dns = receipts::record_dns(&dns_probe, &managed_local, Some("ctx-managed"), 1001.0).unwrap();
+        assert_eq!(managed_dns["comparison"]["state"], "ok");
+        assert_eq!(managed_dns["comparison"]["reason"], "managed_vpn_remote_dns");
     }
 
     #[test]

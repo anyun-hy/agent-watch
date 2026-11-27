@@ -32,6 +32,7 @@ struct NetworkPanoramaPage: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
             topControlWorkbench
+            claudeSafetyVerdictBanner
             executiveKpiStrip
 
             if store.panoramaFocus == .all || store.panoramaFocus == .ipIntel {
@@ -187,6 +188,152 @@ struct NetworkPanoramaPage: View {
                 }
             }
         }
+    }
+
+    // MARK: - Claude / AI Readiness Safety Verdict Banner
+
+    private struct SafetyPillar: Identifiable {
+        let id: String
+        let title: String
+        let state: String // "pass" | "warn" | "fail" | "pending"
+        let detail: String
+    }
+
+    private var claudeSafetyVerdictBanner: some View {
+        let report = ipIntel.currentReport
+        let aiResult = effectiveAIState.result
+        let dnsVerdict = leakChecks.dns.verdict
+        let rtcVerdict = leakChecks.rtc.verdict
+
+        let blockedRegions: Set<String> = ["CN", "HK", "MO", "RU", "BY", "IR", "KP"]
+        let exitCountry = (report?.countryCode ?? aiResult?.countryCode ?? "").uppercased()
+        let regCountry = (report?.registered_country_code ?? "").uppercased()
+
+        let regionPillar: SafetyPillar = {
+            if exitCountry.isEmpty {
+                return SafetyPillar(id: "region", title: "地区合规", state: "pending", detail: "等待识别落地国家")
+            }
+            if blockedRegions.contains(exitCountry) || regCountry == "CN" {
+                return SafetyPillar(id: "region", title: "地区合规", state: "fail", detail: "命中封锁区或中国注册 ASN（\(exitCountry)/\(regCountry)）")
+            }
+            return SafetyPillar(id: "region", title: "地区合规", state: "pass", detail: "安全海外区（\(exitCountry)）")
+        }()
+
+        let purityPillar: SafetyPillar = {
+            guard let r = report, let s = r.score else {
+                return SafetyPillar(id: "purity", title: "IP 纯净度", state: "pending", detail: "等待评估")
+            }
+            if r.is_tor == true || r.is_abuser == true || s.value < 45 {
+                return SafetyPillar(id: "purity", title: "IP 纯净度", state: "fail", detail: "\(s.value) 分 · 高危滥用或黑名单")
+            }
+            if s.value >= 78 {
+                return SafetyPillar(id: "purity", title: "IP 纯净度", state: "pass", detail: "\(s.value) 分 · \(r.is_residential == true ? "家宽级" : s.label)")
+            }
+            return SafetyPillar(id: "purity", title: "IP 纯净度", state: "warn", detail: "\(s.value) 分 · 机房或广播特征")
+        }()
+
+        let endpointPillar: SafetyPillar = {
+            let eps = aiResult?.endpoints ?? []
+            if eps.isEmpty {
+                return SafetyPillar(id: "endpoints", title: "AI 连通性", state: "pending", detail: "等待端点探测")
+            }
+            let claudeBlocked = eps.contains { $0.family == "claude" && $0.httpStatus == 403 && $0.cfChallenge != true }
+            if claudeBlocked {
+                return SafetyPillar(id: "endpoints", title: "AI 连通性", state: "fail", detail: "Claude 端点返回 403 拒绝访问")
+            }
+            let ok = eps.filter { $0.status == "responded" && ($0.httpStatus == 200 || $0.httpStatus == 401) }.count
+            return SafetyPillar(id: "endpoints", title: "AI 连通性", state: ok == eps.count ? "pass" : "warn", detail: "\(ok)/\(eps.count) 端点正常")
+        }()
+
+        let dnsPillar: SafetyPillar = {
+            switch dnsVerdict.state {
+            case .matched: return SafetyPillar(id: "dns", title: "DNS 零泄漏", state: "pass", detail: "AI 域名解析无国内泄漏")
+            case .difference: return SafetyPillar(id: "dns", title: "DNS 零泄漏", state: "fail", detail: "检测到异国/国内 DNS 泄漏")
+            default: return SafetyPillar(id: "dns", title: "DNS 零泄漏", state: "pending", detail: dnsVerdict.title)
+            }
+        }()
+
+        let rtcPillar: SafetyPillar = {
+            switch rtcVerdict.state {
+            case .matched: return SafetyPillar(id: "rtc", title: "WebRTC 防护", state: "pass", detail: "无公网 UDP 反射泄漏")
+            case .difference: return SafetyPillar(id: "rtc", title: "WebRTC 防护", state: "fail", detail: "检测到公网候选与出口不一致")
+            default: return SafetyPillar(id: "rtc", title: "WebRTC 防护", state: "pending", detail: rtcVerdict.title)
+            }
+        }()
+
+        let tzPillar: SafetyPillar = {
+            guard let aligned = report?.usage?.timezone_aligned else {
+                return SafetyPillar(id: "tz", title: "时区指纹", state: "pending", detail: "待核对本机时区")
+            }
+            if aligned {
+                return SafetyPillar(id: "tz", title: "时区指纹", state: "pass", detail: "与出口时区一致 (\(report?.timezone ?? ""))")
+            }
+            return SafetyPillar(id: "tz", title: "时区指纹", state: "warn", detail: "出口 \(report?.timezone ?? "") ≠ 本机 \(report?.usage?.system_timezone ?? "")")
+        }()
+
+        let pillars = [regionPillar, purityPillar, endpointPillar, dnsPillar, rtcPillar, tzPillar]
+        let hasFail = pillars.contains { $0.state == "fail" }
+        let hasWarn = pillars.contains { $0.state == "warn" }
+        let hasPending = pillars.contains { $0.state == "pending" }
+
+        let (headline, summary, symbol, tint): (String, String, String, Color) = {
+            if hasFail {
+                let firstFail = pillars.first { $0.state == "fail" }?.detail ?? "存在高危封号风险项"
+                return ("严禁启动 Claude · 检测到高危风险", "首要阻断项：\(firstFail)。请更换纯净海外节点并排除泄漏后再登录或启动。", "xmark.shield.fill", p.red)
+            }
+            if hasWarn {
+                let firstWarn = pillars.first { $0.state == "warn" }?.detail ?? "存在可优化项"
+                return ("基本可用 · 建议对齐配置后再启动 Claude", "待优化项：\(firstWarn)。对齐本机时区或切至原生家宽节点可显著降低风控概率。", "exclamationmark.shield.fill", p.amber)
+            }
+            if hasPending {
+                return ("正在核验 Claude 6 项防封安全指标…", "等待全部探针回执完成后给出最终安全就绪判定。", "shield.lefthalf.filled", p.blue)
+            }
+            return ("Claude / ChatGPT 当前可安全运行（6 项防封指标全部通过）", "出口地区合规、IP 纯净度达标、AI 域名与 WebRTC 零泄漏且本机时区已对齐；运行期间请勿跨国切换当前通道节点。", "checkmark.shield.fill", p.mint)
+        }()
+
+        return VStack(alignment: .leading, spacing: 11) {
+            HStack(alignment: .center, spacing: 12) {
+                Image(systemName: symbol)
+                    .font(.system(size: 22, weight: .semibold))
+                    .foregroundStyle(tint)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(headline)
+                        .font(WatchTypography.section)
+                        .foregroundStyle(p.text)
+                    Text(summary)
+                        .font(WatchTypography.caption)
+                        .foregroundStyle(p.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Spacer(minLength: 8)
+                if tzPillar.state == "warn" {
+                    Button("前往环境状态对齐时区 ↗") {
+                        store.page = .environment
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                }
+            }
+            LazyVGrid(columns: [GridItem(.adaptive(minimum: 175), spacing: 8)], spacing: 8) {
+                ForEach(pillars) { item in
+                    let c: Color = item.state == "pass" ? p.mint : item.state == "fail" ? p.red : item.state == "warn" ? p.amber : p.secondary
+                    let icon = item.state == "pass" ? "checkmark.circle.fill" : item.state == "fail" ? "xmark.circle.fill" : item.state == "warn" ? "exclamationmark.triangle.fill" : "clock"
+                    HStack(spacing: 6) {
+                        Image(systemName: icon).font(.system(size: 11)).foregroundStyle(c)
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(item.title).font(WatchTypography.small.weight(.semibold)).foregroundStyle(p.text)
+                            Text(item.detail).font(.system(size: 10)).foregroundStyle(p.secondary).lineLimit(1)
+                        }
+                        Spacer(minLength: 0)
+                    }
+                    .padding(.horizontal, 8).padding(.vertical, 6)
+                    .background(p.surface.opacity(0.85), in: RoundedRectangle(cornerRadius: 7))
+                }
+            }
+        }
+        .padding(14)
+        .background(tint.opacity(0.08), in: RoundedRectangle(cornerRadius: 12))
+        .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(tint.opacity(0.32), lineWidth: 1))
     }
 
     // MARK: - 4-Card Executive Summary KPI Strip
@@ -1009,7 +1156,7 @@ struct NetworkPanoramaPage: View {
         let obs = result?.observations ?? []
         let resolvers = obs.filter { $0.kind == "resolver" }
         let httpRef = obs.first(where: { $0.kind == "http" })
-        let ecsNote = result?.details.first(where: { $0.contains("ECS") })
+        let ecsNote = result?.details.first(where: { $0.contains("Fake-IP") || $0.contains("ECS") })
         let codes = CountryIdentity.geoCodes(result?.externalJSON)
         let tint = style.verdictColor(state.verdict.state)
 
@@ -1027,17 +1174,19 @@ struct NetworkPanoramaPage: View {
                     .fixedSize(horizontal: false, vertical: true)
 
                 if let ecsNote {
+                    let isGood = ecsNote.contains("Fake-IP") || ecsNote.contains("未检测到")
                     HStack(spacing: 6) {
-                        Image(systemName: ecsNote.contains("未检测到") ? "checkmark.shield.fill" : "exclamationmark.shield.fill")
-                            .foregroundStyle(ecsNote.contains("未检测到") ? p.mint : p.amber)
+                        Image(systemName: isGood ? "checkmark.shield.fill" : "exclamationmark.shield.fill")
+                            .foregroundStyle(isGood ? p.mint : p.amber)
                             .font(.system(size: 12))
                         Text(ecsNote)
                             .font(WatchTypography.small)
                             .foregroundStyle(p.text)
+                            .fixedSize(horizontal: false, vertical: true)
                     }
                     .padding(8)
                     .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(p.elevated.opacity(0.45), in: RoundedRectangle(cornerRadius: 7))
+                    .background((isGood ? p.mint : p.amber).opacity(0.08), in: RoundedRectangle(cornerRadius: 7))
                 }
 
                 Divider()
