@@ -618,7 +618,7 @@ enum SwitcherCommandRunner {
             if first == "account" || args.contains("--apply") {
                 return .mutatingTransaction
             }
-            if first == "setup" || first == "update" || first == "launch" || first == "environment" || first == "diagnose-proxy" {
+            if first == "setup" || first == "update" || first == "launch" || first == "environment" || first == "diagnose-proxy" || (first == "vpn" && args.contains("probe")) {
                 return .longRunningInteractive
             }
             return .readOnlyQuery

@@ -16,6 +16,7 @@ mod reinstall_dispatch;
 mod runtime;
 mod setup_dispatch;
 mod update_dispatch;
+mod vpn_dispatch;
 #[cfg(all(test, target_os = "macos"))]
 #[path = "../tests/support/ready_entry_fixture.rs"]
 mod entry_ready_fixture;
@@ -452,10 +453,13 @@ fn run() -> Result<EngineOutput> {
     }
     if request.command == "dns-probe" {
         use claude_watch_runtime::network_client::{NetworkClient, UreqTransport, default_proxy_url};
+        let storage = claude_watch_runtime::storage::StateStore::new(paths.clone());
+        let active_proxy = claude_watch_runtime::managed_vpn::active_upstream_endpoint(&storage)
+            .unwrap_or_else(|| default_proxy_url().into());
         let runner = runtime::runner()?;
         let network = NetworkClient::new(
             std::sync::Arc::new(UreqTransport),
-            Some(default_proxy_url().into()),
+            Some(active_proxy),
         )
         .map_err(|e| CoreError::new(&e.code, &e.detail))?;
         return Ok(EngineOutput::json(
@@ -463,10 +467,14 @@ fn run() -> Result<EngineOutput> {
             0,
         ));
     }
-    if let Some(value) = ai_dispatch::dispatch(&request)? {
+    if let Some(value) = ai_dispatch::dispatch(&request, paths.clone())? {
         // A partial/timeout observation is still a valid JSON receipt for the
         // GUI, matching the Python collector's zero exit behaviour.
         return Ok(EngineOutput::json(value, 0));
+    }
+    if let Some(value) = vpn_dispatch::dispatch(&request, paths.clone())? {
+        let code = result_code(&value);
+        return Ok(EngineOutput::json(value, code));
     }
     if let Some(value) = reference_dispatch::dispatch(&request)? {
         return Ok(EngineOutput::json(value, 0));

@@ -619,6 +619,87 @@ pub fn event_history(store: &StateStore, query: &EventHistoryQuery) -> Result<Va
         json!({"status":"ok","events":page,"total":total,"nextOffset":next,"hasMore":next < total,"invalidRecords":history.invalid_records}),
     )
 }
+pub fn managed_proxy_snapshot(store: &StateStore, observed_at: f64) -> Option<Value> {
+    let cfg = crate::config_store::ConfigStore {
+        storage: store.clone(),
+    }
+    .load()
+    .ok()?;
+    if cfg.effective_vpn_source_mode() != claude_watch_core::vpn_profile::VpnSourceMode::Managed {
+        return None;
+    }
+    let st = crate::managed_vpn::read_runtime_state(store);
+    let live_ep = crate::managed_vpn::active_upstream_endpoint(store);
+    let running = live_ep.is_some();
+    let node_name = st
+        .node_name
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            cfg.managed_vpn
+                .as_ref()
+                .map(|m| m.selected_node_name.as_str())
+                .filter(|s| !s.is_empty())
+        })
+        .unwrap_or("待选定节点");
+    let endpoint = live_ep
+        .or(st.upstream_endpoint.clone())
+        .unwrap_or_else(|| "http://127.0.0.1:0".into());
+    let listener_path = st
+        .kernel_identity
+        .as_ref()
+        .map(|k| k.executable_path.as_str())
+        .unwrap_or("watch-vpn-core");
+    let entry_reason = if running {
+        "独立内置 VPN 内核已核验（无 TUN · 不影响本机 VPN）".to_string()
+    } else {
+        st.error_message
+            .clone()
+            .unwrap_or_else(|| "独立内置 VPN 尚未启动或尚未选定节点".into())
+    };
+    Some(json!({
+        "backendVersion": VERSION,
+        "monitoredApps": MONITORED,
+        "observedAt": observed_at,
+        "entryState": if running { "verified" } else { "unconfirmed" },
+        "entryReason": entry_reason,
+        "entrySource": "managed-vpn",
+        "endpoint": endpoint,
+        "listenerPID": st.pid,
+        "listenerPath": listener_path,
+        "listenerStarted": Value::Null,
+        "apiState": if running { "available" } else { "unavailable" },
+        "apiReason": if running { "" } else { "独立内置隧道未就绪" },
+        "mode": "global",
+        "coversProxy": running,
+        "expectedGroup": "独立内置 VPN",
+        "expectedNode": node_name,
+        "selectedNode": node_name,
+        "globalNode": node_name,
+        "pinned": true,
+        "selectionChanged": false,
+        "flows": [],
+        "connectionObservation": {
+            "schema": 1,
+            "roundID": "managed-vpn",
+            "observedAt": observed_at,
+            "collectorState": "no_targets",
+            "targetCount": 0,
+            "parsedCount": 0,
+            "acceptedCount": 0,
+            "correlatedCount": 0,
+            "unconfirmedCount": 0,
+            "confirmedExitedCount": 0,
+            "processConfirmedExitedCount": 0,
+            "processReasonCounts": {},
+            "dropped": {},
+            "detail": "独立内置 VPN 经受控沙盒网关直接承载，不依赖外部 TAG 连接表",
+            "uiFilteredCount": 0,
+            "uiDropped": {}
+        }
+    }))
+}
+
 pub fn assemble(
     store: &StateStore,
     round: &ProcessRound,
@@ -655,7 +736,7 @@ pub(crate) fn assemble_with_active(
     )).unwrap_or((None, Value::Null));
     let mut snapshot = json!({"capturedAt":at,"health":{"state":if quality{"running"}else{"degraded"},"mode":mode,"pid":producer.pid,"heartbeatAge":0.0,"started":producer.start_stamp,"detail":if quality{"后台进程存活，采样心跳正常"}else{"部分监控采样需要检查"},"alerts":"开启"},
         "installed":installed,"autoStart":false,"keepAlive":false,"hasBaseline":has_session_reference(store,at),"stderrBytes":0,
-        "processes":rows,"targetDiscovery":round.discovery,"events":events,"eventError":event_error,"proxy":proxy(tag),"proxyError":Value::Null,"channelSupervision":channel_supervision,"vpnSupervision":vpn_supervision,"backendVersion":VERSION,"monitoredApps":MONITORED,"logPath":store.paths.base().join("events.jsonl")});
+        "processes":rows,"targetDiscovery":round.discovery,"events":events,"eventError":event_error,"proxy":managed_proxy_snapshot(store, at).or_else(|| proxy(tag)),"proxyError":Value::Null,"channelSupervision":channel_supervision,"vpnSupervision":vpn_supervision,"backendVersion":VERSION,"monitoredApps":MONITORED,"logPath":store.paths.base().join("events.jsonl")});
     if snapshot["channelSupervision"].get("event_history").is_none() {
         snapshot["channelEvents"] = channel_events.unwrap_or_else(|| json!([]));
     }
@@ -819,5 +900,42 @@ mod guard_history_presentation_tests {
         assert_eq!(flow["flow_kind"], "core_platform");
         assert_eq!(flow["association"], "correlated");
         assert_eq!(flow["chains"], json!(["海外AI", "JP11"]));
+    }
+
+    #[test]
+    fn managed_proxy_snapshot_projects_tunnel_state_and_returns_none_in_external_mode() {
+        let root = std::env::temp_dir().join(format!("cw-snap-managed-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let store = StateStore::new(crate::storage::Paths::new(&root).unwrap());
+        store.initialize().unwrap();
+
+        // External mode (default) returns None so existing TAG snapshot behavior is untouched.
+        assert!(managed_proxy_snapshot(&store, 1000.0).is_none());
+
+        // Managed mode projects an explicit proxy snapshot even when no host VPN is installed.
+        let cfg_store = crate::config_store::ConfigStore {
+            storage: store.clone(),
+        };
+        cfg_store
+            .set_vpn_source_mode(claude_watch_core::vpn_profile::VpnSourceMode::Managed)
+            .unwrap();
+        crate::managed_vpn::write_runtime_state(
+            &store,
+            &crate::managed_vpn::ManagedVpnRuntimeState {
+                schema: 1,
+                mode: "managed".into(),
+                state: "inactive".into(),
+                node_name: Some("UK Synthetic".into()),
+                updated_at: 1000.0,
+                ..Default::default()
+            },
+        );
+        let projected = managed_proxy_snapshot(&store, 1000.0).expect("managed proxy snapshot");
+        assert_eq!(projected["entrySource"], "managed-vpn");
+        assert_eq!(projected["selectedNode"], "UK Synthetic");
+        assert_eq!(projected["mode"], "global");
+        assert_eq!(projected["pinned"], true);
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

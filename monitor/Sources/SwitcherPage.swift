@@ -1019,7 +1019,32 @@ struct SwitcherPage: View {
     }
 
     private var vpnExpectationSection: some View {
-        VStack(alignment: .leading, spacing: 10) {
+        let managedActive = monitor?.managedVpn.mode == .managed
+        return VStack(alignment: .leading, spacing: 10) {
+            if managedActive, let managed = monitor?.managedVpn {
+                HStack(alignment: .center, spacing: 10) {
+                    Image(systemName: "lock.shield.fill")
+                        .font(.system(size: 13, weight: .medium))
+                        .foregroundStyle(p.mint)
+                        .frame(width: 24, height: 24)
+                        .background(p.mint.opacity(0.12), in: RoundedRectangle(cornerRadius: 6))
+                    VStack(alignment: .leading, spacing: 3) {
+                        HStack(spacing: 8) {
+                            Text("独立内置 VPN 通道（单点生效）").font(WatchTypography.bodyStrong).foregroundStyle(p.text)
+                            Badge(text: managed.runtime?.state == "running" ? "运行中 · 不影响本机 VPN" : "独立模式", color: p.mint)
+                        }
+                        Text(managed.selectedNode.map { "当前绑定节点：\($0.name)（\($0.protocol_label)），无需配置外部 TAG / Clash 监督预期。" }
+                             ?? "当前已启用独立内置 VPN 模式，但尚未选定节点；请前往「代理与连接」导入或启用节点。")
+                            .font(WatchTypography.small).foregroundStyle(p.secondary)
+                    }
+                    Spacer(minLength: 8)
+                    Button("管理独立 VPN 节点 ↗") {
+                        openNetwork(.claude)
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                }
+            } else {
             HStack(alignment: .center, spacing: 10) {
                 Image(systemName: "network.badge.shield.half.filled")
                     .font(.system(size: 13, weight: .medium))
@@ -1040,6 +1065,11 @@ struct SwitcherPage: View {
                         .font(WatchTypography.small).foregroundStyle(p.secondary)
                 }
                 Spacer(minLength: 8)
+                Button("改用独立内置 VPN ↗") {
+                    openNetwork(.claude)
+                }
+                .buttonStyle(.borderless)
+                .font(WatchTypography.small)
                 Button(showVpnEditor ? "收起修改" : "修改 VPN 预期…") {
                     withAnimation(.easeInOut(duration: 0.15)) { showVpnEditor.toggle() }
                 }
@@ -1074,10 +1104,12 @@ struct SwitcherPage: View {
                 Text("仅写入 Watch 本地只读比对基线，不修改外部 VPN / TAG 客户端设置。")
                     .font(WatchTypography.small).foregroundStyle(p.secondary)
             }
+            }
         }
         .padding(10)
         .background(p.elevated.opacity(0.35), in: RoundedRectangle(cornerRadius: 9))
         .overlay(RoundedRectangle(cornerRadius: 9).strokeBorder(p.border.opacity(0.6), lineWidth: 1))
+        .task { await monitor?.managedVpn.refresh() }
     }
 
     private var changeReview: some View {

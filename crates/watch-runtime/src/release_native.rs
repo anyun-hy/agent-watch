@@ -724,6 +724,40 @@ impl<E: FixedCommandExecutor> LifecycleOs for NativeRelease<E> {
                 return Err(error("release_identity_mismatch", "原生组件校验失败"));
             }
         }
+        // Optional managed isolated VPN core (`watch-vpn-core`), declared outside
+        // `RuntimeHashes` so v4.2.5/v4.2.6 in-app updaters accept the bundle seamlessly
+        // while this installer still enforces arm64 + exact SHA-256 verification.
+        if let Some(expected_vpn_hash) = manifest["ManagedVpnCoreHash"]
+            .as_str()
+            .filter(|h| !h.is_empty())
+        {
+            let candidate = resources.join("watch-vpn-core");
+            let meta = fs::symlink_metadata(&candidate)
+                .map_err(|_| error("release_identity_mismatch", "内置独立 VPN 内核缺失"))?;
+            if !meta.is_file()
+                || meta.file_type().is_symlink()
+                || meta.len() > 256 * 1024 * 1024
+                || expected_vpn_hash.len() != 64
+                || !expected_vpn_hash.bytes().all(|x| x.is_ascii_hexdigit())
+            {
+                return Err(error("release_identity_mismatch", "内置独立 VPN 内核清单无效"));
+            }
+            let actual = crate::storage::sha256(
+                &fs::read(&candidate)
+                    .map_err(|_| error("release_identity_mismatch", "内置独立 VPN 内核不可读取"))?,
+            );
+            if actual != expected_vpn_hash {
+                return Err(error("release_identity_mismatch", "内置独立 VPN 内核校验失败"));
+            }
+            let out = self.require(
+                "/usr/bin/lipo",
+                &["-archs".into(), candidate.display().to_string()],
+                Duration::from_secs(10),
+            )?;
+            if out.stdout.split_whitespace().collect::<Vec<_>>() != ["arm64"] {
+                return Err(error("release_identity_mismatch", "内置独立 VPN 内核不是 arm64"));
+            }
+        }
         if manifest["NetworkBackend"] == "seatbelt" {
             self.validated_gateway_pins = Some(crate::release_gateway::GatewayComponentPins {
                 engine_sha: hashes["watch-engine"].as_str().unwrap_or_default().to_owned(),

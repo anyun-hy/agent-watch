@@ -75,7 +75,10 @@ impl EvidenceSystem for NativeEvidence {
     fn local(&mut self, config: &Config) -> Result<Value> {
         let mut local = AuditSystem::local(&self.host, config)?;
         if local["evidence_network_bound"] == true {
-            let egress = self.host.network.fast_egress();
+            let managed_ep = (local["mode"] == claude_watch_runtime::managed_vpn::MANAGED_VPN_SOURCE)
+                .then(|| local["verified_proxy_url"].as_str())
+                .flatten();
+            let egress = self.host.network.fast_egress_via(managed_ep);
             let ip = egress.data.as_ref().and_then(|v| v["ip"].as_str())
                 .ok_or_else(|| CoreError::new("evidence_egress_unavailable", "出口采样未完成；已通过检测记录保留"))?;
             local["evidence_egress_ip"] = Value::String(ip.into());
@@ -109,13 +112,17 @@ impl EvidenceSystem for NativeEvidence {
         )
     }
     fn collect(&mut self, kind: ProbeKind) -> Result<Value> {
+        let proxy_override =
+            claude_watch_runtime::managed_vpn::active_upstream_endpoint(&self.host.storage)
+                .or_else(|| Some(claude_watch_runtime::network_client::default_proxy_url().into()));
+        let probe_network = self.host.network.with_proxy(proxy_override);
         Ok(match kind {
             ProbeKind::Dns => claude_watch_runtime::native_leak_probes::collect_dns(
                 self.host.runner.as_ref(),
-                &self.host.network,
+                &probe_network,
             ),
             ProbeKind::WebRtc => {
-                claude_watch_runtime::native_leak_probes::collect_webrtc(&self.host.network)
+                claude_watch_runtime::native_leak_probes::collect_webrtc(&probe_network)
             }
         })
     }

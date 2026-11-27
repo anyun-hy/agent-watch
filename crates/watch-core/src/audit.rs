@@ -251,11 +251,30 @@ pub fn evaluate_target(
         true,
         "本机环境",
     ));
+    let managed_vpn_mode = mode == "managed-vpn"
+        || config.effective_vpn_source_mode() == crate::vpn_profile::VpnSourceMode::Managed;
+    let (tun_state, tun_detail, tun_required) = if managed_vpn_mode {
+        (
+            if text(local, "proxy") == "ok" {
+                "ok"
+            } else {
+                "unknown"
+            },
+            "独立内置 VPN 经受控沙盒专属本地隧道出站，无需系统 TUN 网卡（不影响本机 VPN）",
+            false,
+        )
+    } else {
+        (
+            text(local, "tun"),
+            "接口与代理状态核对；不构成逐包出站保证",
+            true,
+        )
+    };
     rows.push(row(
         "tun",
-        text(local, "tun"),
-        "接口与代理状态核对；不构成逐包出站保证",
-        true,
+        tun_state,
+        tun_detail,
+        tun_required,
         "本机环境",
     ));
     let measured = region::reference(&online["trace"], &online["geo"], zones);
@@ -714,4 +733,105 @@ pub fn evaluate_target(
         result["authorization_scope"] = json!("observation");
     }
     Ok(result)
+}
+
+#[cfg(test)]
+mod managed_vpn_audit_tests {
+    use super::*;
+    use crate::vpn_profile::VpnSourceMode;
+
+    #[test]
+    fn managed_vpn_mode_passes_preflight_without_host_tun_and_blocks_when_tunnel_down() {
+        let mut cfg = Config::default_for_new_install();
+        cfg.vpn_source_mode = Some(VpnSourceMode::Managed);
+        cfg.require_ipv6_off = false;
+        cfg.require_english = false;
+        cfg.require_pinned_rules = true;
+
+        let zones: ZoneCatalog = serde_json::from_value(json!({
+            "GB": ["Europe/London"]
+        }))
+        .unwrap();
+        let local_ok = json!({
+            "mode": "managed-vpn",
+            "proxy": "ok",
+            "proxy_detail": "独立内置 VPN 运行中（UK Test）",
+            "tun": "not_required",
+            "rules": {"state": "ok", "detail": "单节点强制出站"},
+            "timezone": "Europe/London",
+            "locale": "en_GB",
+            "date_format": {
+                "state": "available",
+                "configured_locale": "en_GB",
+                "patterns": {"short": "dd/MM/yyyy", "medium": "d MMM y", "long": "d MMMM y"},
+                "reference_patterns": {
+                    "en_GB": {"short": "dd/MM/yyyy", "medium": "d MMM y", "long": "d MMMM y"}
+                }
+            },
+            "ipv6": "ok",
+            "language": "en-GB",
+            "guard": true,
+            "guard_state": "ok",
+            "context": "ctx-1"
+        });
+        let online_ok = json!({
+            "trace": {"ip": "1.1.1.1", "loc": "GB"},
+            "geo": {"ip": "1.1.1.1", "country": "GB", "timezone": "Europe/London"},
+            "service_responses": {
+                "claude": {"status": "ok", "transport_reached": true, "http_status": 200, "queried_at": 100.0},
+                "api": {"status": "ok", "transport_reached": true, "http_status": 401, "queried_at": 100.0}
+            },
+            "stun": {"complete": true, "observations": [{"status": "ok", "address": "1.1.1.1"}]}
+        });
+
+        let evaluated = evaluate_target(
+            AuditInput {
+                config: &cfg,
+                local: &local_ok,
+                online: &online_ok,
+                history: &[],
+                zones: &zones,
+                policy: "pol-1",
+                now: 100.0,
+                confirmed_ip: Some("1.1.1.1"),
+            },
+            crate::processes::LaunchTarget::ClaudeDesktop,
+            |_| "2026-11-27 09:00:00".into(),
+        )
+        .unwrap();
+        assert_eq!(
+            evaluated["ready"],
+            json!(true),
+            "blocked rows: {}",
+            evaluated["blocked"]
+        );
+        let tun_row = evaluated["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["id"] == "tun")
+            .unwrap();
+        assert_eq!(tun_row["state"], "ok");
+        assert_eq!(tun_row["required"], false);
+
+        // When the managed tunnel is down (`proxy == "fail"`), preflight must block!
+        let mut local_down = local_ok.clone();
+        local_down["proxy"] = json!("fail");
+        let blocked_eval = evaluate_target(
+            AuditInput {
+                config: &cfg,
+                local: &local_down,
+                online: &online_ok,
+                history: &[],
+                zones: &zones,
+                policy: "pol-1",
+                now: 100.0,
+                confirmed_ip: Some("1.1.1.1"),
+            },
+            crate::processes::LaunchTarget::ClaudeDesktop,
+            |_| "2026-11-27 09:00:00".into(),
+        )
+        .unwrap();
+        assert_eq!(blocked_eval["ready"], json!(false));
+    }
 }

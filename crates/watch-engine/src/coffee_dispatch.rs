@@ -142,9 +142,12 @@ pub fn dispatch(request: &Request, paths: Paths) -> Result<Option<Value>> {
     if kind != "trace" && query.is_empty() {
         return Err(CoreError::new("invalid_arguments", "查询参数不能为空"));
     }
-    let network = NetworkClient::new(Arc::new(UreqTransport), Some(default_proxy_url().into()))
+    let storage = StateStore::new(paths);
+    let active_proxy = claude_watch_runtime::managed_vpn::active_upstream_endpoint(&storage)
+        .unwrap_or_else(|| default_proxy_url().into());
+    let network = NetworkClient::new(Arc::new(UreqTransport), Some(active_proxy))
         .map_err(|error| CoreError::new(&error.code, &error.detail))?
-        .with_state_store(StateStore::new(paths));
+        .with_state_store(storage);
     let receipt = match kind {
         "lookup" | "geoip" | "risk" => network.metadata(kind, query),
         "dns" => network.netcoffee_dns(query),

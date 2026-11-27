@@ -389,6 +389,31 @@ fn fetch_http_trace<T: Transport>(network: &NetworkClient<T>) -> Result<TraceRef
     Err(("timeout".into(), "未能通过代理取得同轮 HTTP 出口参考".into()))
 }
 
+#[derive(Debug, Clone)]
+pub struct GeoLookup {
+    pub country: Option<String>,
+    pub region: Option<String>,
+    pub city: Option<String>,
+    pub isp: Option<String>,
+}
+
+/// Public cached GeoIP lookup reusing the process-wide 30-minute GeoCache.
+pub fn lookup_geo_cached(ip: &str, proxy_url: Option<&str>) -> Option<GeoLookup> {
+    let network = NetworkClient::new(
+        std::sync::Arc::new(crate::network_client::UreqTransport),
+        proxy_url.map(str::to_owned),
+    )
+    .ok()?;
+    let now = crate::native::now();
+    let meta = lookup_geo_single(&network, ip, None, now)?;
+    Some(GeoLookup {
+        country: (!meta.country_code.is_empty()).then_some(meta.country_code),
+        region: (!meta.region.is_empty()).then_some(meta.region),
+        city: (!meta.city.is_empty()).then_some(meta.city),
+        isp: (!meta.isp.is_empty()).then_some(meta.isp),
+    })
+}
+
 fn lookup_geo_single<T: Transport>(
     network: &NetworkClient<T>,
     ip: &str,

@@ -139,16 +139,28 @@ for key in ("engine", "native_observer", "process_control", "sandbox_launcher", 
     destination.chmod(0o700)
 PY
 chmod 700 "$APP/Contents/Resources/watch-process-control" "$APP/Contents/Resources/watch-sandbox-launcher" "$APP/Contents/Resources/ControlledEntry" "$APP/Contents/Resources/watch-admin.sh"
+if [[ -n "${CW_VPN_CORE_BIN:-}" ]]; then
+  [[ -f "$CW_VPN_CORE_BIN" && ! -L "$CW_VPN_CORE_BIN" ]] || { echo "Invalid CW_VPN_CORE_BIN: $CW_VPN_CORE_BIN" >&2; exit 1; }
+  [[ "$(/usr/bin/lipo -archs "$CW_VPN_CORE_BIN" | /usr/bin/xargs)" == "arm64" ]] || { echo "CW_VPN_CORE_BIN must be arm64: $CW_VPN_CORE_BIN" >&2; exit 1; }
+  cp "$CW_VPN_CORE_BIN" "$APP/Contents/Resources/watch-vpn-core"
+  chmod 700 "$APP/Contents/Resources/watch-vpn-core"
+fi
 if [[ "$CW_SIGNING_IDENTITY" != - ]]; then
   for CW_COMPONENT in watch-engine watch-native-observer watch-process-control watch-sandbox-launcher watch-gateway-broker ControlledEntry; do
     CW_COMPONENT_ID="io.local.watchpanel.$CW_COMPONENT"
     if [[ "$CW_COMPONENT" == watch-engine ]]; then CW_COMPONENT_ID=io.local.watchpanel.engine; fi
     /usr/bin/codesign --force --sign "$CW_SIGNING_IDENTITY" "${CW_SIGN_OPTIONS[@]}" --identifier "$CW_COMPONENT_ID" "$APP/Contents/Resources/$CW_COMPONENT"
   done
+  if [[ -f "$APP/Contents/Resources/watch-vpn-core" ]]; then
+    /usr/bin/codesign --force --sign "$CW_SIGNING_IDENTITY" "${CW_SIGN_OPTIONS[@]}" --identifier io.local.watchpanel.watch-vpn-core "$APP/Contents/Resources/watch-vpn-core"
+  fi
   BACKEND_SHA256=$(/usr/bin/shasum -a 256 "$APP/Contents/Resources/watch-engine" | /usr/bin/awk '{print $1}')
 else
   /usr/bin/codesign --force --sign - "$APP/Contents/Resources/watch-process-control"
   /usr/bin/codesign --force --sign - "$APP/Contents/Resources/ControlledEntry"
+  if [[ -f "$APP/Contents/Resources/watch-vpn-core" ]]; then
+    /usr/bin/codesign --force --sign - "$APP/Contents/Resources/watch-vpn-core"
+  fi
 fi
 # The free local endpoint broker authenticates live engine code, including
 # hardened runtime/library validation. This is an ad-hoc-capable code signature,
@@ -207,6 +219,9 @@ forbidden = [p for p in root.rglob("*") if p.suffix == ".py" or p.name in ("clau
 if forbidden: raise SystemExit("The bundle still contains retired backend resources")
 files = [root / n for n in ("watch-engine", "watch-native-observer", "watch-admin.sh", "watch-process-control", "watch-sandbox-launcher", "watch-gateway-broker", "ControlledEntry", "watch-native-collector.zsh", "BuildIdentity.json")]
 value["RuntimeHashes"] = {str(p.relative_to(root)): hashlib.sha256(p.read_bytes()).hexdigest() for p in files}
+vpn_core = root / "watch-vpn-core"
+if vpn_core.is_file() and not vpn_core.is_symlink():
+    value["ManagedVpnCoreHash"] = hashlib.sha256(vpn_core.read_bytes()).hexdigest()
 helper = root / "watch-sandbox-launcher"
 signature = subprocess.run(["/usr/bin/codesign", "--display", "--verbose=4", helper], capture_output=True, text=True, check=True).stderr
 cdhash = next((line[7:] for line in signature.splitlines() if line.startswith("CDHash=")), "")

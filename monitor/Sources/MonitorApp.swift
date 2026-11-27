@@ -380,7 +380,7 @@ struct MonitorView: View {
         case .processes: return "最近采样到的 AI 应用及关联进程"
         case .events: return "检索最近的监控事件与原始记录"
         case .dns: return "采集递归出口，按预期解析器核对；无结果保持未完成"
-        case .webrtc: return "比较当前检测 WebView 的 ICE/STUN 候选与 HTTP 出口"
+        case .webrtc: return "比较本机原生 ICE / STUN 候选与同轮 HTTP 出口"
         case .claudeAI: return "核对 Claude 域名的代理诊断、入口响应与现有连接"
         case .ipScore: return "读取 Net.Coffee 评分与原始 IP 资料"
         case .gptAI: return "核对 ChatGPT 与 API 入口响应，并查看现有连接证据"
@@ -572,6 +572,7 @@ struct MonitorView: View {
 
     private var network: some View {
         Group {
+            ManagedVpnPanel(store: store.managedVpn, p: p)
             ConnectionGraphView(store: store, p: p)
             ConnectionInventoryView(store: store, p: p)
             Surface(p) {

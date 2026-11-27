@@ -174,6 +174,65 @@ impl ConfigStore {
         Ok(validated)
     }
 
+    pub fn set_vpn_source_mode(
+        &self,
+        mode: claude_watch_core::vpn_profile::VpnSourceMode,
+    ) -> Result<Config> {
+        let _lock = self.storage.lock("operation", None)?;
+        let mut current = self.load()?;
+        current.schema = current.schema.max(2);
+        current.network_backend = Some(NetworkBackendKind::Seatbelt);
+        current.vpn_source_mode = Some(mode);
+        let mut managed = current.managed_vpn.clone().unwrap_or_default();
+        managed.enabled = mode == claude_watch_core::vpn_profile::VpnSourceMode::Managed;
+        current.managed_vpn = Some(managed);
+        let validated = Config::from_value(current.value()?)?;
+        self.storage
+            .atomic_json(&self.storage.paths.config(), &validated.value()?)?;
+        Ok(validated)
+    }
+
+    pub fn select_managed_vpn_node(
+        &self,
+        node: &claude_watch_core::vpn_profile::NormalizedOutboundNode,
+        activate_managed_mode: bool,
+    ) -> Result<Config> {
+        node.validate()?;
+        let _lock = self.storage.lock("operation", None)?;
+        let mut current = self.load()?;
+        current.schema = current.schema.max(2);
+        current.network_backend = Some(NetworkBackendKind::Seatbelt);
+        let mut managed = current.managed_vpn.clone().unwrap_or_default();
+        managed.selected_node_id = Some(node.id.clone());
+        managed.selected_node_name = node.name.clone();
+        managed.provider_kind = node.provider_kind;
+        if activate_managed_mode {
+            current.vpn_source_mode = Some(claude_watch_core::vpn_profile::VpnSourceMode::Managed);
+            managed.enabled = true;
+        }
+        current.managed_vpn = Some(managed);
+        let validated = Config::from_value(current.value()?)?;
+        self.storage
+            .atomic_json(&self.storage.paths.config(), &validated.value()?)?;
+        Ok(validated)
+    }
+
+    pub fn clear_selected_managed_node_if_matches(&self, node_id: &str) -> Result<Config> {
+        let _lock = self.storage.lock("operation", None)?;
+        let mut current = self.load()?;
+        if let Some(ref mut managed) = current.managed_vpn {
+            if managed.selected_node_id.as_deref() == Some(node_id) {
+                managed.selected_node_id = None;
+                managed.selected_node_name.clear();
+                let validated = Config::from_value(current.value()?)?;
+                self.storage
+                    .atomic_json(&self.storage.paths.config(), &validated.value()?)?;
+                return Ok(validated);
+            }
+        }
+        Ok(current)
+    }
+
     /// Read-only migration disclosure for the UI. Loading never edits the
     /// legacy document; the effective config is already downgraded to close.
     pub fn legacy_force_pending(&self) -> Result<Vec<String>> {

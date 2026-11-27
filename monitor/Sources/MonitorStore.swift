@@ -12,6 +12,7 @@ final class MonitorStore: ObservableObject {
     let netCoffee = NetCoffeeStore()
     let processControl = AIProcessControl()
     let managedEntryControl: ManagedEntryControl
+    let managedVpn: ManagedVpnStore
     let switcher: SwitcherStore
     /// First-run owns diagnostic/mutation sequencing; publication events request readback.
     @Published private(set) var initializing = false
@@ -65,6 +66,7 @@ final class MonitorStore: ObservableObject {
         self.aiChecks = aiChecks ?? AIProbeStore()
         self.switcher = switcher ?? SwitcherStore()
         self.managedEntryControl = ManagedEntryControl(isFixture: self.switcher.isFixture)
+        self.managedVpn = ManagedVpnStore(isFixture: self.switcher.isFixture)
         switcherReady = self.switcher.$busy.combineLatest(self.switcher.$readingEnvironment)
             .filter { busy, _ in !busy }.receive(on: DispatchQueue.main)
             .sink { [weak self] _, readingEnvironment in

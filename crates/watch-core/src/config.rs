@@ -4,6 +4,7 @@ use crate::network::public_unicast;
 use crate::policy::PolicyCatalog;
 use crate::processes::Provider;
 use crate::vpn::VpnExpectation;
+use crate::vpn_profile::{ManagedVpnConfig, VpnSourceMode};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
@@ -65,6 +66,10 @@ pub struct Config {
     pub network_backend: Option<NetworkBackendKind>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vpn_expectation: Option<VpnExpectation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vpn_source_mode: Option<VpnSourceMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub managed_vpn: Option<ManagedVpnConfig>,
     pub update_url: String,
     pub update_public_key: String,
     pub verified_claude_versions: Vec<String>,
@@ -103,6 +108,8 @@ impl Default for Config {
             gpt_force_approved_v1: Vec::new(),
             network_backend: None,
             vpn_expectation: None,
+            vpn_source_mode: None,
+            managed_vpn: None,
             update_url: String::new(),
             update_public_key: String::new(),
             verified_claude_versions: Vec::new(),
@@ -131,10 +138,12 @@ impl Config {
             || self.network_backend == Some(NetworkBackendKind::NetworkExtension)
     }
 
+    pub fn effective_vpn_source_mode(&self) -> VpnSourceMode {
+        self.vpn_source_mode.unwrap_or(VpnSourceMode::External)
+    }
+
     pub fn vpn_is_read_only(&self) -> bool {
-        // VPN configuration belongs to the VPN application, including while
-        // an old Watch document is waiting for explicit migration.
-        true
+        self.effective_vpn_source_mode() == VpnSourceMode::External
     }
 
     pub fn is_openai_target(target: crate::processes::LaunchTarget) -> bool {
@@ -189,6 +198,8 @@ impl Config {
         merged.insert("gpt_force_approved_v1".into(), serde_json::json!([]));
         merged.insert("network_backend".into(), Value::Null);
         merged.insert("vpn_expectation".into(), Value::Null);
+        merged.insert("vpn_source_mode".into(), Value::Null);
+        merged.insert("managed_vpn".into(), Value::Null);
         for key in [
             "gpt_require_ipv6_off",
             "gpt_require_stun",
@@ -260,10 +271,13 @@ impl Config {
         if !matches!(result.schema, 1 | 2)
             || !matches!(
                 result.proxy_mode.as_str(),
-                "tag" | "clash-verge" | "shadowrocket" | "sing-box" | "clashx" | "surge" | "auto"
+                "tag" | "clash-verge" | "shadowrocket" | "sing-box" | "clashx" | "surge" | "auto" | "managed-vpn"
             )
         {
             return Err(invalid("不支持的配置版本或代理类型"));
+        }
+        if let Some(ref managed) = result.managed_vpn {
+            managed.validate()?;
         }
         if result.schema == 2 && result.network_backend.is_none() {
             result.network_backend = Some(NetworkBackendKind::Seatbelt);

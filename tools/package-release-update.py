@@ -35,6 +35,7 @@ RUNTIME_COMPONENTS = (
     "watch-process-control",
     "watch-sandbox-launcher",
     "watch-gateway-broker",
+    "watch-vpn-core",
     "ControlledEntry",
     "watch-native-collector.zsh",
     "BuildIdentity.json",

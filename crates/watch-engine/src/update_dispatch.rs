@@ -117,6 +117,16 @@ fn install_verified_app(
             "已校验的更新应用目录缺失",
         ));
     }
+    // When upgrading from v4.2.5/v4.2.6, the old updater extracts newly introduced
+    // signed executables (`watch-vpn-core`) with mode 0600; restore 0700 here before
+    // `AppLifecycle::apply` installs the verified bundle.
+    let staged_vpn_core = staged_app.join("Contents/Resources/watch-vpn-core");
+    if let Ok(meta) = fs::symlink_metadata(&staged_vpn_core) {
+        if meta.is_file() && !meta.file_type().is_symlink() {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&staged_vpn_core, fs::Permissions::from_mode(0o700));
+        }
+    }
     let _operation = storage.lock("operation", None)?;
     let mut lifecycle = AppLifecycle {
         paths: LifecyclePaths {

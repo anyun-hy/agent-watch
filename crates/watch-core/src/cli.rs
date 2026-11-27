@@ -78,6 +78,22 @@ impl Request {
                 &["apply"],
                 &["confirm-force"],
             ),
+            "vpn" => (
+                &[
+                    "status",
+                    "nodes",
+                    "import",
+                    "select",
+                    "delete",
+                    "probe",
+                    "mode",
+                    "service-set",
+                    "service-sync",
+                    "service-clear",
+                ],
+                &["apply", "preview"],
+                &["id", "mode", "provider"],
+            ),
             "account" => (
                 &["status", "current", "identity", "save", "switch", "recover", "import", "prune-cli"],
                 &["apply", "ack-unverified-version"],

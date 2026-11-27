@@ -1743,8 +1743,7 @@ impl ChannelSupervisor {
                     None => self.latest_vpn_unavailable_reason.is_some(),
                 };
                 let matched_now = self
-                    .config
-                    .vpn_expectation
+                    .effective_vpn_expectation_for(Some(&observation))
                     .as_ref()
                     .is_some_and(|exp| compare_vpn(exp, &observation, now).is_matched());
                 if matched_now {
@@ -1831,9 +1830,15 @@ impl ChannelSupervisor {
                 } else {
                     self.latest_egress.insert(measured_family.to_string(), egress);
                 }
-                let tun_required_by_guard = match self.config.vpn_expectation.as_ref() {
-                    Some(exp) if exp.configured => exp.require_tun == Some(true),
-                    _ => true,
+                let tun_required_by_guard = if self.config.effective_vpn_source_mode()
+                    == claude_watch_core::vpn_profile::VpnSourceMode::Managed
+                {
+                    false
+                } else {
+                    match self.config.vpn_expectation.as_ref() {
+                        Some(exp) if exp.configured => exp.require_tun == Some(true),
+                        _ => true,
+                    }
                 };
                 let local_guard_ok = local_guard["proxy"] == "ok"
                     && (!tun_required_by_guard || local_guard["tun"] == "ok");
@@ -2047,11 +2052,72 @@ impl ChannelSupervisor {
         Ok(current)
     }
 
+    fn effective_vpn_expectation_for(
+        &self,
+        observation: Option<&VpnObservation>,
+    ) -> Option<VpnExpectation> {
+        if self.config.effective_vpn_source_mode()
+            == claude_watch_core::vpn_profile::VpnSourceMode::Managed
+        {
+            let managed = self.config.managed_vpn.as_ref()?;
+            let node_id = managed.selected_node_id.as_deref()?;
+            let obs = observation?;
+            return crate::managed_vpn::build_managed_expectation_for_observation(
+                node_id,
+                &managed.selected_node_name,
+                obs,
+            );
+        }
+        self.config.vpn_expectation.clone()
+    }
+
     fn compute_vpn_match(&self, now: f64) -> Option<VpnMatch> {
         if let Some(ref reason) = self.config_blocking_reason {
             return Some(VpnMatch::Unknown {
                 reasons: vec![reason.clone()],
             });
+        }
+        if self.config.effective_vpn_source_mode()
+            == claude_watch_core::vpn_profile::VpnSourceMode::Managed
+        {
+            let Some(managed) = self.config.managed_vpn.as_ref() else {
+                return Some(VpnMatch::Unknown {
+                    reasons: vec!["managed_vpn_node_unselected".into()],
+                });
+            };
+            let Some(node_id) = managed.selected_node_id.as_deref() else {
+                return Some(VpnMatch::Unknown {
+                    reasons: vec!["managed_vpn_node_unselected".into()],
+                });
+            };
+            let Some(obs) = self.latest_vpn_observation.as_ref() else {
+                let reason = self
+                    .latest_vpn_unavailable_reason
+                    .clone()
+                    .unwrap_or_else(|| "managed_vpn_starting".into());
+                return Some(VpnMatch::Unknown {
+                    reasons: vec![reason],
+                });
+            };
+            if let Some(ref err) = obs.source_error {
+                return Some(VpnMatch::Unknown {
+                    reasons: vec![if err.trim().is_empty() {
+                        "managed_vpn_unavailable".into()
+                    } else {
+                        err.clone()
+                    }],
+                });
+            }
+            let Some(exp) = crate::managed_vpn::build_managed_expectation_for_observation(
+                node_id,
+                &managed.selected_node_name,
+                obs,
+            ) else {
+                return Some(VpnMatch::Unknown {
+                    reasons: vec!["managed_vpn_node_switching".into()],
+                });
+            };
+            return Some(compare_vpn(&exp, obs, now));
         }
         let is_sandbox_backend = self.config.effective_network_backend().is_sandbox();
         let vpn_gate_active = is_sandbox_backend
@@ -2169,9 +2235,15 @@ impl ChannelSupervisor {
             }
         }
 
-        let tun_required_by_guard = match self.config.vpn_expectation.as_ref() {
-            Some(exp) if exp.configured => exp.require_tun == Some(true),
-            _ => true,
+        let tun_required_by_guard = if self.config.effective_vpn_source_mode()
+            == claude_watch_core::vpn_profile::VpnSourceMode::Managed
+        {
+            false
+        } else {
+            match self.config.vpn_expectation.as_ref() {
+                Some(exp) if exp.configured => exp.require_tun == Some(true),
+                _ => true,
+            }
         };
         let local_guard_ok = self.latest_local_guard["proxy"] == "ok"
             && (!tun_required_by_guard || self.latest_local_guard["tun"] == "ok");

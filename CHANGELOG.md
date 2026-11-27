@@ -2,6 +2,18 @@
 
 该摘要根据现有源码和版本发布记录整理。后续版本遵循语义化版本（SemVer）：缺陷修复递增 patch，功能/品牌升级递增 minor，破坏性架构变更递增 major。
 
+## 4.3.0 — 2026-11-26
+
+- **新增独立内置 VPN 通道模式（`watch-vpn-core`），与本机 VPN 100% 零冲突**：
+  - 集成并签名封装官方 arm64 `sing-box` 内核（`watch-vpn-core`），仅在私密回环端口运行，**不开第二个 `utun` 网卡、不修改系统代理、不改系统 DNS、不绑定固定硬件网卡**，完全不影响本机日常 TAG / Clash / Surge，Wi-Fi / 有线 / 热点切换由 macOS 自动选路。
+  - 配置通过内存匿名 `stdin` 管道投喂、无磁盘明文残留，生成规则显式剥离客户端 `direct` 兜底，与现有 Seatbelt 沙盒 + `ChannelSupervisor` / `ChannelEnforcer` 单一裁决链无缝合一，异常退出或断连保持毫秒级 Fail-Closed 阻断。
+- **「自带 VPN 服务」与「自配节点 / 订阅」一体化管理**：
+  - 纯 Rust 协议解析器原生支持 **VLESS Reality + XTLS-Vision + uTLS（Chrome 指纹）**、VMess、Trojan、Shadowsocks、Hysteria2、TUIC、SOCKS5/HTTP，并自动识别纠偏 Clash 节点元数据中 `type: vmess` 携带 `reality-opts` / `flow: xtls-rprx-vision` 的 VLESS Reality 配置。
+  - 新增 `0600` 私密凭据库 `vpn-vault.json`，集中隔离节点密钥与自带服务授权码，UI 展示、快照与日志全链路脱敏；支持「自带 VPN 服务」HTTPS 远程拉取（兼容 JSON 清单、Clash YAML 与 Base64 订阅）与单节点真实延迟/出口实测。
+- **「代理与连接」双模式工作台与 `v4.2.5/v4.2.6 → v4.3.0` 无缝更新兼容**：
+  - 在「代理与连接」顶部提供「复用本机 VPN / 独立内置 VPN」单点切换与节点管理工作台；「后台保护 → 01 · 公用底座」自动同步为只读摘要并支持直达跳转。
+  - `watch-vpn-core` 采用独立顶层 `ManagedVpnCoreHash` 校验字段并纳入 RSA 更新签名清单，确保已安装的 `v4.2.5 / v4.2.6` 可无缝应用内升级并自动恢复可执行权限。
+
 ## 4.2.6 — 2026-11-26
 
 - **DNS / WebRTC 泄漏检测改为 Rust 进程内原生探针（秒级出结果）**：

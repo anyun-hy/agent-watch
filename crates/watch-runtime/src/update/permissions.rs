@@ -20,7 +20,7 @@ fn executable(name: &str) -> bool {
     let component = name.strip_prefix("runtime/")
         .or_else(|| name.strip_prefix("app/Agent Watch.app/Contents/Resources/"));
     matches!(component, Some("watch-engine" | "watch-native-observer" | "watch-process-control"
-        | "watch-sandbox-launcher" | "watch-gateway-broker" | "ControlledEntry" | "watch-admin.sh" | "watch-native-collector.zsh"))
+        | "watch-sandbox-launcher" | "watch-gateway-broker" | "watch-vpn-core" | "ControlledEntry" | "watch-admin.sh" | "watch-native-collector.zsh"))
 }
 
 /// Only traverse normal directories inside the extraction destination. An
@@ -93,9 +93,11 @@ mod tests {
     #[test]
     fn execution_roles_are_exact_paths_not_names_or_extensions() {
         for name in ["runtime/watch-engine", "runtime/watch-sandbox-launcher", "runtime/watch-gateway-broker",
+            "runtime/watch-vpn-core",
             "app/Agent Watch.app/Contents/MacOS/AgentWatch",
             "app/Agent Watch.app/Contents/Resources/watch-sandbox-launcher",
             "app/Agent Watch.app/Contents/Resources/watch-gateway-broker",
+            "app/Agent Watch.app/Contents/Resources/watch-vpn-core",
             "app/Agent Watch.app/Contents/Resources/watch-admin.sh"] {
             assert!(executable(name), "{name}");
         }

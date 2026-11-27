@@ -599,7 +599,7 @@ impl<R: ReadRunner, T: Transport, M: Mutator> Macos<R, T, M> {
                 }
             }
         }
-        let selected = if candidates.len() == 1 {
+        let mut selected = if candidates.len() == 1 {
             candidates.keys().next().copied().unwrap_or("")
         } else {
             ""
@@ -620,7 +620,7 @@ impl<R: ReadRunner, T: Transport, M: Mutator> Macos<R, T, M> {
         let route = self.read(ReadCommand::Route(std::net::IpAddr::from([198, 18, 0, 1])));
         let interfaces = self.read(ReadCommand::Interfaces);
         let interface = route.as_deref().and_then(route_interface).unwrap_or("");
-        let tun = match (&route, &interfaces) {
+        let mut tun = match (&route, &interfaces) {
             (Some(_), Some(interfaces))
                 if !selected.is_empty() && fake_ip_interface(interfaces, interface) =>
             {
@@ -629,7 +629,31 @@ impl<R: ReadRunner, T: Transport, M: Mutator> Macos<R, T, M> {
             (Some(_), Some(_)) => "fail",
             _ => "unknown",
         };
-        if tun == "unknown" {
+        let mut managed_endpoint: Option<String> = None;
+        let mut managed_runtime_state: Option<crate::managed_vpn::ManagedVpnRuntimeState> = None;
+        if c.effective_vpn_source_mode() == claude_watch_core::vpn_profile::VpnSourceMode::Managed {
+            selected = crate::managed_vpn::MANAGED_VPN_SOURCE;
+            tun = "not_required";
+            let st = crate::managed_vpn::read_runtime_state(&self.storage);
+            let live_ep = crate::managed_vpn::active_upstream_endpoint(&self.storage);
+            if let Some(ep) = live_ep {
+                proxy = "ok";
+                let node_name = st
+                    .node_name
+                    .as_deref()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("独立内置节点");
+                detail = format!("独立内置 VPN 运行中（{node_name}，不影响本机 VPN）");
+                managed_endpoint = Some(ep);
+            } else {
+                proxy = "fail";
+                detail = st
+                    .error_message
+                    .clone()
+                    .unwrap_or_else(|| "独立内置 VPN 尚未启动或节点未选定".into());
+            }
+            managed_runtime_state = Some(st);
+        } else if tun == "unknown" {
             unavailable.push("tun_sampling");
         }
         let mut tag = json!({});
@@ -686,13 +710,24 @@ impl<R: ReadRunner, T: Transport, M: Mutator> Macos<R, T, M> {
             identity["network_config"] = tag["api"]["network_config"].clone();
             identity["runtime_config_revision"] = tag["runtime_config_revision"].clone();
             if identity["network_config"].is_null() { unavailable.push("network_config_sampling"); }
+        } else if selected == crate::managed_vpn::MANAGED_VPN_SOURCE {
+            if let Some(ref st) = managed_runtime_state {
+                identity["managed_node_id"] = json!(st.node_id);
+                identity["managed_node_name"] = json!(st.node_name);
+                identity["managed_pid"] = json!(st.pid);
+            }
         }
         let context = crate::config_store::policy_digest(&identity)?;
         let backend = self.backend_facts_using(Some(&table));
         let guard = self.guard_heartbeat(c, backend.guard_healthy);
         let mut out = json!({"proxy":proxy,"proxy_detail":detail,"tun":tun,"mode":selected,"candidates":candidates.keys().collect::<Vec<_>>(),"context":context,"context_id":context,"timezone":env.get("timezone"),"locale":env.get("locale"),"language":env.get("language"),"app_language":env.get("app_language"),"date_format":env.get("date_format"),"ipv6":env.get("ipv6"),"ipv6_method":env.get("ipv6_method"),"network":env.get("network"),"network_identity":identity,"service":env.pointer("/network/service"),"interface":interface,"processes":processes,"tag":tag,"observation_unavailable":unavailable,"backend_healthy":backend.sampling_healthy,"backend_native":backend.sampling_native,"backend_detail":backend.sampling_detail,"guard_backend_healthy":backend.guard_healthy,"guard_backend_native":backend.guard_native,"guard_backend_detail":backend.guard_detail,"guard":guard,"guard_state":if guard{"ok"}else if !c.guard_enabled{"disabled"}else{"unknown"},"guard_detail":if guard{"保护心跳已确认"}else if !c.guard_enabled{"保护策略已禁用"}else{"保护心跳或后台身份未能确认"}});
-        out["evidence_network_bound"] = json!(selected == "tag" && !tag["api"]["network_config"].is_null());
-        out["verified_proxy_url"] = if selected == "tag"
+        out["evidence_network_bound"] = json!(
+            (selected == "tag" && !tag["api"]["network_config"].is_null())
+                || (selected == crate::managed_vpn::MANAGED_VPN_SOURCE && managed_endpoint.is_some())
+        );
+        out["verified_proxy_url"] = if let Some(ref ep) = managed_endpoint {
+            json!(ep)
+        } else if selected == "tag"
             && proxy == "ok"
             && tag["entry"]["state"] == "verified"
             && (tag["api"]["covers_7890"] == true || tag["api"]["covers_7897"] == true)
@@ -711,7 +746,13 @@ impl<R: ReadRunner, T: Transport, M: Mutator> Macos<R, T, M> {
                     .map(str::to_owned)
                     .collect::<Vec<_>>()
             });
-        out["rules"] = if selected == "tag" && tag["api"]["state"] == "available" {
+        out["rules"] = if selected == crate::managed_vpn::MANAGED_VPN_SOURCE {
+            if proxy == "ok" {
+                json!({"state":"ok","detail":"独立内置 VPN 单节点强制代理出站（客户端流量零直连分流）"})
+            } else {
+                json!({"state":"unknown","detail":"独立内置 VPN 尚未运行，未能确认出站通道"})
+            }
+        } else if selected == "tag" && tag["api"]["state"] == "available" {
             crate::rules::inspect_tag_rules(entries.as_deref(), &[], &tag["api"])
         } else {
             json!({"state":"unknown","detail":"未取得当前代理的实际规则证据"})
@@ -729,7 +770,14 @@ impl<R: ReadRunner, T: Transport, M: Mutator> Macos<R, T, M> {
                 out["guard_listener_observed_at"] = json!(listener_at);
                 environment_at = environment_at.min(listener_at);
             }
-            if selected != "tag" && proxy == "ok" {
+            if selected == crate::managed_vpn::MANAGED_VPN_SOURCE && proxy == "ok" {
+                if let (Some(ref ep), Some(ref st)) = (&managed_endpoint, &managed_runtime_state) {
+                    let listener_at = native::now();
+                    out["guard_listener"] = json!({"endpoint": ep, "owner": st.pid});
+                    out["guard_listener_observed_at"] = json!(listener_at);
+                    environment_at = environment_at.min(listener_at);
+                }
+            } else if selected != "tag" && proxy == "ok" {
                 let endpoint = if c.proxy_url.trim().is_empty() { crate::network_client::default_proxy_url() } else { &c.proxy_url };
                 let url = url::Url::parse(endpoint).ok()
                     .filter(|_| claude_watch_core::config::valid_loopback_proxy(endpoint))
@@ -862,7 +910,7 @@ impl<R: ReadRunner, T: Transport, M: Mutator> Macos<R, T, M> {
     }
     fn online_facts(
         &self,
-        _: &Config,
+        config: &Config,
         local: &Value,
         include_claude: bool,
         include_chatgpt: bool,
@@ -872,7 +920,40 @@ impl<R: ReadRunner, T: Transport, M: Mutator> Macos<R, T, M> {
             .get("context_id")
             .and_then(Value::as_str)
             .unwrap_or("");
-        let network = &self.network;
+        let managed_mode = config.effective_vpn_source_mode()
+            == claude_watch_core::vpn_profile::VpnSourceMode::Managed
+            || local.get("mode").and_then(Value::as_str)
+                == Some(crate::managed_vpn::MANAGED_VPN_SOURCE);
+        let managed_proxy = if managed_mode {
+            local
+                .get("verified_proxy_url")
+                .and_then(Value::as_str)
+                .filter(|s| claude_watch_core::config::valid_loopback_proxy(s))
+                .map(str::to_owned)
+        } else {
+            None
+        };
+        if managed_mode && managed_proxy.is_none() {
+            // Fail closed: never probe via host direct routing when Managed VPN is selected
+            // but `watch-vpn-core` is not yet running!
+            return Ok(json!({
+                "trace": {"ip": Value::Null, "loc": Value::Null, "observed_at": 0.0},
+                "geo": {"ip": "", "country": Value::Null, "timezone": Value::Null},
+                "lookup": Value::Null,
+                "asn": {},
+                "services": {},
+                "openai_services": {},
+                "dns": {"state": "unknown", "detail": "独立内置 VPN 尚未就绪"},
+                "stun": {"complete": false, "observations": []},
+                "query_errors": {"egress": {"source": "managed-vpn", "message": "独立内置 VPN 尚未启动，拒绝直连探测"}},
+            }));
+        }
+        let bound_client = match managed_proxy {
+            Some(ref ep) => self.network.with_proxy(Some(ep.clone())),
+            None => self.network.clone(),
+        };
+        let network = &bound_client;
+        let managed_ep_ref = managed_proxy.as_deref();
         let storage = &self.storage;
         let (egress, services, openai_services, fresh_stun, trace, geo, geo_sampled_at, lookup, lookup_receipt, lookup_bound, asn, organization, mut query_errors, asn_value) =
             std::thread::scope(|scope| {
@@ -898,7 +979,7 @@ impl<R: ReadRunner, T: Transport, M: Mutator> Macos<R, T, M> {
                         probe
                     })
                 });
-                let egress = network.fast_egress();
+                let egress = network.fast_egress_via(managed_ep_ref);
                 let raw_trace = egress.data.clone().unwrap_or(Value::Null);
                 let trace = json!({"ip":raw_trace["ip"],"loc":raw_trace["country"],"observed_at":raw_trace["observed_at"]});
                 let ip = trace.get("ip").and_then(Value::as_str).unwrap_or("");
@@ -907,8 +988,7 @@ impl<R: ReadRunner, T: Transport, M: Mutator> Macos<R, T, M> {
                     .and_then(Value::as_f64)
                     .unwrap_or(0.);
                 let lookup_receipt = (!ip.is_empty()).then(|| {
-                    self.network
-                        .metadata_for_context("lookup", context, ip, measured_at)
+                    network.metadata_for_context("lookup", context, ip, measured_at)
                 });
                 let lookup = lookup_receipt
                     .as_ref()
@@ -1005,8 +1085,7 @@ impl<R: ReadRunner, T: Transport, M: Mutator> Macos<R, T, M> {
                     && !conflict
                     && (geo["country"].is_null() || (geo["timezone"].is_null() && !single_zone_country))
                 {
-                    let fallback = self
-                        .network
+                    let fallback = network
                         .metadata_for_context("geoip", context, ip, measured_at);
                     if let Some(data) = fallback.data.as_ref().filter(|data| data.is_object()) {
                         let returned_ip = data
@@ -1059,7 +1138,7 @@ impl<R: ReadRunner, T: Transport, M: Mutator> Macos<R, T, M> {
                 if let Some(receipt) = lookup_receipt.as_ref().filter(|_| asn.is_some()) {
                     asn_value["queried_at"] = json!(receipt.finished_at);
                     let number = asn.unwrap();
-                    let registration = self.network.ripe_asn(number);
+                    let registration = network.ripe_asn(number);
                     if let Some(country) =
                         crate::network_client::ripe_registered_country(&registration, number)
                     {

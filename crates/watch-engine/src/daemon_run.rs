@@ -518,13 +518,25 @@ fn spawn_vpn_observation_worker(
             if let Some(stream) = &listener_stream { stream.subscribe_failures(&notice); }
             let mut live_reader = None;
             let config_store = ConfigStore { storage: storage.clone() };
+            if custom_reader.is_none() {
+                let _ = claude_watch_runtime::managed_vpn::sweep_orphan_managed_vpn(&storage);
+            }
             watcher.watch_file(storage.paths.config());
-            let mut expectation = config_store.resolve_runtime_config_state(packaged_backend)
-                .config.vpn_expectation.unwrap_or_else(VpnExpectation::unconfigured);
+            let initial_cfg = config_store.resolve_runtime_config_state(packaged_backend).config;
+            let mut active_vpn_mode = initial_cfg.effective_vpn_source_mode();
+            let mut active_managed_cfg = initial_cfg.managed_vpn.clone().unwrap_or_default();
+            let mut expectation = initial_cfg.vpn_expectation.unwrap_or_else(VpnExpectation::unconfigured);
+            let mut managed_proc: Option<claude_watch_runtime::managed_vpn::ManagedVpnProcess> = None;
+            let mut managed_epoch_gen: u64 = 0;
+            let mut managed_sample_seq: u64 = 0;
+            let mut managed_last_obs_at: Option<f64> = None;
+            let mut managed_last_err_code: Option<String> = None;
+            let managed_boot_id = format!("managed-{}", uuid::Uuid::new_v4().simple());
             let watch_configs = |watcher: &mut NetworkEventWatcher, expectation: &VpnExpectation| {
                 let mut files = claude_watch_runtime::vpn_observer::vpn_controller_config_paths(
                     &storage.paths.home, &expectation.proxy_mode);
                 files.push(storage.paths.config());
+                files.push(storage.paths.watch().join("vpn-vault.json"));
                 files.push(storage.paths.home.join("Library/Application Support/com.tag.lab.v2/dns_config.yaml"));
                 watcher.set_watched_files(files);
             };
@@ -582,7 +594,10 @@ fn spawn_vpn_observation_worker(
                 } else {
                     Some(Duration::from_secs_f64(DEFAULT_VPN_OBSERVATION_TTL_SECONDS))
                 };
-                if !first && awaiting_revision.is_none() && custom_reader.is_none()
+                if !first && active_vpn_mode == claude_watch_core::vpn_profile::VpnSourceMode::Managed && custom_reader.is_none() {
+                    let managed_wait = Duration::from_secs(10);
+                    timeout = Some(timeout.map_or(managed_wait, |budget| budget.min(managed_wait)));
+                } else if !first && awaiting_revision.is_none() && custom_reader.is_none()
                     && expectation.configured
                     && active_guard.has_active_managed()
                     && observer.observed_listener_pid().is_some()
@@ -661,8 +676,12 @@ fn spawn_vpn_observation_worker(
                         NetworkEventKind::WatchedFileChanged(path) if path == storage.paths.config() => {
                             let resolved_cfg = config_store.resolve_runtime_config_state(packaged_backend);
                             let updated = resolved_cfg.config.vpn_expectation.clone().unwrap_or_else(VpnExpectation::unconfigured);
-                            if updated != expectation {
+                            let next_mode = resolved_cfg.config.effective_vpn_source_mode();
+                            let next_managed = resolved_cfg.config.managed_vpn.clone().unwrap_or_default();
+                            if updated != expectation || next_mode != active_vpn_mode || next_managed != active_managed_cfg {
                                 expectation = updated;
+                                active_vpn_mode = next_mode;
+                                active_managed_cfg = next_managed;
                                 watch_configs(&mut watcher, &expectation);
                                 invalidation = Some("vpn_expectation_changed".into());
                             }
@@ -696,6 +715,218 @@ fn spawn_vpn_observation_worker(
                     }
                 }
                 if wake { invalidation = Some("system_wake".into()); }
+                // Managed isolated VPN mode (`watch-vpn-core` non-TUN loopback tunnel):
+                // supervise our own child process directly and publish authoritative
+                // `VpnObservation` into the exact same `ChannelSupervisor` pipeline.
+                if custom_reader.is_none()
+                    && active_vpn_mode == claude_watch_core::vpn_profile::VpnSourceMode::Managed
+                {
+                    use claude_watch_core::vpn::VpnEpoch;
+                    use claude_watch_runtime::managed_vpn::{
+                        self, ManagedVpnProcess, ManagedVpnRuntimeState,
+                    };
+                    use claude_watch_runtime::vpn_vault::VpnVaultStore;
+
+                    let now = native::now();
+                    if wake {
+                        let _ = event_tx.send(SupervisionEvent::LeaseExpired {
+                            observed_at: now,
+                            woke_from_sleep: true,
+                        });
+                    }
+                    let selected_id = active_managed_cfg.selected_node_id.clone();
+                    let vault = VpnVaultStore::new(storage.clone());
+                    let resolved_node = selected_id
+                        .as_deref()
+                        .and_then(|id| vault.node_by_id(id).ok().flatten());
+                    let core_res = managed_vpn::locate_verified_core(&storage);
+
+                    let fail_managed = |code: &str,
+                                        msg: &str,
+                                        state_label: &str,
+                                        managed_proc: &mut Option<ManagedVpnProcess>,
+                                        watcher: &mut NetworkEventWatcher,
+                                        managed_epoch_gen: &mut u64,
+                                        managed_sample_seq: &mut u64,
+                                        managed_last_obs_at: &mut Option<f64>,
+                                        managed_last_err_code: &mut Option<String>,
+                                        retry_after: &mut Option<Instant>| {
+                        if managed_proc.take().is_some() {
+                            *managed_epoch_gen = managed_epoch_gen.saturating_add(1);
+                        }
+                        watcher.set_watched_pids(&[]);
+                        managed_vpn::write_runtime_state(
+                            &storage,
+                            &ManagedVpnRuntimeState {
+                                schema: 1,
+                                mode: "managed".into(),
+                                state: state_label.into(),
+                                updated_at: now,
+                                error_code: Some(code.into()),
+                                error_message: Some(msg.into()),
+                                ..ManagedVpnRuntimeState::default()
+                            },
+                        );
+                        if managed_last_err_code.as_deref() != Some(code)
+                            || managed_last_obs_at.is_none()
+                        {
+                            *managed_epoch_gen = managed_epoch_gen.saturating_add(1).max(1);
+                            *managed_sample_seq = managed_sample_seq.saturating_add(1);
+                            let obs = managed_vpn::build_managed_error_observation(
+                                code,
+                                now,
+                                *managed_sample_seq,
+                                VpnEpoch::new(managed_boot_id.clone(), *managed_epoch_gen),
+                            );
+                            send(obs);
+                            *managed_last_obs_at = Some(now);
+                            *managed_last_err_code = Some(code.into());
+                        }
+                        *retry_after = Some(Instant::now() + Duration::from_secs(5));
+                    };
+
+                    let Some(node) = resolved_node else {
+                        let code = if selected_id.is_some() {
+                            "managed_vpn_node_missing"
+                        } else {
+                            "managed_vpn_node_unselected"
+                        };
+                        let msg = if selected_id.is_some() {
+                            "已选定的内置 VPN 节点不存在，请重新选择或导入"
+                        } else {
+                            "尚未选择内置独立 VPN 节点，请在「代理与连接」中导入并选定节点"
+                        };
+                        fail_managed(
+                            code,
+                            msg,
+                            "inactive",
+                            &mut managed_proc,
+                            &mut watcher,
+                            &mut managed_epoch_gen,
+                            &mut managed_sample_seq,
+                            &mut managed_last_obs_at,
+                            &mut managed_last_err_code,
+                            &mut retry_after,
+                        );
+                        continue;
+                    };
+
+                    let core = match core_res {
+                        Ok(c) => c,
+                        Err(err) => {
+                            fail_managed(
+                                &err.code,
+                                &err.message,
+                                "core_missing",
+                                &mut managed_proc,
+                                &mut watcher,
+                                &mut managed_epoch_gen,
+                                &mut managed_sample_seq,
+                                &mut managed_last_obs_at,
+                                &mut managed_last_err_code,
+                                &mut retry_after,
+                            );
+                            continue;
+                        }
+                    };
+
+                    let desired_rev = node.fingerprint_digest();
+                    let still_healthy = !wake
+                        && managed_proc.as_mut().is_some_and(|p| {
+                            p.node_id() == node.id
+                                && p.node_revision() == desired_rev
+                                && p.is_healthy()
+                        });
+
+                    if still_healthy {
+                        let renew_due = managed_last_obs_at
+                            .is_none_or(|at| now - at >= 35.0)
+                            || requested_refresh
+                            || invalidation.is_some();
+                        if renew_due {
+                            if let Some(ref p) = managed_proc {
+                                managed_sample_seq = managed_sample_seq.saturating_add(1);
+                                managed_vpn::write_runtime_state(&storage, &p.to_runtime_state(now));
+                                let obs = p.to_observation(
+                                    now,
+                                    managed_sample_seq,
+                                    VpnEpoch::new(managed_boot_id.clone(), managed_epoch_gen.max(1)),
+                                );
+                                send(obs);
+                                managed_last_obs_at = Some(now);
+                                managed_last_err_code = None;
+                            }
+                        }
+                        retry_after = None;
+                        continue;
+                    }
+
+                    // Need a fresh managed core process (first start, node switch, crash, or wake).
+                    drop(managed_proc.take());
+                    watcher.set_watched_pids(&[]);
+                    managed_epoch_gen = managed_epoch_gen.saturating_add(1).max(1);
+                    managed_vpn::write_runtime_state(
+                        &storage,
+                        &ManagedVpnRuntimeState {
+                            schema: 1,
+                            mode: "managed".into(),
+                            state: "starting".into(),
+                            node_id: Some(node.id.clone()),
+                            node_name: Some(node.name.clone()),
+                            protocol_label: Some(node.protocol_label()),
+                            updated_at: now,
+                            ..ManagedVpnRuntimeState::default()
+                        },
+                    );
+                    match ManagedVpnProcess::start(&core, &node) {
+                        Ok(proc) => {
+                            let pid = proc.pid();
+                            watcher.set_watched_pids(&[pid]);
+                            managed_sample_seq = managed_sample_seq.saturating_add(1);
+                            managed_vpn::write_runtime_state(&storage, &proc.to_runtime_state(now));
+                            let obs = proc.to_observation(
+                                now,
+                                managed_sample_seq,
+                                VpnEpoch::new(managed_boot_id.clone(), managed_epoch_gen),
+                            );
+                            send(obs);
+                            managed_proc = Some(proc);
+                            managed_last_obs_at = Some(now);
+                            managed_last_err_code = None;
+                            retry_after = None;
+                        }
+                        Err(err) => {
+                            fail_managed(
+                                &err.code,
+                                &err.message,
+                                "error",
+                                &mut managed_proc,
+                                &mut watcher,
+                                &mut managed_epoch_gen,
+                                &mut managed_sample_seq,
+                                &mut managed_last_obs_at,
+                                &mut managed_last_err_code,
+                                &mut retry_after,
+                            );
+                        }
+                    }
+                    continue;
+                } else if managed_proc.is_some() {
+                    // User switched back to External mode: immediately terminate our managed core.
+                    drop(managed_proc.take());
+                    managed_last_obs_at = None;
+                    managed_last_err_code = None;
+                    claude_watch_runtime::managed_vpn::write_runtime_state(
+                        &storage,
+                        &claude_watch_runtime::managed_vpn::ManagedVpnRuntimeState {
+                            schema: 1,
+                            mode: "external".into(),
+                            state: "inactive".into(),
+                            updated_at: now,
+                            ..claude_watch_runtime::managed_vpn::ManagedVpnRuntimeState::default()
+                        },
+                    );
+                }
                 // Fast-path debounce for spurious macOS `network_change` broadcasts (e.g. mDNS /
                 // secondary interface DHCP renewal): verify default route + kernel listener PID +
                 // local VPN controller state in ~30-50ms BEFORE revoking the active channel epoch.

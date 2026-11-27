@@ -30,3 +30,4 @@ pub mod tag_flow;
 pub mod tag_policy;
 pub mod time_parse;
 pub mod vpn;
+pub mod vpn_profile;

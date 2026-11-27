@@ -376,6 +376,16 @@ impl<T: Transport> NetworkClient<T> {
         self.storage = Some(storage);
         self
     }
+
+    pub fn with_proxy(&self, proxy: Option<String>) -> Self {
+        let mut next = self.clone();
+        if let Some(p) = proxy.filter(|v| valid_loopback_proxy(v)) {
+            next.proxy = Some(p);
+        } else {
+            next.proxy = None;
+        }
+        next
+    }
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout.clamp(Duration::from_millis(100), Duration::from_secs(30));
         self

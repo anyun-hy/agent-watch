@@ -97,6 +97,12 @@ jobs:
           cargo test -p claude-watch-core
           cargo test -p claude-watch-runtime --test update_contracts --test update_permissions_regressions
 
+      - name: Fetch & verify sing-box arm64 core (watch-vpn-core)
+        shell: bash
+        run: |
+          set -euo pipefail
+          /bin/bash tools/fetch-vpn-core.sh --output "${RUNNER_TEMP}/watch-vpn-core"
+
       - name: Build .app and DMG (Seatbelt arm64)
         shell: bash
         env:
@@ -104,6 +110,7 @@ jobs:
           BUILD_NUMBER: ${{ steps.meta.outputs.build_number }}
           CW_NETWORK_BACKEND: seatbelt
           CW_BUILD_ARCH: arm64
+          CW_VPN_CORE_BIN: ${{ runner.temp }}/watch-vpn-core
         run: |
           set -euo pipefail
           /bin/bash monitor/package-dmg.sh

@@ -413,6 +413,16 @@ fn install_mode<E: FixedCommandExecutor>(
                 },
             )?;
         }
+        if let Some(expected_vpn_hash) = manifest["ManagedVpnCoreHash"]
+            .as_str()
+            .filter(|h| !h.is_empty())
+        {
+            let vpn_bytes = source_bytes(&resources.join("watch-vpn-core"))?;
+            if expected_vpn_hash != sha256(&vpn_bytes).as_str() {
+                return Err(err("runtime_hash_mismatch", "内置独立 VPN 内核哈希不匹配"));
+            }
+            store.atomic_bytes(&stage.join("watch-vpn-core"), &vpn_bytes, 0o700)?;
+        }
         store.atomic_bytes(
             &stage.join("BuildInfo.plist"),
             &source_bytes(&resources.join("BuildInfo.plist"))?,

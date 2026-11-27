@@ -198,7 +198,7 @@ impl VpnExpectation {
         if !self.proxy_mode.is_empty()
             && !matches!(
                 self.proxy_mode.as_str(),
-                "tag" | "clash-verge" | "shadowrocket" | "sing-box" | "clashx" | "surge" | "auto"
+                "tag" | "clash-verge" | "shadowrocket" | "sing-box" | "clashx" | "surge" | "auto" | "managed-vpn"
             )
         {
             return Err(invalid_vpn("VPN 预期代理客户端类型无效"));
