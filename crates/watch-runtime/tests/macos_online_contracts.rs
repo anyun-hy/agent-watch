@@ -69,35 +69,31 @@ impl Transport for T {
         );
         let (status, body, headers) = if request.url.contains("www.cloudflare.com") {
             (200, "ip=1.1.1.1\nloc=JP\n", HashMap::new())
-        } else if request.url.contains("/api/ip/lookup/") {
-            // Real payload shape: lowercase countryCode, no `timezone`, and no
-            // timezone inside `geo_sources`.
+        } else if request.url.starts_with("https://api.ipapi.is/?q=") {
             match self.lookup {
                 Lookup::CamelCase | Lookup::RipePrefixed => (
                     200,
-                    r#"{"ip":"1.1.1.1","country":"Japan","countryCode":"jp","asn":13335,"asOrganization":"Cloudflare, Inc.","geo_sources":[{"src":"g1","country":"Japan","country_code":"jp"}]}"#,
+                    r#"{"ip":"1.1.1.1","location":{"country":"Japan","country_code":"jp"},"asn":{"asn":13335,"org":"Cloudflare, Inc.","country":"us"}}"#,
                     HashMap::new(),
                 ),
                 Lookup::CountryConflict => (
                     200,
-                    r#"{"ip":"1.1.1.1","countryCode":"CN","timezone":"Asia/Shanghai","asn":4134,"asOrganization":"China Telecom"}"#,
+                    r#"{"ip":"1.1.1.1","location":{"country_code":"CN","timezone":"Asia/Shanghai"},"asn":{"asn":4134,"org":"China Telecom"}}"#,
                     HashMap::new(),
                 ),
                 Lookup::Failed => (503, "{}", HashMap::new()),
                 Lookup::WrongIP => (
                     200,
-                    r#"{"ip":"8.8.8.8","countryCode":"JP"}"#,
+                    r#"{"ip":"8.8.8.8","location":{"country_code":"JP"}}"#,
                     HashMap::new(),
                 ),
-                Lookup::MissingIP => (200, r#"{"countryCode":"JP"}"#, HashMap::new()),
+                Lookup::MissingIP => (200, r#"{"location":{"country_code":"JP"}}"#, HashMap::new()),
             }
-        } else if request.url.contains("/api/geoip/") {
-            // Real payload shape: answers for the IP in the path and carries no
-            // `ip` field and no timezone.
+        } else if request.url.starts_with("https://ipinfo.io/") {
             self.geo_calls.fetch_add(1, Ordering::SeqCst);
             (
                 200,
-                r#"{"country":"Japan","region":"Tokyo","city":"Tokyo","isp":"au one net","country_code":"jp"}"#,
+                r#"{"country":"JP","region":"Tokyo","city":"Tokyo","org":"AS2516 KDDI CORPORATION"}"#,
                 HashMap::new(),
             )
         } else if request.url.contains("stat.ripe.net") {
@@ -177,7 +173,7 @@ fn online_uses_bound_camel_case_lookup_for_geo_asn_and_registered_country() {
     // The real lookup carries no timezone; a single-zone country is resolved
     // from the IANA catalog instead of a fallback round trip.
     assert!(out["geo"]["timezone"].is_null());
-    assert_eq!(out["geo"]["country_source"], "Net.Coffee lookup");
+    assert_eq!(out["geo"]["country_source"], "ipapi.is lookup");
     assert_eq!(out["asn"]["number"], 13335);
     assert_eq!(out["asn"]["organization"], "Cloudflare, Inc.");
     assert_eq!(out["asn"]["registered_country"], "US");
@@ -187,13 +183,13 @@ fn online_uses_bound_camel_case_lookup_for_geo_asn_and_registered_country() {
     );
     assert!(out["query_errors"].get("geo").is_none());
     assert_eq!(
-        out["netcoffee_lookup"]["sourceURL"],
-        "https://ip.net.coffee/api/ip/lookup/1.1.1.1"
+        out["ip_intel"]["sourceURL"],
+        "https://api.ipapi.is/?q=1.1.1.1"
     );
-    assert!(out["netcoffee_lookup"].get("source_url").is_none());
-    assert!(out["netcoffee_lookup"]["queriedAt"].is_number());
-    assert!(out["netcoffee_lookup"]["finishedAt"].is_number());
-    assert_eq!(out["netcoffee_lookup"]["httpStatus"], 200);
+    assert!(out["ip_intel"].get("source_url").is_none());
+    assert!(out["ip_intel"]["queriedAt"].is_number());
+    assert!(out["ip_intel"]["finishedAt"].is_number());
+    assert_eq!(out["ip_intel"]["httpStatus"], 200);
     assert_eq!(
         transport.geo_calls.load(Ordering::SeqCst),
         0,
@@ -253,12 +249,12 @@ fn lookup_country_conflict_remains_visible_and_never_uses_fallback() {
 fn failed_lookup_uses_bound_geo_fallback_without_inventing_an_asn() {
     let (out, transport) = online(Lookup::Failed);
     assert_eq!(out["geo"]["country"], "JP");
-    assert_eq!(out["geo"]["country_source"], "Net.Coffee geoip fallback");
+    assert_eq!(out["geo"]["country_source"], "ipinfo.io geoip fallback");
     assert!(
         out["query_errors"].get("geo").is_none(),
         "the geoip endpoint returns no `ip`, so provenance comes from the query"
     );
-    assert!(out["query_errors"].get("netcoffee").is_some());
+    assert!(out["query_errors"].get("ip_intel").is_some());
     assert!(out["asn"]["number"].is_null());
     assert_eq!(transport.geo_calls.load(Ordering::SeqCst), 1);
 }
@@ -267,7 +263,7 @@ fn failed_lookup_uses_bound_geo_fallback_without_inventing_an_asn() {
 fn missing_fields_are_query_failures_while_real_ip_conflicts_block_fallback() {
     let (missing, transport) = online(Lookup::MissingIP);
     assert!(missing["query_errors"]["egress_consistency"].is_null());
-    assert!(missing["query_errors"].get("netcoffee").is_some());
+    assert!(missing["query_errors"].get("ip_intel").is_some());
     assert_eq!(missing["geo"]["country"], "JP");
     assert!(missing["query_errors"].get("geo").is_none());
     assert_eq!(transport.geo_calls.load(Ordering::SeqCst), 1);

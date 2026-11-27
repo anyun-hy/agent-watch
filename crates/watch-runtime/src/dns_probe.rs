@@ -407,7 +407,11 @@ mod tests {
     impl Transport for Http {
         fn get(&self, request: &HttpRequest) -> std::result::Result<Response, TransportError> {
             assert_eq!(request.proxy.as_deref(), Some("http://127.0.0.1:7890"));
-            if let Some(address) = request.url.strip_prefix("https://ip.net.coffee/api/geoip/") {
+            if let Some(address) = request
+                .url
+                .strip_prefix("https://ipinfo.io/")
+                .and_then(|s| s.strip_suffix("/json"))
+            {
                 let body = self
                     .geo
                     .clone()

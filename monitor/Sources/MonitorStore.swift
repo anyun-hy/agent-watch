@@ -9,7 +9,7 @@ final class MonitorStore: ObservableObject {
     let historyUpdated = PassthroughSubject<Void, Never>()
     let leakChecks: LeakCheckStore
     let aiChecks: AIProbeStore
-    let netCoffee = NetCoffeeStore()
+    let ipIntel: IpIntelStore
     let processControl = AIProcessControl()
     let managedEntryControl: ManagedEntryControl
     let managedVpn: ManagedVpnStore
@@ -32,6 +32,7 @@ final class MonitorStore: ObservableObject {
     /// Native desktop presence is a display fact, not protection evidence.
     @Published private(set) var desktopPresence: WorkspaceDesktopPresence?
     @Published var page: Page = .environment
+    @Published var panoramaFocus: PanoramaFocusSection = .all
     @Published var now = Date()
     @Published var networkSelection = NetworkGraphSelection()
     @Published private(set) var graphContinuity = GraphContinuityStore()
@@ -67,6 +68,7 @@ final class MonitorStore: ObservableObject {
         self.switcher = switcher ?? SwitcherStore()
         self.managedEntryControl = ManagedEntryControl(isFixture: self.switcher.isFixture)
         self.managedVpn = ManagedVpnStore(isFixture: self.switcher.isFixture)
+        self.ipIntel = IpIntelStore(isFixture: self.switcher.isFixture)
         switcherReady = self.switcher.$busy.combineLatest(self.switcher.$readingEnvironment)
             .filter { busy, _ in !busy }.receive(on: DispatchQueue.main)
             .sink { [weak self] _, readingEnvironment in
@@ -109,7 +111,7 @@ final class MonitorStore: ObservableObject {
             self?.scheduleEvidenceExpiry()
             let ip = result.exitIP
             guard !ip.isEmpty else { return }
-            self?.netCoffee.fetchAI(ip)
+            self?.ipIntel.noteEnvironmentExit(ip)
         }
         self.switcher.onCurrentEnvironment = { [weak self] result in
             self?.leakChecks.acceptEnvironment(result)
@@ -576,18 +578,11 @@ final class MonitorStore: ObservableObject {
         refreshEnvironmentIfNeeded()
     }
     private func refreshEnvironmentQuality(_ result: CurrentEnvironmentReceipt) {
-        if let receipt = result.netcoffee_lookup { netCoffee.ingest(receipt) }
         if let raw = result.rows.first(where: { $0.id == "egress" })?.current,
            let candidate = raw.components(separatedBy: " / ").first,
            let ip = LeakIPAddress(candidate.trimmingCharacters(in: .whitespacesAndNewlines)),
            ip.isPublic {
-            if netCoffee.selectedIP.isEmpty {
-                netCoffee.selectedForPage(ip.canonical)
-                if netCoffee.query.isEmpty { netCoffee.query = ip.canonical }
-            }
-            if !switcher.isFixture && netCoffee.report(ip.canonical) == nil {
-                netCoffee.fetch(ip.canonical)
-            }
+            ipIntel.noteEnvironmentExit(ip.canonical)
         }
     }
     func showConnections(_ product: MonitoredProduct) {

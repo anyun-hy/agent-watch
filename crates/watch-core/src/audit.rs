@@ -725,7 +725,7 @@ pub fn evaluate_target(
         "预检通过，仅限当前策略和采样范围".into()
     };
     let mut result = json!({"schema":1,"observed_at":now,"expires_at":now+30.0,"context":local.get("context").unwrap_or(&json!("")),"policy":policy,
-        "rows":rows,"ready":blocked.is_empty() && config.enabled,"blocked":blocked,"message":message,"netcoffee_lookup":online["netcoffee_lookup"],
+        "rows":rows,"ready":blocked.is_empty() && config.enabled,"blocked":blocked,"message":message,"ip_intel":online.get("ip_intel").cloned().unwrap_or(Value::Null),"netcoffee_lookup":online["netcoffee_lookup"],
         "source_notices":p::source_notices(online),"egress_reference":{"ip":address,"country":country,"timezone":measured["timezone"],"checked_at":now,
         "context":local.get("context").unwrap_or(&json!(""))},"facts":automatic});
     if !target.protected() {

@@ -2,6 +2,18 @@
 
 该摘要根据现有源码和版本发布记录整理。后续版本遵循语义化版本（SemVer）：缺陷修复递增 patch，功能/品牌升级递增 minor，破坏性架构变更递增 major。
 
+## 4.4.0 — 2026-11-27
+
+- **彻底退役 `Net.Coffee` 依赖，升级 100% 纯 Rust 多源权威 IP 风控与路由情报引擎（`watch-engine ip-intel`）**：
+  - 以 `api.ipapi.is` 为核心基座（定量企业与 ASN 浮点滥用率 `abuser_score`、十维威胁与商用 VPN/IDC 机房识别、RIR 注册国与 IANA 时区），并发融合 RIPE NCC 官方 `rpki-validation` / `rir-stats-country`、隧道内加密 DoH 逆向 `PTR`（识别真实家庭拨号与云主机特征）以及 `ipinfo.io` + Cloudflare Trace 三源地理漂移比对（纯 Rust Haversine km 偏移计算）。
+  - 在 `watch-core::ip_intel` 实现完全透明可审计的 **0–100 纯净度评分与逐项加减分拆解**，并自动比对出口 IP 时区与本机 macOS 系统时区一致性；严格执行独立内置 VPN 未就绪时 Fail-Closed 拒绝回退本机探测。
+- **合并为一页式「网络全景诊断」工作台（退役原 4 个碎片检测页）**：
+  - 侧边栏「网络检测」收敛为单一入口 **「网络全景诊断」**，一键并发完成四宫格核心结论、IP 十维风控与路由画像、Claude / Anthropic API / ChatGPT / OpenAI API 全端点连通与 Cloudflare 边缘协议栈（`colo` 城市、`TLS`、`http/2`、后量子 `kex`、CF 质询）遥测，以及与启动预检共享同一守护回执的 DNS 递归（新增 `EDNS Client Subnet` 子网透传核验）与 WebRTC / 双栈网卡泄漏取证。
+  - 删除冗余的 `AI 连通检测` 内嵌 `iprisk` 卡片及其引发的报错污染；彻底移除 `NetCoffeeScorePage`、`NetCoffeeStore`、`GPTServiceCheckPage`、`LeakCheckPages`。
+- **侧边栏「后台保护」更名为「保护与设置」与双模式 VPN 归位**：
+  - 侧边栏「后台保护」升级为 **「保护与设置」**（绑定 macOS 标准 `⌘,` 快捷键并兼容旧页名恢复）；「代理与连接」恢复纯只读监控定位。
+  - 将「AI 专属 VPN 通道（复用本机 VPN / 独立内置 VPN）」归位至「保护与设置 → 01 · 公用底座」，选中「复用本机 VPN」时仅展示外部监督预期，不再显示冗余的「配置独立节点…」按钮与引导条，仅在点击「独立内置 VPN」时展开独立隧道与节点工作台。
+
 ## 4.3.0 — 2026-11-26
 
 - **新增独立内置 VPN 通道模式（`watch-vpn-core`），与本机 VPN 100% 零冲突**：

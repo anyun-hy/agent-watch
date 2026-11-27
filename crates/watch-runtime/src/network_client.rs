@@ -33,8 +33,99 @@ pub fn default_proxy_url() -> &'static str {
 }
 pub const FAST_EGRESS_URL: &str = "https://www.cloudflare.com/cdn-cgi/trace";
 pub const CONTEXT_MAX_AGE: Duration = Duration::from_secs(30);
-const NETCOFFEE: &str = "https://ip.net.coffee";
+const IPAPI_IS_BASE: &str = "https://api.ipapi.is/?q=";
+const IPINFO_BASE: &str = "https://ipinfo.io/";
 const DISK_SINGLEFLIGHT_WAIT: Duration = Duration::from_secs(5);
+
+fn reverse_ptr_name(ip: &str) -> Option<String> {
+    match ip.parse::<std::net::IpAddr>().ok()? {
+        std::net::IpAddr::V4(v4) => {
+            let [a, b, c, d] = v4.octets();
+            Some(format!("{d}.{c}.{b}.{a}.in-addr.arpa"))
+        }
+        std::net::IpAddr::V6(v6) => {
+            let mut labels = Vec::with_capacity(32);
+            for byte in v6.octets().iter().rev() {
+                labels.push(format!("{:x}", byte & 0x0f));
+                labels.push(format!("{:x}", (byte >> 4) & 0x0f));
+            }
+            Some(format!("{}.ip6.arpa", labels.join(".")))
+        }
+    }
+}
+
+fn valid_cidr_prefix(prefix: &str) -> Option<String> {
+    let (addr_str, len_str) = prefix.trim().split_once('/')?;
+    let addr: std::net::IpAddr = addr_str.parse().ok()?;
+    let mask: u8 = len_str.parse().ok()?;
+    let max_mask = if addr.is_ipv4() { 32 } else { 128 };
+    if mask == 0 || mask > max_mask {
+        return None;
+    }
+    Some(format!("{addr}/{mask}"))
+}
+
+fn enrich_lookup_top_level(data: &mut Value) {
+    let Some(obj) = data.as_object_mut() else {
+        return;
+    };
+    if let Some(loc) = obj.get("location").and_then(Value::as_object).cloned() {
+        if !obj.contains_key("countryCode") {
+            if let Some(cc) = loc.get("country_code").and_then(Value::as_str) {
+                obj.insert("countryCode".into(), json!(cc));
+            }
+        }
+        if !obj.contains_key("country") {
+            if let Some(c) = loc.get("country").and_then(Value::as_str) {
+                obj.insert("country".into(), json!(c));
+            }
+        }
+        if !obj.contains_key("region") {
+            if let Some(r) = loc.get("state").and_then(Value::as_str) {
+                obj.insert("region".into(), json!(r));
+            }
+        }
+        if !obj.contains_key("city") {
+            if let Some(c) = loc.get("city").and_then(Value::as_str) {
+                obj.insert("city".into(), json!(c));
+            }
+        }
+        if !obj.contains_key("timezone") {
+            if let Some(tz) = loc.get("timezone").and_then(Value::as_str) {
+                obj.insert("timezone".into(), json!(tz));
+            }
+        }
+    }
+    if let Some(asn_meta) = obj.get("asn").and_then(Value::as_object).cloned() {
+        if !obj.contains_key("asOrganization") {
+            if let Some(org) = asn_meta.get("org").or_else(|| asn_meta.get("descr")).and_then(Value::as_str) {
+                obj.insert("asOrganization".into(), json!(org));
+            }
+        }
+        if !obj.contains_key("registered_country_code") {
+            if let Some(rc) = asn_meta.get("country").and_then(Value::as_str) {
+                obj.insert("registered_country_code".into(), json!(rc.to_ascii_uppercase()));
+            }
+        }
+        if !obj.contains_key("cidr") {
+            if let Some(rt) = asn_meta.get("route").and_then(Value::as_str) {
+                obj.insert("cidr".into(), json!(rt));
+            }
+        }
+    }
+    if let Some(comp) = obj.get("company").and_then(Value::as_object).cloned() {
+        if !obj.contains_key("company_name") {
+            if let Some(name) = comp.get("name").and_then(Value::as_str) {
+                obj.insert("company_name".into(), json!(name));
+            }
+        }
+        if !obj.contains_key("company_type") {
+            if let Some(kind) = comp.get("type").and_then(Value::as_str) {
+                obj.insert("company_type".into(), json!(kind));
+            }
+        }
+    }
+}
 
 fn now() -> f64 {
     SystemTime::now()
@@ -386,6 +477,12 @@ impl<T: Transport> NetworkClient<T> {
         }
         next
     }
+    pub fn proxy_description(&self) -> String {
+        match &self.proxy {
+            Some(p) => format!("HTTPS CONNECT via {p}"),
+            None => "Direct HTTPS (no loopback proxy)".into(),
+        }
+    }
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout.clamp(Duration::from_millis(100), Duration::from_secs(30));
         self
@@ -555,14 +652,19 @@ impl<T: Transport> NetworkClient<T> {
         };
         if out.status == "complete" && !matches!(kind, "trace" | "service") {
             match serde_json::from_str::<Value>(&out.raw) {
-                Ok(v) if v.is_object() => out.data = Some(v),
+                Ok(mut v) if v.is_object() => {
+                    if matches!(kind, "lookup" | "ipapi") {
+                        enrich_lookup_top_level(&mut v);
+                    }
+                    out.data = Some(v);
+                }
                 _ => {
                     out.status = "error".into();
                     out.error = Some("JSON 对象格式无效".into())
                 }
             }
         }
-        if matches!(kind, "lookup" | "risk")
+        if matches!(kind, "lookup" | "ipapi")
             && out.status == "complete"
             && out
                 .data
@@ -572,6 +674,19 @@ impl<T: Transport> NetworkClient<T> {
                 .and_then(public_unicast)
                 .as_deref()
                 != Some(query)
+        {
+            out.status = "error".into();
+            out.error = Some("响应 IP 与请求出口不一致".into());
+            out.data = None;
+        }
+        if kind == "geoip"
+            && out.status == "complete"
+            && out
+                .data
+                .as_ref()
+                .and_then(|v| v.get("ip"))
+                .and_then(Value::as_str)
+                .is_some_and(|returned| public_unicast(returned).as_deref() != Some(query))
         {
             out.status = "error".into();
             out.error = Some("响应 IP 与请求出口不一致".into());
@@ -659,10 +774,9 @@ impl<T: Transport> NetworkClient<T> {
         let Some(ip) = public_unicast(address) else {
             return Receipt::error(kind, address, "", now(), "invalid_ip", "仅允许公网出口 IP");
         };
-        let path = match kind {
-            "lookup" => "/api/ip/lookup/",
-            "geoip" => "/api/geoip/",
-            "risk" => "/api/iprisk/",
+        let url = match kind {
+            "lookup" | "ipapi" => format!("{IPAPI_IS_BASE}{ip}"),
+            "geoip" => format!("{IPINFO_BASE}{ip}/json"),
             _ => {
                 return Receipt::error(
                     kind,
@@ -674,45 +788,70 @@ impl<T: Transport> NetworkClient<T> {
                 )
             }
         };
-        self.cached(
-            format!("{kind}:{ip}"),
-            kind,
-            &ip,
-            format!("{NETCOFFEE}{path}{ip}"),
-        )
+        self.cached(format!("{kind}:{ip}"), kind, &ip, url)
     }
-    /// Returns a completed Net.Coffee DNS probe receipt for a token issued by
-    /// the local WebView flow. The token is deliberately constrained before it
-    /// becomes part of the fixed, allowlisted URL.
-    pub fn netcoffee_dns(&self, token: &str) -> Receipt {
-        if !(16..=48).contains(&token.len())
-            || !token
-                .bytes()
-                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
-        {
-            return Receipt::error(
-                "dns",
-                token,
-                "",
-                now(),
-                "invalid_dns_token",
-                "Net.Coffee DNS 令牌无效",
-            );
+
+    /// Official RIPE NCC Routinator RPKI Route Origin Validation check.
+    pub fn ripe_rpki(&self, asn: u32, prefix: &str) -> Receipt {
+        if asn == 0 {
+            return Receipt::error("ripe-rpki", prefix, "", now(), "invalid_asn", "ASN 无效");
         }
-        let mut receipt = self.request("dns", token, format!("{NETCOFFEE}/api/dns/result/{token}"));
-        if receipt.status == "complete"
-            && !receipt
-                .data
-                .as_ref()
-                .and_then(|value| value.get("dns_servers"))
-                .and_then(Value::as_array)
-                .is_some_and(|servers| servers.iter().all(Value::is_string))
-        {
-            receipt.status = "error".into();
-            receipt.error = Some("DNS 服务列表格式无效".into());
-            receipt.data = None;
+        let Some(cidr) = valid_cidr_prefix(prefix) else {
+            return Receipt::error("ripe-rpki", prefix, "", now(), "invalid_prefix", "路由前缀格式无效");
+        };
+        let query = format!("AS{asn}:{cidr}");
+        let url = format!(
+            "https://stat.ripe.net/data/rpki-validation/data.json?resource=AS{asn}&prefix={cidr}"
+        );
+        self.cached(format!("ripe-rpki:{query}"), "ripe-rpki", &query, url)
+    }
+
+    /// Encrypted DNS-over-HTTPS PTR (`in-addr.arpa` / `ip6.arpa`) lookup through the active proxy.
+    pub fn doh_ptr(&self, address: &str) -> Vec<String> {
+        let Some(ip) = public_unicast(address) else {
+            return Vec::new();
+        };
+        let Some(arpa) = reverse_ptr_name(&ip) else {
+            return Vec::new();
+        };
+        let url = format!("https://1.1.1.1/dns-query?name={arpa}&type=PTR");
+        let resp = self.transport.get(&Request {
+            url,
+            proxy: self.proxy.clone(),
+            timeout: self.timeout.min(Duration::from_secs(4)),
+            connect_timeout: self.connect_timeout,
+            max_body: 16 * 1024,
+            safe_headers: vec![("Accept".into(), "application/dns-json".into())],
+        });
+        let Ok(r) = resp else {
+            return Vec::new();
+        };
+        if r.status != 200 {
+            return Vec::new();
         }
-        receipt
+        let Ok(val) = serde_json::from_slice::<Value>(&r.body) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        if let Some(answers) = val.get("Answer").and_then(Value::as_array) {
+            for ans in answers.iter().take(16) {
+                if ans.get("type").and_then(Value::as_u64) == Some(12) {
+                    if let Some(host) = ans.get("data").and_then(Value::as_str) {
+                        let clean = host.trim().trim_end_matches('.');
+                        if !clean.is_empty()
+                            && clean.len() <= 253
+                            && clean
+                                .bytes()
+                                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
+                            && !out.iter().any(|existing: &String| existing.eq_ignore_ascii_case(clean))
+                        {
+                            out.push(clean.to_owned());
+                        }
+                    }
+                }
+            }
+        }
+        out
     }
     /// Adds explicit same-IP, current-round provenance to a metadata receipt.
     /// `egress_ip` must be an independently observed public egress value, not a
@@ -794,6 +933,7 @@ impl<T: Transport> NetworkClient<T> {
             url,
             "https://claude.ai/cdn-cgi/trace"
                 | "https://www.anthropic.com/cdn-cgi/trace"
+                | "https://api.anthropic.com/v1/models"
                 | "https://chatgpt.com/cdn-cgi/trace"
                 | "https://api.openai.com/v1/models"
                 | "https://1.1.1.1/cdn-cgi/trace"
@@ -901,6 +1041,12 @@ pub fn lookup_asn(receipt: &Receipt) -> Option<u32> {
         value
             .as_u64()
             .and_then(|value| u32::try_from(value).ok())
+            .or_else(|| {
+                value
+                    .get("asn")
+                    .and_then(Value::as_u64)
+                    .and_then(|n| u32::try_from(n).ok())
+            })
             .or_else(|| {
                 value.as_str().and_then(|value| {
                     (!value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()))

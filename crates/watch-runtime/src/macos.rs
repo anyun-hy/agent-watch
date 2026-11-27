@@ -1046,10 +1046,10 @@ impl<R: ReadRunner, T: Transport, M: Mutator> Macos<R, T, M> {
                         .is_some_and(|country| country != trace["loc"].as_str().unwrap_or(""))
                     {
                         conflict = true;
-                        query_errors["egress_consistency"] = json!({"source":"Cloudflare trace / Net.Coffee","message":"Cloudflare 与 Net.Coffee 出口国家不一致"});
+                        query_errors["egress_consistency"] = json!({"source":"Cloudflare trace / ipapi.is","message":"Cloudflare 与 ipapi.is 出口国家不一致"});
                     }
                     geo = json!({"ip":ip,"country":country,"timezone":timezone,
-                        "country_source":"Net.Coffee lookup","timezone_source":"Net.Coffee lookup"});
+                        "country_source":"ipapi.is lookup","timezone_source":"ipapi.is lookup"});
                     geo_sampled_at = lookup_receipt.as_ref().map(|value| value.finished_at);
                 } else if lookup_receipt.is_some() {
                     let returned = lookup_receipt
@@ -1063,16 +1063,16 @@ impl<R: ReadRunner, T: Transport, M: Mutator> Macos<R, T, M> {
                     let actual_conflict = other_ip.as_deref().is_some_and(|other| other != ip);
                     let (source, message) = if actual_conflict {
                         (
-                            "Cloudflare trace / Net.Coffee",
-                            "Cloudflare 与 Net.Coffee 出口 IP 不一致",
+                            "Cloudflare trace / ipapi.is",
+                            "Cloudflare 与 ipapi.is 出口 IP 不一致",
                         )
                     } else {
-                        ("Net.Coffee lookup", "Net.Coffee 查询未完成")
+                        ("ipapi.is lookup", "ipapi.is 情报查询未完成")
                     };
                     query_errors[if actual_conflict {
                         "egress_consistency"
                     } else {
-                        "netcoffee"
+                        "ip_intel"
                     }] = json!({"source":source,"message":message});
                     conflict = actual_conflict;
                 }
@@ -1107,16 +1107,16 @@ impl<R: ReadRunner, T: Transport, M: Mutator> Macos<R, T, M> {
                             });
                         if bound && country.as_deref() == trace["loc"].as_str() {
                             geo = json!({"ip":ip,"country":country,"timezone":data.get("timezone").cloned().unwrap_or(Value::Null),
-                                "country_source":"Net.Coffee geoip fallback","timezone_source":"Net.Coffee geoip fallback"});
+                                "country_source":"ipinfo.io geoip fallback","timezone_source":"ipinfo.io geoip fallback"});
                             geo_sampled_at = Some(fallback.finished_at);
                         } else if country.is_some() && returned_ip.is_some() {
-                            query_errors["egress_consistency"] = json!({"source":"Cloudflare trace / Net.Coffee geoip","message":"Cloudflare 与 Net.Coffee 备用出口资料不一致"});
+                            query_errors["egress_consistency"] = json!({"source":"Cloudflare trace / ipinfo.io","message":"Cloudflare 与 ipinfo.io 备用出口资料不一致"});
                         } else {
-                            query_errors["geo"] = json!({"source":"Net.Coffee geoip","message":"备用地理响应缺少有效 IP 或国家字段"});
+                            query_errors["geo"] = json!({"source":"ipinfo.io geoip","message":"备用地理响应缺少有效 IP 或国家字段"});
                         }
                     } else {
                         query_errors["geo"] =
-                            json!({"source":"Net.Coffee geoip","message":"备用地理查询未完成"});
+                            json!({"source":"ipinfo.io geoip","message":"备用地理查询未完成"});
                     }
                 }
                 let asn = lookup_receipt
@@ -1127,6 +1127,7 @@ impl<R: ReadRunner, T: Transport, M: Mutator> Macos<R, T, M> {
                     .filter(|_| lookup_bound)
                     .and_then(|data| {
                         data.get("asOrganization")
+                            .or_else(|| data.pointer("/asn/org"))
                             .or_else(|| data.get("asn_org"))
                             .or_else(|| data.get("org"))
                     })
@@ -1134,7 +1135,7 @@ impl<R: ReadRunner, T: Transport, M: Mutator> Macos<R, T, M> {
                     .unwrap_or("")
                     .to_owned();
                 let mut asn_value =
-                    json!({"number":asn,"organization":organization,"source":"Net.Coffee lookup"});
+                    json!({"number":asn,"organization":organization,"source":"ipapi.is lookup"});
                 if let Some(receipt) = lookup_receipt.as_ref().filter(|_| asn.is_some()) {
                     asn_value["queried_at"] = json!(receipt.finished_at);
                     let number = asn.unwrap();
@@ -1179,7 +1180,7 @@ impl<R: ReadRunner, T: Transport, M: Mutator> Macos<R, T, M> {
             });
         let _ = (&lookup_receipt, lookup_bound, asn, &organization, &mut query_errors);
         let stun = fresh_stun.unwrap_or_else(|| self.stun_fact(context));
-        let mut result = json!({"stun":stun,"trace":trace,"geo":geo,"asn":asn_value,"netcoffee_lookup":lookup,"query_errors":query_errors,
+        let mut result = json!({"stun":stun,"trace":trace,"geo":geo,"asn":asn_value,"ip_intel":lookup,"netcoffee_lookup":lookup,"query_errors":query_errors,
             "source_times":{"trace":egress.finished_at,"geo":geo_sampled_at,"asn":asn_value.get("registered_queried_at").or_else(||asn_value.get("queried_at"))}});
         if let Some((claude, api)) = services {
             result["source_times"]["claude"] = json!(claude.queried_at);

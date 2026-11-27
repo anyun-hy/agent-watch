@@ -80,8 +80,13 @@ pub fn extract_risks(online: &Value, measured: &Value) -> Value {
         ));
     }
     let lookup = online
-        .pointer("/netcoffee_lookup/data/ip")
-        .and_then(Value::as_str);
+        .pointer("/ip_intel/ip")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            online
+                .pointer("/netcoffee_lookup/data/ip")
+                .and_then(Value::as_str)
+        });
     if online
         .pointer("/asn/registered_country")
         .and_then(Value::as_str)

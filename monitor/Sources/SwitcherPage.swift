@@ -2,12 +2,12 @@ import AppKit
 import SwiftUI
 
 enum SwitcherSection: String, CaseIterable {
-    case environment = "环境状态", accounts = "启动与账号", protection = "后台保护"
+    case environment = "环境状态", accounts = "启动与账号", protection = "保护与设置"
     var caption: String {
         switch self {
         case .environment: return "自动识别代理，按本轮实测出口核对地区、日期与时区；英文语言独立保持。"
         case .accounts: return "受控启动 Claude 与 ChatGPT，管理本地 A / B 资料槽位并核验双应用启动条件。"
-        case .protection: return "统一配置公用守护底座、VPN 监督预期与双 AI 门禁及处置策略。"
+        case .protection: return "统一配置公用守护底座、AI 专属 VPN 双模式与双平台门禁及风控策略。"
         }
     }
 }
@@ -24,7 +24,7 @@ struct SwitcherPage: View {
     var openIPScore: (String) -> Void = { _ in }
     var channelState: (MonitoredProduct) -> FamilyChannelMonitorState? = { _ in nil }
     var leakChecks: LeakCheckStore? = nil
-    var netCoffee: NetCoffeeStore? = nil
+    var ipIntel: IpIntelStore? = nil
     var managedEntryControl: ManagedEntryControl? = nil
     let finished: () -> Void
     @AppStorage("returnToOverviewAfterSwitch") private var returnToOverviewAfterSwitch = true
@@ -204,7 +204,7 @@ struct SwitcherPage: View {
                     if !store.dnsReceiptError.isEmpty {
                         InlineNotice(title: "DNS 结果尚未同步到启动预检", detail: store.dnsReceiptError, symbol: "exclamationmark.triangle", tint: p.amber, p: p)
                     }
-                    if let netCoffee { EnvironmentIPQualitySummary(store: netCoffee, environment: result, p: p, openIPScore: openIPScore) }
+                    if let ipIntel { EnvironmentIPQualitySummary(store: ipIntel, environment: result, p: p, openIPScore: openIPScore) }
                 } else {
                     Label(store.busy ? "正在读取系统与检测出口…" : "尚无本轮样本。点击「检测环境」。", systemImage: "network").font(WatchTypography.body).foregroundStyle(p.secondary)
                     sessionInspector
@@ -284,7 +284,7 @@ struct SwitcherPage: View {
                     .font(WatchTypography.small).foregroundStyle(p.secondary)
                 HStack(spacing: 12) {
                     Button { navigate(.accounts) } label: { Label("启动与账号", systemImage: "arrow.right") }.buttonStyle(.borderless)
-                    Button { navigate(.protection) } label: { Label("后台保护", systemImage: "shield.lefthalf.filled") }.buttonStyle(.borderless)
+                    Button { navigate(.protection) } label: { Label("保护与设置", systemImage: "slider.horizontal.3") }.buttonStyle(.borderless)
                 }.font(WatchTypography.caption)
             }.foregroundStyle(p.text).frame(maxWidth: .infinity, alignment: .leading)
         }
@@ -313,7 +313,7 @@ struct SwitcherPage: View {
     }
     private var environmentAdjustment: some View {
         VStack(alignment: .leading, spacing: 14) {
-            Text("当系统时区、地区格式或 IPv6 与本轮出口不一致时，可在此生成具体的系统环境对齐预览并一键应用；VPN 与代理预期请前往「后台保护 → 01 · 公用底座」管理。")
+            Text("当系统时区、地区格式或 IPv6 与本轮出口不一致时，可在此生成具体的系统环境对齐预览并一键应用；VPN 双模式与监督预期请前往「保护与设置 → 01 · 公用底座」管理。")
                 .font(WatchTypography.caption).foregroundStyle(p.secondary)
             HStack {
                 Button { Task { await store.detectEnvironment() } } label: { Label("自动检测并生成修复建议", systemImage: "wand.and.stars") }
@@ -1018,33 +1018,23 @@ struct SwitcherPage: View {
         .disabled(store.busy || !store.loaded)
     }
 
+    @ViewBuilder
     private var vpnExpectationSection: some View {
-        let managedActive = monitor?.managedVpn.mode == .managed
-        return VStack(alignment: .leading, spacing: 10) {
-            if managedActive, let managed = monitor?.managedVpn {
-                HStack(alignment: .center, spacing: 10) {
-                    Image(systemName: "lock.shield.fill")
-                        .font(.system(size: 13, weight: .medium))
-                        .foregroundStyle(p.mint)
-                        .frame(width: 24, height: 24)
-                        .background(p.mint.opacity(0.12), in: RoundedRectangle(cornerRadius: 6))
-                    VStack(alignment: .leading, spacing: 3) {
-                        HStack(spacing: 8) {
-                            Text("独立内置 VPN 通道（单点生效）").font(WatchTypography.bodyStrong).foregroundStyle(p.text)
-                            Badge(text: managed.runtime?.state == "running" ? "运行中 · 不影响本机 VPN" : "独立模式", color: p.mint)
-                        }
-                        Text(managed.selectedNode.map { "当前绑定节点：\($0.name)（\($0.protocol_label)），无需配置外部 TAG / Clash 监督预期。" }
-                             ?? "当前已启用独立内置 VPN 模式，但尚未选定节点；请前往「代理与连接」导入或启用节点。")
-                            .font(WatchTypography.small).foregroundStyle(p.secondary)
-                    }
-                    Spacer(minLength: 8)
-                    Button("管理独立 VPN 节点 ↗") {
-                        openNetwork(.claude)
-                    }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
-                }
-            } else {
+        if let managed = monitor?.managedVpn {
+            ManagedVpnPanel(store: managed, p: p) {
+                externalVpnExpectationContent
+            }
+        } else {
+            externalVpnExpectationContent
+                .padding(10)
+                .background(p.elevated.opacity(0.35), in: RoundedRectangle(cornerRadius: 9))
+                .overlay(RoundedRectangle(cornerRadius: 9).strokeBorder(p.border.opacity(0.6), lineWidth: 1))
+        }
+    }
+
+    private var externalVpnExpectationContent: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Divider()
             HStack(alignment: .center, spacing: 10) {
                 Image(systemName: "network.badge.shield.half.filled")
                     .font(.system(size: 13, weight: .medium))
@@ -1053,7 +1043,7 @@ struct SwitcherPage: View {
                     .background(p.elevated, in: RoundedRectangle(cornerRadius: 6))
                 VStack(alignment: .leading, spacing: 3) {
                     HStack(spacing: 8) {
-                        Text("只读 VPN 监督预期").font(WatchTypography.bodyStrong).foregroundStyle(p.text)
+                        Text("本机外部 VPN 监督预期").font(WatchTypography.bodyStrong).foregroundStyle(p.text)
                         if let syncState = store.policySyncState {
                             Badge(
                                 text: syncState.labelZh,
@@ -1065,11 +1055,6 @@ struct SwitcherPage: View {
                         .font(WatchTypography.small).foregroundStyle(p.secondary)
                 }
                 Spacer(minLength: 8)
-                Button("改用独立内置 VPN ↗") {
-                    openNetwork(.claude)
-                }
-                .buttonStyle(.borderless)
-                .font(WatchTypography.small)
                 Button(showVpnEditor ? "收起修改" : "修改 VPN 预期…") {
                     withAnimation(.easeInOut(duration: 0.15)) { showVpnEditor.toggle() }
                 }
@@ -1104,12 +1089,7 @@ struct SwitcherPage: View {
                 Text("仅写入 Watch 本地只读比对基线，不修改外部 VPN / TAG 客户端设置。")
                     .font(WatchTypography.small).foregroundStyle(p.secondary)
             }
-            }
         }
-        .padding(10)
-        .background(p.elevated.opacity(0.35), in: RoundedRectangle(cornerRadius: 9))
-        .overlay(RoundedRectangle(cornerRadius: 9).strokeBorder(p.border.opacity(0.6), lineWidth: 1))
-        .task { await monitor?.managedVpn.refresh() }
     }
 
     private var changeReview: some View {
@@ -1424,7 +1404,7 @@ private struct EnvironmentWebRTCTile: View {
 }
 
 private struct EnvironmentIPQualitySummary: View {
-    @ObservedObject var store: NetCoffeeStore
+    @ObservedObject var store: IpIntelStore
     let environment: CurrentEnvironmentReceipt
     let p: Palette
     let openIPScore: (String) -> Void
@@ -1437,75 +1417,70 @@ private struct EnvironmentIPQualitySummary: View {
     }
     var body: some View {
         guard let ip else { return AnyView(EmptyView()) }
-        let receipt = store.report(ip)
-        let fresh = store.isFreshLookup(ip)
-        let isp = receipt?.field("isp").replacingOccurrences(of: "未提供", with: "") ?? egressRow?.isp ?? ""
-        let company = receipt?.field("company_name").replacingOccurrences(of: "未提供", with: "") ?? egressRow?.company_name ?? ""
-        let org = receipt?.field("asOrganization").replacingOccurrences(of: "未提供", with: "") ?? egressRow?.as_org ?? ""
-        let effectiveCompany = !company.isEmpty ? company : org
-        let nature = egressRow?.nature ?? ""
-        let isResidential = receipt?.data?["isResidential"]?.flag ?? egressRow?.is_residential
-        let isDatacenter = receipt?.data?["is_datacenter"]?.flag ?? egressRow?.is_datacenter
-        let typeBadge = isResidential == true ? "家庭住宅 IP (原生)" : (isDatacenter == true ? "机房/数据中心" : (!nature.isEmpty ? nature : ""))
-        let rdns = receipt?.field("rdns").replacingOccurrences(of: "未提供", with: "") ?? egressRow?.rdns ?? ""
-        let city = receipt?.field("city").replacingOccurrences(of: "未提供", with: "") ?? ""
-        let region = receipt?.field("region").replacingOccurrences(of: "未提供", with: "") ?? ""
-        let location = !region.isEmpty && !city.isEmpty ? "\(region) \(city)" : (egressRow?.location ?? "")
+        let report = store.report(for: ip)
+        let fresh = store.isFresh(ip)
+        let effectiveCompany = report?.company_name ?? report?.asOrganization ?? egressRow?.company_name ?? egressRow?.as_org ?? ""
+        let isResidential = report?.is_residential ?? egressRow?.is_residential
+        let isDatacenter = report?.is_datacenter ?? egressRow?.is_datacenter
+        let nativeLabel = report?.usage?.native_label ?? ""
+        let typeBadge = report?.usage?.label ?? (isResidential == true ? "家庭住宅宽带 (ISP)" : (isDatacenter == true ? "机房 / 数据中心" : (egressRow?.nature ?? "")))
+        let rdns = report?.rdns ?? egressRow?.rdns ?? ""
+        let location = [report?.country, report?.region, report?.city].compactMap { $0 }.filter { !$0.isEmpty }.joined(separator: " · ")
 
         return AnyView(Surface(p, padding: 12) {
             VStack(alignment: .leading, spacing: 10) {
                 HStack {
-                    Label("IP 质量与运营商归属", systemImage: "gauge.with.dots.needle.50percent").font(WatchTypography.bodyStrong)
+                    Label("出口 IP 纯净度与运营商画像", systemImage: "shield.lefthalf.filled.badge.checkmark").font(WatchTypography.bodyStrong)
+                    if !nativeLabel.isEmpty {
+                        Badge(text: nativeLabel, color: report?.usage?.native_status == "native" ? p.mint : p.amber)
+                    }
                     if !typeBadge.isEmpty {
-                        Text(typeBadge)
-                            .font(WatchTypography.small)
-                            .foregroundStyle(isResidential == true ? p.mint : p.amber)
-                            .padding(.horizontal, 6).padding(.vertical, 2)
-                            .background((isResidential == true ? p.mint : p.amber).opacity(0.12), in: Capsule())
+                        Badge(text: typeBadge, color: isResidential == true ? p.mint : p.blue)
                     }
                     Spacer()
-                    Text(store.running.contains(ip) ? "更新中" : receipt == nil ? "未取得" : fresh && receipt?.cache_state != "last_good" ? "本轮实测" : "历史资料")
+                    Text(store.isRunning ? "评估中…" : report == nil ? "待评估" : fresh ? "本轮实测" : "缓存资料")
                         .font(WatchTypography.small).foregroundStyle(p.secondary)
-                    PageLink(title: "查看 IP 评分", p: p) { openIPScore(ip) }
+                    PageLink(title: "打开网络全景诊断", p: p) { openIPScore(ip) }
                 }
-                if let receipt {
+                if let report, let score = report.score {
                     HStack(alignment: .top, spacing: 18) {
                         VStack(alignment: .leading, spacing: 3) {
-                            Text(receipt.score.map(String.init) ?? "—")
+                            Text("\(score.value)")
                                 .font(.system(size: 26, weight: .bold, design: .monospaced))
-                                .foregroundStyle((receipt.score ?? 0) >= 80 ? p.mint : p.text)
-                            Text("Net.Coffee 信任分").font(WatchTypography.small).foregroundStyle(p.secondary)
-                        }.frame(minWidth: 80, alignment: .leading)
+                                .foregroundStyle(score.value >= 85 ? p.mint : score.value >= 65 ? p.blue : p.amber)
+                            Text("纯净分 · \(score.label)").font(WatchTypography.small).foregroundStyle(p.secondary)
+                        }.frame(minWidth: 92, alignment: .leading)
 
                         VStack(alignment: .leading, spacing: 4) {
                             HStack(spacing: 8) {
-                                Text("AS\(receipt.field("asn")) · \(effectiveCompany)")
+                                Text("\(report.asn.map { "AS\($0)" } ?? "AS—") · \(effectiveCompany)")
                                     .font(WatchTypography.captionStrong)
                                     .lineLimit(1)
-                                if !isp.isEmpty && isp != effectiveCompany {
-                                    Text("(\(isp))")
-                                        .font(WatchTypography.caption)
+                                if let abuse = report.abuser?.company.raw, !abuse.isEmpty {
+                                    Text("滥用度 \(abuse)")
+                                        .font(WatchTypography.small.monospaced())
                                         .foregroundStyle(p.secondary)
-                                        .lineLimit(1)
                                 }
                             }
                             HStack(spacing: 12) {
                                 if !location.isEmpty {
-                                    Label("IP 归属地区：" + location, systemImage: "mappin.and.ellipse")
+                                    Label(location, systemImage: "mappin.and.ellipse")
                                         .font(WatchTypography.small).foregroundStyle(p.secondary)
                                 }
                                 if !rdns.isEmpty {
-                                    Text("rDNS: \(rdns)")
-                                        .font(WatchTypography.small).foregroundStyle(p.secondary)
+                                    Text("PTR: \(rdns)")
+                                        .font(WatchTypography.small.monospaced()).foregroundStyle(p.secondary)
                                         .lineLimit(1)
                                 }
                             }
                         }.frame(maxWidth: .infinity, alignment: .leading)
                     }
-                    Text((fresh && receipt.cache_state != "last_good" ? "资料时间：" : "历史资料时间：") + environmentSummaryTime(receipt.queriedAt) + " · 数据来自 Net.Coffee 原站")
-                        .font(WatchTypography.small).foregroundStyle(p.secondary)
+                    if let ts = report.finishedAt {
+                        Text("采样时间：" + environmentSummaryTime(ts) + " · 纯 Rust 权威多源聚合（ipapi.is + RIPEstat RPKI + DoH PTR）")
+                            .font(WatchTypography.small).foregroundStyle(p.secondary)
+                    }
                 } else {
-                    Text("正在按本轮公网出口 IP 读取 Net.Coffee 运营商与网络资料；未返回时保持未取得。")
+                    Text("正在通过纯 Rust 权威情报链评估本轮公网出口 IP 的纯净度、原生性与历史滥用率。")
                         .font(WatchTypography.caption).foregroundStyle(p.secondary)
                 }
             }

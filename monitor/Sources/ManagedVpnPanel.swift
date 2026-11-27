@@ -1,11 +1,22 @@
 import SwiftUI
 
-/// Single-authority AI VPN channel & node management workbench inside "代理与连接".
+/// Single-authority AI VPN channel & node management workbench inside "保护与设置 → 01 · 公用底座".
 /// Allows switching between reusing the host VPN (TAG / Clash) and running Agent Watch's
 /// isolated non-TUN `watch-vpn-core` tunnel without interfering with host VPNs or system proxy.
-struct ManagedVpnPanel: View {
+struct ManagedVpnPanel<ExternalContent: View>: View {
     @ObservedObject var store: ManagedVpnStore
     let p: Palette
+    private let externalContent: ExternalContent
+
+    init(
+        store: ManagedVpnStore,
+        p: Palette,
+        @ViewBuilder externalContent: () -> ExternalContent = { EmptyView() }
+    ) {
+        self.store = store
+        self.p = p
+        self.externalContent = externalContent()
+    }
 
     private enum SourceTab: String, CaseIterable, Identifiable {
         case builtin = "自带 VPN 服务"
@@ -22,33 +33,34 @@ struct ManagedVpnPanel: View {
     @State private var pendingDeleteNode: ManagedVpnNode?
 
     var body: some View {
-        Surface(p, padding: 16) {
-            VStack(alignment: .leading, spacing: 14) {
-                headerRow
-                if let err = store.errorMessage, !err.isEmpty {
-                    InlineNotice(title: "独立 VPN 操作提示", detail: err,
-                                 symbol: "exclamationmark.triangle", tint: p.amber, p: p)
-                } else if !store.message.isEmpty {
-                    HStack(spacing: 8) {
-                        Image(systemName: "checkmark.circle.fill")
-                            .font(.system(size: 12))
-                            .foregroundStyle(p.mint)
-                        Text(store.message)
-                            .font(WatchTypography.caption)
-                            .foregroundStyle(p.secondary)
-                        Spacer()
-                    }
-                    .padding(.horizontal, 10).padding(.vertical, 7)
-                    .background(p.mint.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
+        VStack(alignment: .leading, spacing: 12) {
+            headerRow
+            if let err = store.errorMessage, !err.isEmpty {
+                InlineNotice(title: "独立 VPN 操作提示", detail: err,
+                             symbol: "exclamationmark.triangle", tint: p.amber, p: p)
+            } else if !store.message.isEmpty {
+                HStack(spacing: 8) {
+                    Image(systemName: "checkmark.circle.fill")
+                        .font(.system(size: 12))
+                        .foregroundStyle(p.mint)
+                    Text(store.message)
+                        .font(WatchTypography.caption)
+                        .foregroundStyle(p.secondary)
+                    Spacer()
                 }
+                .padding(.horizontal, 10).padding(.vertical, 7)
+                .background(p.mint.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
+            }
 
-                if store.mode == .external {
-                    externalSummaryStrip
-                } else {
-                    managedWorkbench
-                }
+            if store.mode == .external {
+                externalContent
+            } else {
+                managedWorkbench
             }
         }
+        .padding(12)
+        .background(p.elevated.opacity(0.35), in: RoundedRectangle(cornerRadius: 9))
+        .overlay(RoundedRectangle(cornerRadius: 9).strokeBorder(p.border.opacity(0.6), lineWidth: 1))
         .task { await store.refresh() }
         .sheet(isPresented: $showImportSheet) {
             ManagedVpnImportSheet(store: store, p: p) {
@@ -115,34 +127,6 @@ struct ManagedVpnPanel: View {
             .frame(width: 240)
             .disabled(store.busy)
         }
-    }
-
-    private var externalSummaryStrip: some View {
-        HStack(spacing: 10) {
-            Image(systemName: "info.circle")
-                .foregroundStyle(p.secondary)
-            Text(store.nodes.isEmpty
-                 ? "如需为 Claude / ChatGPT 单独提供独立线路而不影响本机 TAG，请切换到「独立内置 VPN」导入节点或接入自带 VPN 服务。"
-                 : "本地私密库已保存 \(store.nodes.count) 个独立节点；随时可切换至「独立内置 VPN」启用。")
-                .font(WatchTypography.caption).foregroundStyle(p.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-            Spacer(minLength: 8)
-            Button(store.nodes.isEmpty ? "配置独立节点…" : "启用独立 VPN") {
-                if store.nodes.isEmpty {
-                    Task {
-                        await store.setMode(.managed)
-                        showImportSheet = true
-                    }
-                } else {
-                    Task { await store.setMode(.managed) }
-                }
-            }
-            .buttonStyle(.bordered)
-            .controlSize(.small)
-            .disabled(store.busy)
-        }
-        .padding(10)
-        .background(p.elevated.opacity(0.35), in: RoundedRectangle(cornerRadius: 8))
     }
 
     private var managedWorkbench: some View {

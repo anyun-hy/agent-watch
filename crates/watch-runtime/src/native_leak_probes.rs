@@ -256,6 +256,39 @@ pub fn extract_echo_resolvers(source: DnsEchoSource, records: &[Vec<String>]) ->
     found.into_values().collect()
 }
 
+/// Extract EDNS Client Subnet (`ecs`) lines from Akamai / Google TXT echo answers.
+pub fn extract_echo_ecs(source: DnsEchoSource, records: &[Vec<String>]) -> Vec<String> {
+    let mut subnets = BTreeSet::new();
+    for chunks in records {
+        match source {
+            DnsEchoSource::Akamai => {
+                if chunks.len() >= 2 && chunks[0].trim().eq_ignore_ascii_case("ecs") {
+                    let s = chunks[1].trim().trim_matches('"');
+                    if !s.is_empty() && s.len() <= 64 {
+                        let mask = chunks.get(2).map(|m| format!(" ({})", m.trim())).unwrap_or_default();
+                        subnets.insert(format!("{s}{mask}"));
+                    }
+                }
+            }
+            DnsEchoSource::Google => {
+                for chunk in chunks {
+                    let trimmed = chunk.trim().trim_matches('"');
+                    if let Some(rest) = trimmed
+                        .strip_prefix("edns0-client-subnet ")
+                        .or_else(|| trimmed.strip_prefix("edns0-client-subnet="))
+                    {
+                        let clean = rest.trim();
+                        if !clean.is_empty() && clean.len() <= 64 {
+                            subnets.insert(clean.to_owned());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    subnets.into_iter().collect()
+}
+
 fn query_dns_txt_udp_or_tcp(server: SocketAddr, qname: &str) -> Result<Vec<Vec<String>>, &'static str> {
     let mut tx_bytes = [0u8; 2];
     getrandom::fill(&mut tx_bytes).map_err(|_| "rng_failed")?;
@@ -432,7 +465,7 @@ fn lookup_geo_single<T: Transport>(
         .with_timeout(GEOIP_TIMEOUT)
         .with_connect_timeout(Duration::from_millis(1500));
 
-    // Primary: Net.Coffee geoip endpoint via proxy
+    // Primary: ipinfo.io geoip endpoint via controlled proxy
     let receipt = client.metadata("geoip", ip);
     if receipt.status == "complete" && receipt.http_status == Some(200) && receipt.query == ip {
         if let Some(data) = receipt.data.as_ref().filter(|d| d.is_object()) {
@@ -553,7 +586,7 @@ pub fn collect_dns<R: ReadRunner, T: Transport>(runner: &R, network: &NetworkCli
     let started = wallclock();
     let nameservers = discover_system_nameservers(runner);
 
-    let (trace_res, echo_results) = thread::scope(|scope| {
+    let (trace_res, echo_results, ecs_subnets) = thread::scope(|scope| {
         let trace_job = scope.spawn(|| fetch_http_trace(network));
         let mut dns_jobs = Vec::new();
         for &server in nameservers.iter().take(2) {
@@ -561,22 +594,36 @@ pub fn collect_dns<R: ReadRunner, T: Transport>(runner: &R, network: &NetworkCli
                 dns_jobs.push((
                     source,
                     scope.spawn(move || {
-                        query_dns_txt_udp_or_tcp(server, source.qname())
-                            .map(|records| extract_echo_resolvers(source, &records))
+                        query_dns_txt_udp_or_tcp(server, source.qname()).map(|records| {
+                            (
+                                extract_echo_resolvers(source, &records),
+                                extract_echo_ecs(source, &records),
+                            )
+                        })
                     }),
                 ));
             }
         }
         let mut resolvers: BTreeMap<String, (u8, &'static str, u64)> = BTreeMap::new();
+        let mut ecs_found: BTreeSet<String> = BTreeSet::new();
         for (source, job) in dns_jobs {
-            if let Ok(Ok(found)) = job.join() {
+            if let Ok(Ok((found, ecs))) = job.join() {
                 for (ip, fam) in found {
                     let entry = resolvers.entry(ip).or_insert((fam, source.label(), 0));
                     entry.2 += 1;
                 }
+                for sub in ecs {
+                    ecs_found.insert(sub);
+                }
             }
         }
-        (trace_job.join().unwrap_or_else(|_| Err(("error".into(), "HTTP 线程异常".into()))), resolvers)
+        (
+            trace_job
+                .join()
+                .unwrap_or_else(|_| Err(("error".into(), "HTTP 线程异常".into()))),
+            resolvers,
+            ecs_found.into_iter().collect::<Vec<_>>(),
+        )
     });
 
     let mut resolvers = echo_results;
@@ -721,9 +768,19 @@ pub fn collect_dns<R: ReadRunner, T: Transport>(runner: &R, network: &NetworkCli
         "partial"
     };
 
+    let ecs_summary = if ecs_subnets.is_empty() {
+        "EDNS Client Subnet (ECS)：未检测到客户端真实子网透传（隐私保护正常）。".to_owned()
+    } else {
+        format!(
+            "EDNS Client Subnet (ECS)：检测到递归解析器携带子网掩码 [{}]，请核对该子网归属。",
+            ecs_subnets.join(", ")
+        )
+    };
+
     let external_evidence = json!({
         "provider": "native",
         "dns_servers": dns_servers_json,
+        "ecs_subnets": ecs_subnets,
         "http": http_evidence,
         "geoip": geoip_json,
     });
@@ -734,13 +791,14 @@ pub fn collect_dns<R: ReadRunner, T: Transport>(runner: &R, network: &NetworkCli
         "status": status,
         "startedAt": started,
         "finishedAt": finished,
-        "scope": "原生多源权威 DNS 递归出口核对（Akamai / Google）",
+        "scope": "原生多源权威 DNS 递归出口与 ECS 子网核对（Akamai / Google）",
         "observations": observations,
         "errors": errors,
         "contextChanged": false,
         "details": [
             "直接向系统生效 DNS 解析器并发发起 Akamai 与 Google 权威 TXT 递归回显查询。",
-            "同轮对照经本机代理的公网 HTTP 出口国家归属，无需加载外部检测网页。"
+            ecs_summary,
+            "同轮对照经受控代理通道的公网 HTTP 出口国家归属，无需加载外部网页。"
         ],
         "externalJSON": external_evidence.to_string(),
     })

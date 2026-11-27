@@ -157,16 +157,13 @@ struct MonitorView: View {
                         case .network: network
                         case .processes: ProcessActivityPage(store: store, p: p)
                         case .events: EventTimelinePage(store: store, p: p)
-                        case .dns: DNSLeakPage(store: store.leakChecks, p: p, switchKind: { store.page = $0 == .dns ? .dns : .webrtc })
-                        case .webrtc: WebRTCLeakPage(store: store.leakChecks, p: p, switchKind: { store.page = $0 == .dns ? .dns : .webrtc })
-                        case .claudeAI: AIInspectorPage(service: .claude, store: store, probes: store.aiChecks, p: p)
-                        case .ipScore: NetCoffeeScorePage(store: store.netCoffee, p: p)
-                        case .gptAI: AIInspectorPage(service: .gpt, store: store, probes: store.aiChecks, p: p)
+                        case .panorama, .dns, .webrtc, .claudeAI, .ipScore, .gptAI:
+                            NetworkPanoramaPage(store: store, ipIntel: store.ipIntel, aiChecks: store.aiChecks, leakChecks: store.leakChecks, p: p)
                         case .environment: taskPage(.environment)
                         case .switcher: taskPage(.accounts)
                         case .protection: taskPage(.protection)
                         }
-                        if store.page.isLeakCheck || store.page == .ipScore {
+                        if store.page.isDiagnosticWorkbench {
                             PageLink(title: "返回环境状态", p: p) { store.page = .environment }
                                 .frame(maxWidth: .infinity, alignment: .leading)
                         }
@@ -243,13 +240,15 @@ struct MonitorView: View {
         SwitcherPage(store: store.switcher, p: p, monitor: store, desktopPresence: store.desktopPresence,
                      section: section, navigate: { target in
             store.page = target == .environment ? .environment : target == .accounts ? .switcher : .protection
-        }, openLeakCheck: { kind in store.page = kind == .dns ? .dns : .webrtc },
-        openNetwork: store.showConnections, openIPScore: { ip in
-            store.netCoffee.selectedForPage(ip)
-            store.netCoffee.query = ip
-            store.page = .ipScore
+        }, openLeakCheck: { _ in
+            store.panoramaFocus = .leaks
+            store.page = .panorama
+        }, openNetwork: store.showConnections, openIPScore: { ip in
+            store.panoramaFocus = .ipIntel
+            store.ipIntel.focusAndQuery(ip)
+            store.page = .panorama
         }, channelState: store.channelState(for:), leakChecks: store.leakChecks,
-        netCoffee: store.netCoffee, managedEntryControl: store.managedEntryControl, finished: { store.page = .environment })
+        ipIntel: store.ipIntel, managedEntryControl: store.managedEntryControl, finished: { store.page = .environment })
     }
 
     private func navRow(_ page: Page) -> some View {
@@ -379,11 +378,8 @@ struct MonitorView: View {
         case .network: return "查看已观测的连接路径，区分实际证据与配置参考"
         case .processes: return "最近采样到的 AI 应用及关联进程"
         case .events: return "检索最近的监控事件与原始记录"
-        case .dns: return "采集递归出口，按预期解析器核对；无结果保持未完成"
-        case .webrtc: return "比较本机原生 ICE / STUN 候选与同轮 HTTP 出口"
-        case .claudeAI: return "核对 Claude 域名的代理诊断、入口响应与现有连接"
-        case .ipScore: return "读取 Net.Coffee 评分与原始 IP 资料"
-        case .gptAI: return "核对 ChatGPT 与 API 入口响应，并查看现有连接证据"
+        case .panorama, .dns, .webrtc, .claudeAI, .ipScore, .gptAI:
+            return Page.panorama.caption
         case .switcher: return Page.switcher.caption
         case .environment: return Page.environment.caption
         case .protection: return Page.protection.caption
@@ -411,14 +407,8 @@ struct MonitorView: View {
             SampleTimestamp(source: store.switcher, label: "启动条件采样") { $0.currentPolicyEvaluation?.observed_at }
         case .protection:
             SampleTimestamp(source: store.switcher, label: "后台状态读取") { $0.background?.observed_at }
-        case .claudeAI, .gptAI:
-            let service: AIService = store.page == .claudeAI ? .claude : .gpt
-            SampleTimestamp(source: store.aiChecks, label: "服务检测") { $0.state(service).result?.finishedAt }
-        case .dns, .webrtc:
-            let dns = store.page == .dns
-            SampleTimestamp(source: store.leakChecks, label: "最近检测") { (dns ? $0.dns : $0.rtc).result?.finishedAt }
-        case .ipScore:
-            SampleTimestamp(source: store.netCoffee, label: "IP 资料查询") { $0.report($0.selectedIP)?.queriedAt }
+        case .panorama, .claudeAI, .gptAI, .dns, .webrtc, .ipScore:
+            SampleTimestamp(source: store.ipIntel, label: "全景风控采样") { $0.currentReport?.finishedAt }
         case .network:
             let display = store.graphDisplay(for: store.networkSelection.product)
             Text(display.sample.map { (display.isHistorical ? "历史连接采样于 " : "连接采样于 ") + timeText($0.observedAt) } ?? "等待连接采样")
@@ -445,7 +435,7 @@ struct MonitorView: View {
                     Spacer(minLength: 16)
                     VStack(alignment: .trailing, spacing: 7) {
                         Badge(text: store.error != nil ? "读取失败" : !store.automatic ? "界面刷新暂停" : store.live ? "心跳正常" : "待核对", color: statusTint)
-                        PageLink(title: "查看后台保护", p: p) { store.page = .protection }
+                        PageLink(title: "查看保护与设置", p: p) { store.page = .protection }
                     }
                 }
                 VStack(alignment: .leading, spacing: 7) {
@@ -572,7 +562,22 @@ struct MonitorView: View {
 
     private var network: some View {
         Group {
-            ManagedVpnPanel(store: store.managedVpn, p: p)
+            if store.managedVpn.mode == .managed {
+                Surface(p, padding: 12) {
+                    HStack(spacing: 10) {
+                        Image(systemName: "lock.shield.fill")
+                            .foregroundStyle(p.mint)
+                        Text("当前受控 AI 通道正运行于「独立内置 VPN」只读监控态"
+                             + (store.managedVpn.selectedNode.map { " · 节点：\($0.name)" } ?? ""))
+                            .font(WatchTypography.caption)
+                            .foregroundStyle(p.text)
+                        Spacer()
+                        PageLink(title: "前往保护与设置切换节点", p: p) {
+                            store.page = .protection
+                        }
+                    }
+                }
+            }
             ConnectionGraphView(store: store, p: p)
             ConnectionInventoryView(store: store, p: p)
             Surface(p) {
@@ -749,6 +754,13 @@ struct ClaudeWatchApp: App {
                         Task { await store.checkForUpdates() }
                     }
                     .disabled(!initialization.entered || store.checkingForUpdate || store.switcher.busy || store.switcher.hasUnsavedSettings)
+                }
+                CommandGroup(replacing: .appSettings) {
+                    Button("保护与设置…") {
+                        store.page = .protection
+                    }
+                    .keyboardShortcut(",", modifiers: .command)
+                    .disabled(!initialization.entered)
                 }
                 CommandGroup(replacing: .newItem) {}
                 CommandMenu("页面") {

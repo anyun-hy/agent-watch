@@ -9,6 +9,7 @@ mod diagnostic_queue;
 mod dns_dispatch;
 mod gateway_endpoint_check;
 mod install_dispatch;
+mod ip_intel_dispatch;
 mod maintenance_dispatch;
 mod process_inventory;
 mod reference_dispatch;
@@ -452,10 +453,18 @@ fn run() -> Result<EngineOutput> {
         return Ok(EngineOutput::json(daemon_run::run(&request, paths)?, 0));
     }
     if request.command == "dns-probe" {
-        use claude_watch_runtime::network_client::{NetworkClient, UreqTransport, default_proxy_url};
+        use claude_watch_runtime::network_client::{NetworkClient, UreqTransport};
         let storage = claude_watch_runtime::storage::StateStore::new(paths.clone());
-        let active_proxy = claude_watch_runtime::managed_vpn::active_upstream_endpoint(&storage)
-            .unwrap_or_else(|| default_proxy_url().into());
+        let active_proxy = match ip_intel_dispatch::resolve_controlled_proxy(&storage) {
+            Ok(p) => p,
+            Err(reason) => {
+                let now = claude_watch_runtime::native::now();
+                return Ok(EngineOutput::json(
+                    json!({"kind":"dns","status":"error","startedAt":now,"finishedAt":now,"scope":"managed_vpn_inactive","observations":[],"errors":[{"stage":"proxy","code":"managed_vpn_inactive","message":reason}],"contextChanged":false,"details":[]}),
+                    0,
+                ));
+            }
+        };
         let runner = runtime::runner()?;
         let network = NetworkClient::new(
             std::sync::Arc::new(UreqTransport),
@@ -470,6 +479,9 @@ fn run() -> Result<EngineOutput> {
     if let Some(value) = ai_dispatch::dispatch(&request, paths.clone())? {
         // A partial/timeout observation is still a valid JSON receipt for the
         // GUI, matching the Python collector's zero exit behaviour.
+        return Ok(EngineOutput::json(value, 0));
+    }
+    if let Some(value) = ip_intel_dispatch::dispatch(&request, paths.clone())? {
         return Ok(EngineOutput::json(value, 0));
     }
     if let Some(value) = vpn_dispatch::dispatch(&request, paths.clone())? {

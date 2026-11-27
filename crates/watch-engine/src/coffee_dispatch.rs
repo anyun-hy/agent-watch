@@ -4,7 +4,7 @@ use claude_watch_core::{
     error::{CoreError, Result},
 };
 use claude_watch_runtime::{
-    network_client::{NetworkClient, Receipt, UreqTransport, default_proxy_url},
+    network_client::{NetworkClient, Receipt, UreqTransport},
     storage::{Paths, StateStore},
 };
 use serde_json::{json, Value};
@@ -143,19 +143,59 @@ pub fn dispatch(request: &Request, paths: Paths) -> Result<Option<Value>> {
         return Err(CoreError::new("invalid_arguments", "查询参数不能为空"));
     }
     let storage = StateStore::new(paths);
-    let active_proxy = claude_watch_runtime::managed_vpn::active_upstream_endpoint(&storage)
-        .unwrap_or_else(|| default_proxy_url().into());
+    let active_proxy = match crate::ip_intel_dispatch::resolve_controlled_proxy(&storage) {
+        Ok(p) => p,
+        Err(reason) => {
+            return Ok(Some(json!({
+                "kind": kind,
+                "query": query,
+                "sourceURL": "",
+                "queriedAt": claude_watch_runtime::native::now(),
+                "finishedAt": claude_watch_runtime::native::now(),
+                "status": "error",
+                "httpStatus": Value::Null,
+                "raw": "",
+                "data": Value::Null,
+                "error": reason,
+                "transport": "managed_vpn_inactive",
+                "cache_state": "miss",
+                "last_good": Value::Null
+            })));
+        }
+    };
     let network = NetworkClient::new(Arc::new(UreqTransport), Some(active_proxy))
         .map_err(|error| CoreError::new(&error.code, &error.detail))?
         .with_state_store(storage);
     let receipt = match kind {
-        "lookup" | "geoip" | "risk" => network.metadata(kind, query),
-        "dns" => network.netcoffee_dns(query),
+        "lookup" | "geoip" => network.metadata(kind, query),
         "trace" => network.trace("https://1.1.1.1/cdn-cgi/trace"),
+        "risk" | "dns" => {
+            let now = claude_watch_runtime::native::now();
+            Receipt {
+                kind: kind.into(),
+                query: query.into(),
+                source_url: String::new(),
+                queried_at: now,
+                finished_at: now,
+                status: "error".into(),
+                http_status: None,
+                raw: String::new(),
+                data: None,
+                error: Some("旧版 Net.Coffee 接口已退役，请使用 watch-engine ip-intel".into()),
+                context_id: None,
+                measurement_at: None,
+                response_headers: std::collections::HashMap::new(),
+                transport: "retired".into(),
+                cache_state: "miss".into(),
+                cache_age: None,
+                retry_after: None,
+                last_good: None,
+            }
+        }
         _ => {
             return Err(CoreError::new(
                 "invalid_arguments",
-                "不支持的 Net.Coffee 查询类型",
+                "不支持的元数据查询类型",
             ))
         }
     };
@@ -193,7 +233,7 @@ mod tests {
         Receipt {
             kind: "lookup".into(),
             query: "1.1.1.1".into(),
-            source_url: "https://ip.net.coffee/api/ip/lookup/1.1.1.1".into(),
+            source_url: "https://api.ipapi.is/?q=1.1.1.1".into(),
             queried_at: 1_700_000_000.0,
             finished_at: 1_700_000_000.25,
             status: "complete".into(),
@@ -255,7 +295,7 @@ mod tests {
         let entry = &value["log"]["entries"][0];
         assert_eq!(
             entry["request"]["url"],
-            "https://ip.net.coffee/api/ip/lookup/1.1.1.1"
+            "https://api.ipapi.is/?q=1.1.1.1"
         );
         assert_eq!(entry["response"]["content"]["text"], r#"{"ip":"1.1.1.1"}"#);
         assert_eq!(entry["request"]["headers"], json!([]));

@@ -390,8 +390,8 @@ struct StatusBarPopoverView: View {
         let items: [(String, String, Page)] = [
             ("环境状态", Page.environment.symbol, .environment),
             ("启动与账号", Page.switcher.symbol, .switcher),
-            ("后台保护", Page.protection.symbol, .protection),
-            ("事件与诊断", Page.events.symbol, .events),
+            ("保护与设置", Page.protection.symbol, .protection),
+            ("网络全景诊断", Page.panorama.symbol, .panorama),
         ]
         return LazyVGrid(columns: [GridItem(.flexible(), spacing: 6), GridItem(.flexible(), spacing: 6)], spacing: 6) {
             ForEach(items, id: \.0) { title, symbol, destination in

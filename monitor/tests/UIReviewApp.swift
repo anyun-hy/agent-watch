@@ -59,14 +59,17 @@ struct ClaudeWatchUIReviewApp: App {
                     Button(scenario.rawValue) { session.store.aiChecks.loadFixture(scenario) }
                 }
             }
-            CommandMenu("GPT 设计预览") {
-                ForEach(GPTDiagnosticLayout.allCases, id: \.self) { layout in
-                    Button(layout.rawValue) { session.gptLayout = layout; session.store.page = .gptAI }
+            CommandMenu("全景诊断聚焦") {
+                ForEach(PanoramaFocusSection.allCases) { sec in
+                    Button(sec.rawValue) {
+                        session.store.panoramaFocus = sec
+                        session.store.page = .panorama
+                    }
                 }
                 Divider()
                 Button("结果已过期") {
                     session.store.aiChecks.now = Date().addingTimeInterval(301)
-                    session.store.page = .gptAI
+                    session.store.page = .panorama
                 }
             }
         }
@@ -78,7 +81,6 @@ private struct UIReviewRoot: View {
 
     var body: some View {
         MonitorView(store: session.store, startMonitoring: false, restoresNavigation: false, refreshAction: session.refresh)
-            .environment(\.gptDiagnosticLayout, session.gptLayout)
             .toolbar {
                 ToolbarItem(placement: .principal) {
                     Text("模拟数据 · 界面验收")
@@ -92,7 +94,6 @@ private struct UIReviewRoot: View {
 @MainActor
 private final class UIReviewSession: ObservableObject {
     let store = MonitorStore()
-    @Published var gptLayout: GPTDiagnosticLayout = .inspector
     private var currentScenario: UIReviewScenario = .loading
     private var graphClock = UIReviewFixtures.epoch + 100
 
@@ -102,8 +103,7 @@ private final class UIReviewSession: ObservableObject {
         apply(.namedServices)
         store.aiChecks.loadFixture(.ready)
         store.leakChecks.loadFixture(.matched)
-        store.leakChecks.loadRecordedCoffeeFixture()
-        store.netCoffee.fetchAI("8.8.8.8")
+        store.ipIntel.loadFixture()
         store.networkSelection.product = .openAI
         applyEnvironmentScenario(.normal)
     }

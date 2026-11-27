@@ -1,4 +1,5 @@
 #![forbid(unsafe_code)]
+#![recursion_limit = "256"]
 
 //! Pure policy functions. No I/O, clocks, process control, account access or launch authority.
 //! A matching proxy chain does not establish connection identity or prove absence of leaks.
@@ -12,6 +13,7 @@ pub mod controlled_launch;
 pub mod error;
 pub mod evidence;
 pub mod guard_event;
+pub mod ip_intel;
 pub mod json_value;
 pub mod network;
 pub mod observation;

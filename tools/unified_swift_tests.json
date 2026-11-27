@@ -697,10 +697,10 @@
       "safety_notes": "Synthetic timestamps and context strings only."
     },
     {
-      "id": "swift.NetCoffeeStoreTests",
+      "id": "swift.IpIntelStoreTests",
       "kind": "swift",
       "test_files": [
-        "monitor/tests/NetCoffeeStoreTests.swift"
+        "monitor/tests/IpIntelStoreTests.swift"
       ],
       "sources": [
         "monitor/Sources/*.swift"
@@ -716,7 +716,7 @@
       ],
       "dependencies": [],
       "fixture_only": true,
-      "safety_notes": "UI_REVIEW makes default stores fixture-backed; manually ingested receipts, no Coffee request."
+      "safety_notes": "UI_REVIEW makes default stores fixture-backed; verifies unified Panorama page routing and IpIntelStore contracts offline."
     },
     {
       "id": "swift.NetCoffeeTests",

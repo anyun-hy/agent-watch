@@ -39,6 +39,7 @@ mod executable_verification;
 pub mod fakeip_probe;
 pub mod guard_diagnostics;
 mod guard_readiness;
+pub mod ip_intel_collector;
 pub mod lease_store;
 pub mod local_http;
 pub mod macos;

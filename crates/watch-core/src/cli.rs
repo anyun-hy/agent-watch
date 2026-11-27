@@ -150,6 +150,7 @@ impl Request {
             "observe" => (&[], &["json", "processes-only"], &["home"]),
             "snapshot" => (&[], &["full", "without-channel-events"], &[]),
             "ai-probe" => (&[], &[], &["service"]),
+            "ip-intel" => (&[], &[], &["ip"]),
             "dns-probe" => (&[], &[], &[]),
             "server-reference" => (&[], &[], &["host", "ip"]),
             "coffee" => (
@@ -271,7 +272,7 @@ impl Request {
         {
             return Err(invalid());
         }
-        if command == "ai-probe" && !matches!(request.value("service"), Some("claude" | "gpt")) {
+        if command == "ai-probe" && !matches!(request.value("service"), Some("claude" | "gpt" | "all")) {
             return Err(invalid());
         }
         if command == "server-reference" && request.value("host").is_none() {

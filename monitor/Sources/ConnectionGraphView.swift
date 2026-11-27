@@ -28,7 +28,7 @@ private struct ManagedEntryReadonlyStrip: View {
                 Badge(text: state.busy ? "读取中" : "状态待读取", color: p.secondary)
             }
             Spacer(minLength: 12)
-            PageLink(title: "前往后台保护配置", p: p, action: onOpenProtection)
+            PageLink(title: "前往保护与设置", p: p, action: onOpenProtection)
         }
         .padding(.horizontal, 23).padding(.vertical, 8)
         .background(p.elevated.opacity(0.22))

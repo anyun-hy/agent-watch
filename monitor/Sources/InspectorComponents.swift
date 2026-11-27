@@ -13,6 +13,7 @@ struct InspectorStyle {
     var border: Color { p.border.opacity(p.dark ? 0.55 : 0.65) }
     func pageIcon(_ page: Page) -> Color {
         switch page {
+        case .panorama: return network
         case .ipScore: return service
         case .claudeAI: return service
         case .gptAI: return proxy
