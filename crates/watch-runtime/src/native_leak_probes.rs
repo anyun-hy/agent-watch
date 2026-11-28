@@ -1277,6 +1277,8 @@ mod tests {
         assert_eq!(dns_rec["comparison"]["state"], "ok");
         assert_eq!(dns_rec["comparison"]["reason"], "fake_ip_intercepted");
         assert_eq!(dns_rec["dns"]["countries"], json!(["JP"]));
+        let status_view = receipts::dns_status(&dns_rec, &Value::Null, "ctx-tag-jp", false, 1002.0, |at| format!("{at:.0}"));
+        assert!(status_view["detail"].as_str().unwrap_or("").contains("Fake-IP"));
 
         let rtc_probe = json!({
             "provider": "native",

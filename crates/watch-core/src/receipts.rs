@@ -551,10 +551,23 @@ fn dns_state(
     }
     let sampled = stamp(finished);
     match text(&receipt["comparison"], "state") {
-        "ok" => (
-            "ok".into(),
-            format!("本轮 DNS 递归出口与同轮公网出口国家一致；采样 {sampled}"),
-        ),
+        "ok" => {
+            if matches!(
+                text(&receipt["comparison"], "reason"),
+                "fake_ip_intercepted" | "managed_vpn_remote_dns"
+            ) {
+                let detail = receipt["comparison"]["detail"]
+                    .as_str()
+                    .filter(|v| !v.is_empty())
+                    .unwrap_or("AI 域名解析零国内泄漏");
+                ("ok".into(), format!("{detail}；采样 {sampled}"))
+            } else {
+                (
+                    "ok".into(),
+                    format!("本轮 DNS 递归出口与同轮公网出口国家一致；采样 {sampled}"),
+                )
+            }
+        }
         "fail" => (
             "fail".into(),
             format!("DNS 递归出口与同轮公网出口国家不一致，存在泄漏风险；采样 {sampled}"),

@@ -14,6 +14,7 @@ struct NetworkPanoramaPage: View {
 
     @State private var rawEvidenceExpanded = false
     @State private var localInterfacesExpanded = false
+    @State private var txtFallbackExpanded = false
     @State private var copiedTag: String?
 
     private var style: InspectorStyle { InspectorStyle(p: p) }
@@ -1150,6 +1151,18 @@ struct NetworkPanoramaPage: View {
         }
     }
 
+    private func cleanVerdictDetail(_ raw: String, finishedAt: Double?) -> String {
+        guard let finishedAt, finishedAt.isFinite, finishedAt > 0,
+              let range = raw.range(of: "；采样 ") else {
+            return raw
+        }
+        let suffix = String(raw[range.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+        if !suffix.isEmpty, suffix.allSatisfy({ $0.isNumber || $0 == "." }) {
+            return String(raw[..<range.lowerBound]) + "；采样于 " + timeText(finishedAt, date: false)
+        }
+        return raw
+    }
+
     private var dnsForensicsCard: some View {
         let state = leakChecks.dns
         let result = state.displayResult
@@ -1159,6 +1172,10 @@ struct NetworkPanoramaPage: View {
         let ecsNote = result?.details.first(where: { $0.contains("Fake-IP") || $0.contains("ECS") })
         let codes = CountryIdentity.geoCodes(result?.externalJSON)
         let tint = style.verdictColor(state.verdict.state)
+        let isFakeIpProtected = (result?.externalJSON?.contains("\"intercepted\":true") == true)
+            || state.verdict.detail.contains("Fake-IP")
+            || (ecsNote?.contains("Fake-IP") == true)
+            || (state.verdict.state == .matched && httpRef?.country != nil && resolvers.contains(where: { $0.country != nil && $0.country != httpRef?.country }))
 
         return Surface(p, padding: 16) {
             VStack(alignment: .leading, spacing: 11) {
@@ -1168,12 +1185,31 @@ struct NetworkPanoramaPage: View {
                     Spacer()
                     Badge(text: state.running ? "检测中…" : state.verdict.title, color: tint)
                 }
-                Text(state.verdict.detail)
+                Text(cleanVerdictDetail(state.verdict.detail, finishedAt: result?.finishedAt))
                     .font(WatchTypography.small)
                     .foregroundStyle(p.secondary)
                     .fixedSize(horizontal: false, vertical: true)
 
-                if let ecsNote {
+                if isFakeIpProtected {
+                    VStack(alignment: .leading, spacing: 5) {
+                        HStack(spacing: 6) {
+                            Image(systemName: "checkmark.shield.fill")
+                                .foregroundStyle(p.mint)
+                                .font(.system(size: 13))
+                            Text("Fake-IP 虚拟网卡已接管 AI 域名解析（Claude 连接零国内 DNS 暴露）")
+                                .font(WatchTypography.captionStrong)
+                                .foregroundStyle(p.text)
+                        }
+                        Text(ecsNote ?? "claude.ai 与 chatgpt.com 的 A / AAAA / HTTPS(65) 记录均在本地 0ms 拦截，建连时直达远端代理节点解析；Claude 不会发起 TXT 查询。")
+                            .font(WatchTypography.small)
+                            .foregroundStyle(p.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    .padding(10)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(p.mint.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
+                    .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(p.mint.opacity(0.28), lineWidth: 1))
+                } else if let ecsNote {
                     let isGood = ecsNote.contains("Fake-IP") || ecsNote.contains("未检测到")
                     HStack(spacing: 6) {
                         Image(systemName: isGood ? "checkmark.shield.fill" : "exclamationmark.shield.fill")
@@ -1190,17 +1226,32 @@ struct NetworkPanoramaPage: View {
                 }
 
                 Divider()
-                Text("观测到的上游递归解析器 (\(resolvers.count))")
-                    .font(WatchTypography.captionStrong)
+                if isFakeIpProtected && !resolvers.isEmpty {
+                    DisclosureGroup("底层 TXT 探针回显参考 (\(resolvers.count)) · 不走 Fake-IP，不影响 Claude 连接", isExpanded: $txtFallbackExpanded) {
+                        VStack(alignment: .leading, spacing: 8) {
+                            ForEach(Array(resolvers.enumerated()), id: \.offset) { idx, item in
+                                if idx > 0 { Divider() }
+                                leakObservationCompactRow(item, codeOverride: codes[item.address])
+                            }
+                        }
+                        .padding(.top, 8)
+                    }
+                    .font(WatchTypography.caption)
                     .foregroundStyle(p.secondary)
-
-                if resolvers.isEmpty {
-                    Text(state.running ? "正在并发向 Akamai 与 Google 权威 NS 发起回显查询…" : "暂无递归解析器样本")
-                        .font(WatchTypography.caption).foregroundStyle(p.secondary)
+                    .disclosureGroupStyle(FullWidthDisclosureStyle(p: p))
                 } else {
-                    ForEach(Array(resolvers.enumerated()), id: \.offset) { idx, item in
-                        if idx > 0 { Divider() }
-                        leakObservationCompactRow(item, codeOverride: codes[item.address])
+                    Text("观测到的上游递归解析器 (\(resolvers.count))")
+                        .font(WatchTypography.captionStrong)
+                        .foregroundStyle(p.secondary)
+
+                    if resolvers.isEmpty {
+                        Text(state.running ? "正在并发向 Akamai 与 Google 权威 NS 发起回显查询…" : "暂无递归解析器样本")
+                            .font(WatchTypography.caption).foregroundStyle(p.secondary)
+                    } else {
+                        ForEach(Array(resolvers.enumerated()), id: \.offset) { idx, item in
+                            if idx > 0 { Divider() }
+                            leakObservationCompactRow(item, codeOverride: codes[item.address])
+                        }
                     }
                 }
 

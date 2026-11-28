@@ -2,6 +2,12 @@
 
 该摘要根据现有源码和版本发布记录整理。后续版本遵循语义化版本（SemVer）：缺陷修复递增 patch，功能/品牌升级递增 minor，破坏性架构变更递增 major。
 
+## 4.4.2 — 2026-11-28
+
+- **优化 `Fake-IP` / `独立内置 VPN` 模式下的 DNS 裁决文案与展示层级**：
+  - `watch-core::receipts::dns_state` 在通过原因为 `fake_ip_intercepted` 或 `managed_vpn_remote_dns` 时，直接透出「已实证 Fake-IP 本地接管 AI 域名解析 / 独立内置 VPN 沙箱强制远端解析」精确判词，不再与底层 `TXT` 参考地址产生语义冲突。
+  - 「网络全景诊断 → DNS 权威递归解析出口」卡片主区突出展示 `Fake-IP` 本地拦截至远端节点解析状态，格式化采样时间为 `HH:mm:ss`（消除裸 Unix 时间戳），并将不走 Fake-IP 的底层 `TXT` 回显解析器默认折叠收进「底层 TXT 探针回显参考 · 不走 Fake-IP，不影响 Claude 连接」。
+
 ## 4.4.1 — 2026-11-27
 
 - **新增「Claude / AI 安全就绪总评横幅」**：
