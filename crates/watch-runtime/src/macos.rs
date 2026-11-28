@@ -1081,12 +1081,18 @@ impl<R: ReadRunner, T: Transport, M: Mutator> Macos<R, T, M> {
                         .get(country)
                         .is_some_and(|zones| zones.len() == 1)
                 });
+                let mut fallback_geo_receipt: Option<crate::network_client::Receipt> = None;
+                let mut fallback_ip_explicitly_bound = false;
                 if !ip.is_empty()
                     && !conflict
-                    && (geo["country"].is_null() || (geo["timezone"].is_null() && !single_zone_country))
+                    && (!lookup_bound
+                        || geo["country"].is_null()
+                        || (geo["timezone"].is_null() && !single_zone_country))
                 {
                     let fallback = network
                         .metadata_for_context("geoip", context, ip, measured_at);
+                    let need_geo = geo["country"].is_null()
+                        || (geo["timezone"].is_null() && !single_zone_country);
                     if let Some(data) = fallback.data.as_ref().filter(|data| data.is_object()) {
                         let returned_ip = data
                             .get("ip")
@@ -1098,45 +1104,54 @@ impl<R: ReadRunner, T: Transport, M: Mutator> Macos<R, T, M> {
                         };
                         let bound =
                             fallback.status == "complete" && fallback.http_status == Some(200) && ip_bound;
-                        let country = ["countryCode", "country_code", "country"]
-                            .iter()
-                            .filter_map(|key| data.get(*key).and_then(Value::as_str))
-                            .map(|country| country.trim().to_ascii_uppercase())
-                            .find(|country| {
-                                country.len() == 2 && country.bytes().all(|byte| byte.is_ascii_uppercase())
-                            });
-                        if bound && country.as_deref() == trace["loc"].as_str() {
-                            geo = json!({"ip":ip,"country":country,"timezone":data.get("timezone").cloned().unwrap_or(Value::Null),
-                                "country_source":"ipinfo.io geoip fallback","timezone_source":"ipinfo.io geoip fallback"});
-                            geo_sampled_at = Some(fallback.finished_at);
-                        } else if country.is_some() && returned_ip.is_some() {
-                            query_errors["egress_consistency"] = json!({"source":"Cloudflare trace / ipinfo.io","message":"Cloudflare 与 ipinfo.io 备用出口资料不一致"});
-                        } else {
-                            query_errors["geo"] = json!({"source":"ipinfo.io geoip","message":"备用地理响应缺少有效 IP 或国家字段"});
+                        fallback_ip_explicitly_bound = bound && returned_ip.as_deref() == Some(ip);
+                        if need_geo {
+                            let country = ["countryCode", "country_code", "country"]
+                                .iter()
+                                .filter_map(|key| data.get(*key).and_then(Value::as_str))
+                                .map(|country| country.trim().to_ascii_uppercase())
+                                .find(|country| {
+                                    country.len() == 2 && country.bytes().all(|byte| byte.is_ascii_uppercase())
+                                });
+                            if bound && country.as_deref() == trace["loc"].as_str() {
+                                geo = json!({"ip":ip,"country":country,"timezone":data.get("timezone").cloned().unwrap_or(Value::Null),
+                                    "country_source":"ipinfo.io geoip fallback","timezone_source":"ipinfo.io geoip fallback"});
+                                geo_sampled_at = Some(fallback.finished_at);
+                            } else if country.is_some() && returned_ip.is_some() {
+                                query_errors["egress_consistency"] = json!({"source":"Cloudflare trace / ipinfo.io","message":"Cloudflare 与 ipinfo.io 备用出口资料不一致"});
+                            } else {
+                                query_errors["geo"] = json!({"source":"ipinfo.io geoip","message":"备用地理响应缺少有效 IP 或国家字段"});
+                            }
                         }
-                    } else {
+                    } else if need_geo {
                         query_errors["geo"] =
                             json!({"source":"ipinfo.io geoip","message":"备用地理查询未完成"});
                     }
+                    fallback_geo_receipt = Some(fallback);
                 }
-                let asn = lookup_receipt
+                let (asn, organization, asn_receipt, asn_source) = if let Some(primary_asn) = lookup_receipt
                     .as_ref()
                     .filter(|_| lookup_bound)
-                    .and_then(crate::network_client::lookup_asn);
-                let organization = lookup_data
-                    .filter(|_| lookup_bound)
-                    .and_then(|data| {
-                        data.get("asOrganization")
-                            .or_else(|| data.pointer("/asn/org"))
-                            .or_else(|| data.get("asn_org"))
-                            .or_else(|| data.get("org"))
-                    })
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_owned();
+                    .and_then(crate::network_client::lookup_asn)
+                {
+                    let org = lookup_receipt
+                        .as_ref()
+                        .map(crate::network_client::lookup_organization)
+                        .unwrap_or_default();
+                    (Some(primary_asn), org, lookup_receipt.as_ref(), "ipapi.is lookup")
+                } else if let Some(fallback_receipt) = fallback_geo_receipt.as_ref().filter(|_| fallback_ip_explicitly_bound) {
+                    if let Some(fallback_asn) = crate::network_client::lookup_asn(fallback_receipt) {
+                        let org = crate::network_client::lookup_organization(fallback_receipt);
+                        (Some(fallback_asn), org, Some(fallback_receipt), "ipinfo.io + RIPEstat")
+                    } else {
+                        (None, String::new(), None, "ipapi.is lookup")
+                    }
+                } else {
+                    (None, String::new(), None, "ipapi.is lookup")
+                };
                 let mut asn_value =
-                    json!({"number":asn,"organization":organization,"source":"ipapi.is lookup"});
-                if let Some(receipt) = lookup_receipt.as_ref().filter(|_| asn.is_some()) {
+                    json!({"number":asn,"organization":organization,"source":asn_source});
+                if let Some(receipt) = asn_receipt {
                     asn_value["queried_at"] = json!(receipt.finished_at);
                     let number = asn.unwrap();
                     let registration = network.ripe_asn(number);
@@ -1154,6 +1169,11 @@ impl<R: ReadRunner, T: Transport, M: Mutator> Macos<R, T, M> {
                             .chars()
                             .take(80)
                             .collect::<String>());
+                        if !lookup_bound && !conflict && !geo["country"].is_null() {
+                            if let Some(obj) = query_errors.as_object_mut() {
+                                obj.remove("ip_intel");
+                            }
+                        }
                     } else {
                         query_errors["asn"] = json!({"source":"RIPEstat ASN","message":registration.error.unwrap_or_else(||"ASN 注册国家没有返回完整结果".into())});
                     }

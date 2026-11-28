@@ -6,7 +6,7 @@
 //! classification and scoring to `claude_watch_core::ip_intel`.
 
 use crate::{
-    network_client::{ripe_registered_country, NetworkClient, Transport},
+    network_client::{extract_ripe_network_info, ripe_registered_country, NetworkClient, Transport},
     storage::sha256,
 };
 use claude_watch_core::{
@@ -34,19 +34,6 @@ pub fn host_system_timezone() -> Option<String> {
         }
     }
     None
-}
-
-fn default_prefix_for_ip(ip: &str) -> Option<String> {
-    match ip.parse::<std::net::IpAddr>().ok()? {
-        std::net::IpAddr::V4(v4) => {
-            let octets = v4.octets();
-            Some(format!("{}.{}.{}.0/24", octets[0], octets[1], octets[2]))
-        }
-        std::net::IpAddr::V6(v6) => {
-            let segs = v6.segments();
-            Some(format!("{:x}:{:x}:{:x}::/48", segs[0], segs[1], segs[2]))
-        }
-    }
 }
 
 fn fetch_current_trace<T: Transport>(network: &NetworkClient<T>) -> Result<(CloudflareTraceInfo, String), String> {
@@ -119,11 +106,12 @@ pub fn collect_ip_intel<T: Transport>(
     let ip_ref = target_ip.as_str();
     let probe_live_trace = live_trace.is_none();
 
-    // Stage 1: Concurrently query ipapi.is, ipinfo.io, DoH PTR, and (if needed) live edge trace
-    let (ipapi_receipt, ipinfo_receipt, ptr_domains, matched_trace) = std::thread::scope(|scope| {
+    // Stage 1: Concurrently query ipapi.is, ipinfo.io, RIPEstat network-info, DoH PTR, and (if needed) live edge trace
+    let (ipapi_receipt, ipinfo_receipt, netinfo_receipt, ptr_domains, matched_trace) = std::thread::scope(|scope| {
         let c1 = &client;
         let ipapi_task = scope.spawn(move || c1.metadata("lookup", ip_ref));
         let ipinfo_task = scope.spawn(move || c1.metadata("geoip", ip_ref));
+        let netinfo_task = scope.spawn(move || c1.ripe_network_info(ip_ref));
         let ptr_task = scope.spawn(move || c1.doh_ptr(ip_ref));
         let trace_task = probe_live_trace.then(|| {
             scope.spawn(move || {
@@ -140,9 +128,10 @@ pub fn collect_ip_intel<T: Transport>(
 
         let ipapi_r = ipapi_task.join().unwrap();
         let ipinfo_r = ipinfo_task.join().unwrap();
+        let netinfo_r = netinfo_task.join().unwrap();
         let ptr_r = ptr_task.join().unwrap();
         let tr_r = trace_task.and_then(|t| t.join().ok()).flatten();
-        (ipapi_r, ipinfo_r, ptr_r, tr_r)
+        (ipapi_r, ipinfo_r, netinfo_r, ptr_r, tr_r)
     });
 
     let effective_trace = live_trace.or(matched_trace);
@@ -154,9 +143,13 @@ pub fn collect_ip_intel<T: Transport>(
         .then_some(ipinfo_receipt.data.as_ref())
         .flatten();
 
-    // Extract ASN and route prefix for Stage 2 RIR / RPKI verification
+    let (ripe_net_asn, ripe_net_prefix) = extract_ripe_network_info(&netinfo_receipt);
+
+    // Extract ASN and authoritative BGP route prefix for Stage 2 RIR / RPKI verification.
+    // Never fabricate a `/24` guess when ipapi.is fails; use RIPEstat's announced BGP prefix instead.
     let asn_num = crate::network_client::lookup_asn(&ipapi_receipt)
-        .or_else(|| crate::network_client::lookup_asn(&ipinfo_receipt));
+        .or_else(|| crate::network_client::lookup_asn(&ipinfo_receipt))
+        .or(ripe_net_asn);
     let route_prefix = ipapi_data
         .and_then(|d| {
             d.pointer("/asn/route")
@@ -166,7 +159,7 @@ pub fn collect_ip_intel<T: Transport>(
         })
         .filter(|s| s.contains('/'))
         .map(str::to_owned)
-        .or_else(|| default_prefix_for_ip(&target_ip));
+        .or(ripe_net_prefix);
 
     let (ripe_country_receipt, ripe_rpki_receipt) = std::thread::scope(|scope| {
         let c2 = &client;
@@ -203,6 +196,11 @@ pub fn collect_ip_intel<T: Transport>(
             "cache_state": ipinfo_receipt.cache_state,
             "error": ipinfo_receipt.error,
         },
+        "ripestat_netinfo": {
+            "status": netinfo_receipt.status,
+            "http_status": netinfo_receipt.http_status,
+            "cache_state": netinfo_receipt.cache_state,
+        },
         "ripestat_rir": ripe_country_receipt.as_ref().map(|r| json!({
             "status": r.status,
             "http_status": r.http_status,
@@ -231,6 +229,7 @@ pub fn collect_ip_intel<T: Transport>(
         ipinfo: ipinfo_data,
         ripe_rpki: ripe_rpki_data,
         ripe_country: ripe_country.as_deref(),
+        fallback_route: route_prefix.as_deref(),
         ptr_domains: &ptr_domains,
         trace: effective_trace.as_ref(),
         system_timezone: sys_tz.as_deref(),
@@ -275,6 +274,8 @@ mod tests {
                 r#"{"ip":"106.178.149.35","country":"JP","region":"Tokyo","city":"Tokyo","loc":"35.6895,139.6917","org":"AS2516 KDDI CORPORATION","timezone":"Asia/Tokyo"}"#.to_owned()
             } else if req.url.contains("dns-query") {
                 r#"{"Status":0,"Answer":[{"name":"35.149.178.106.in-addr.arpa.","type":12,"TTL":3600,"data":"KD106178149035.ppp.dion.ne.jp."}]}"#.to_owned()
+            } else if req.url.contains("network-info") {
+                r#"{"data":{"prefix":"106.178.0.0/16","asns":["2516"]}}"#.to_owned()
             } else if req.url.contains("rir-stats-country") {
                 r#"{"data":{"located_resources":[{"resource":"2516","location":"JP"}]}}"#.to_owned()
             } else if req.url.contains("rpki-validation") {
@@ -316,5 +317,33 @@ mod tests {
         .unwrap();
         let report = collect_ip_intel(&client, Some("127.0.0.1"), None);
         assert_eq!(report["status"], "error");
+    }
+
+    #[test]
+    fn collector_preserves_100_score_and_real_bgp_prefix_when_ipapi_times_out() {
+        struct IpApiTimeoutTransport;
+        impl Transport for IpApiTimeoutTransport {
+            fn get(&self, req: &Request) -> Result<Response, TransportError> {
+                if req.url.starts_with("https://api.ipapi.is/") {
+                    return Err(TransportError::new("transport", "unexpected eof while reading"));
+                }
+                if req.url.contains("rpki-validation") && !req.url.contains("prefix=106.178.0.0/16") {
+                    return Err(TransportError::new("bad_prefix", &req.url));
+                }
+                MockIntelTransport.get(req)
+            }
+        }
+        let client = NetworkClient::new(
+            Arc::new(IpApiTimeoutTransport),
+            Some("http://127.0.0.1:7890".into()),
+        )
+        .unwrap();
+        let report = collect_ip_intel(&client, None, Some("Asia/Tokyo"));
+        assert_eq!(report["status"], "complete");
+        assert_eq!(report["cidr"], "106.178.0.0/16");
+        assert_eq!(report["asn_kind"], "isp");
+        assert_eq!(report["rpki"]["status"], "valid");
+        assert_eq!(report["abuser"]["company"]["tier_zh"], "待重试");
+        assert_eq!(report["score"]["value"], 100);
     }
 }

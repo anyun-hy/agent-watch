@@ -39,6 +39,7 @@ use claude_watch_runtime::{
 use claude_watch_system::network_events::{NetworkEventKind, NetworkEventWatcher};
 use serde_json::{json, Value};
 use std::{
+    collections::BTreeSet,
     os::{fd::AsFd, unix::net::UnixStream},
     path::PathBuf,
     sync::{
@@ -170,6 +171,7 @@ pub struct ProductionChannelStack {
     sampling_wake: Option<UnixStream>,
     backend_refresh_requested: bool,
     active_guard: Arc<ActiveGuardState>,
+    auto_adopt_handoff_seen: BTreeSet<(u32, u64, u32)>,
     #[cfg(all(test, target_os = "macos"))]
     private_loopback_backend: bool,
 }
@@ -525,6 +527,9 @@ fn spawn_vpn_observation_worker(
             let initial_cfg = config_store.resolve_runtime_config_state(packaged_backend).config;
             let mut active_vpn_mode = initial_cfg.effective_vpn_source_mode();
             let mut active_managed_cfg = initial_cfg.managed_vpn.clone().unwrap_or_default();
+            let mut last_pushed_cfg = initial_cfg.clone();
+            let mut managed_state_written =
+                active_vpn_mode == claude_watch_core::vpn_profile::VpnSourceMode::Managed;
             let mut expectation = initial_cfg.vpn_expectation.unwrap_or_else(VpnExpectation::unconfigured);
             let mut managed_proc: Option<claude_watch_runtime::managed_vpn::ManagedVpnProcess> = None;
             let mut managed_epoch_gen: u64 = 0;
@@ -671,25 +676,46 @@ fn spawn_vpn_observation_worker(
                 }
                 let mut invalidation = None;
                 let mut wake = false;
+                let mut sync_config_event = |invalidation: &mut Option<String>, refresh: &mut bool| {
+                    let resolved_cfg = config_store.resolve_runtime_config_state(packaged_backend);
+                    let updated = resolved_cfg
+                        .config
+                        .vpn_expectation
+                        .clone()
+                        .unwrap_or_else(VpnExpectation::unconfigured);
+                    let next_mode = resolved_cfg.config.effective_vpn_source_mode();
+                    let next_managed = resolved_cfg.config.managed_vpn.clone().unwrap_or_default();
+                    let vpn_changed = updated != expectation
+                        || next_mode != active_vpn_mode
+                        || next_managed != active_managed_cfg;
+                    let cfg_changed = resolved_cfg.config != last_pushed_cfg;
+                    if vpn_changed {
+                        expectation = updated;
+                        active_vpn_mode = next_mode;
+                        active_managed_cfg = next_managed;
+                        watch_configs(&mut watcher, &expectation);
+                        *invalidation = Some("vpn_expectation_changed".into());
+                        *refresh = true;
+                    }
+                    if cfg_changed && resolved_cfg.blocking_reason().is_none() {
+                        last_pushed_cfg = resolved_cfg.config.clone();
+                        let _ = event_tx.send(SupervisionEvent::PolicyUpdated {
+                            config: resolved_cfg.config,
+                            observed_at: now,
+                        });
+                    }
+                };
                 for event in events {
                     match event {
                         NetworkEventKind::WatchedFileChanged(path) if path == storage.paths.config() => {
-                            let resolved_cfg = config_store.resolve_runtime_config_state(packaged_backend);
-                            let updated = resolved_cfg.config.vpn_expectation.clone().unwrap_or_else(VpnExpectation::unconfigured);
-                            let next_mode = resolved_cfg.config.effective_vpn_source_mode();
-                            let next_managed = resolved_cfg.config.managed_vpn.clone().unwrap_or_default();
-                            if updated != expectation || next_mode != active_vpn_mode || next_managed != active_managed_cfg {
-                                expectation = updated;
-                                active_vpn_mode = next_mode;
-                                active_managed_cfg = next_managed;
-                                watch_configs(&mut watcher, &expectation);
-                                invalidation = Some("vpn_expectation_changed".into());
-                            }
-                            if resolved_cfg.blocking_reason().is_none() {
-                                let _ = event_tx.send(SupervisionEvent::PolicyUpdated {
-                                    config: resolved_cfg.config.clone(), observed_at: now,
-                                });
-                            }
+                            sync_config_event(&mut invalidation, &mut refresh);
+                        }
+                        NetworkEventKind::DarwinNotification(name)
+                            if name == "io.local.claudewatch.channel-update" =>
+                        {
+                            // Ignore self-triggered supervision publications unless `config.json`
+                            // itself changed (e.g., dual-mode switch or opt-in policy update).
+                            sync_config_event(&mut invalidation, &mut refresh);
                         }
                         NetworkEventKind::WatchedFileChanged(path) => {
                             let file = path.file_name().and_then(|s| s.to_str()).unwrap_or("watched_file");
@@ -721,6 +747,7 @@ fn spawn_vpn_observation_worker(
                 if custom_reader.is_none()
                     && active_vpn_mode == claude_watch_core::vpn_profile::VpnSourceMode::Managed
                 {
+                    managed_state_written = true;
                     use claude_watch_core::vpn::VpnEpoch;
                     use claude_watch_runtime::managed_vpn::{
                         self, ManagedVpnProcess, ManagedVpnRuntimeState,
@@ -911,11 +938,13 @@ fn spawn_vpn_observation_worker(
                         }
                     }
                     continue;
-                } else if managed_proc.is_some() {
-                    // User switched back to External mode: immediately terminate our managed core.
+                } else if managed_proc.is_some() || managed_state_written {
+                    // User switched back to External mode: immediately terminate our managed core
+                    // and clear any stale managed error state from disk.
                     drop(managed_proc.take());
                     managed_last_obs_at = None;
                     managed_last_err_code = None;
+                    managed_state_written = false;
                     claude_watch_runtime::managed_vpn::write_runtime_state(
                         &storage,
                         &claude_watch_runtime::managed_vpn::ManagedVpnRuntimeState {
@@ -1371,6 +1400,7 @@ where F: Fn(&AsyncAuditRequest) -> Result<(Value, Value, f64)> + Send + Sync + '
         sampling_wake,
         backend_refresh_requested: false,
         active_guard,
+        auto_adopt_handoff_seen: BTreeSet::new(),
         #[cfg(all(test, target_os = "macos"))]
         private_loopback_backend: false,
     };
@@ -1555,8 +1585,10 @@ impl ProductionChannelStack {
         if matches!(&event, SupervisionEvent::PolicyUpdated { .. } | SupervisionEvent::ExecutorRestarted { .. }) {
             self.backend_refresh_requested = true;
         }
-        if let SupervisionEvent::ProcessInventoryUpdated { family, processes, .. } = &event {
+        if let SupervisionEvent::ProcessInventoryUpdated { family, desktops, processes, .. } = &event {
             if let Some(reg) = &self.sandbox_registry {
+                let auto_adopt = self.supervisor.config().auto_adopt_desktop_for_family(family);
+                let vpn_mode = self.supervisor.config().effective_vpn_source_mode();
                 let verified_tokens = reg.verified_family_tokens(family, delivered_at);
                 let mut protected_pids: Vec<u32> = processes
                     .iter()
@@ -1564,11 +1596,81 @@ impl ProductionChannelStack {
                         verified_tokens
                             .iter()
                             .any(|verified| verified.same_verified_kernel_identity(token))
+                            || (auto_adopt
+                                && vpn_mode == claude_watch_core::vpn_profile::VpnSourceMode::External
+                                && token.role.desktop())
                     })
                     .map(|t| t.pid)
                     .collect();
                 protected_pids.sort_unstable();
                 protected_pids.dedup();
+                if auto_adopt
+                    && vpn_mode == claude_watch_core::vpn_profile::VpnSourceMode::Managed
+                    && self.activate_local_interception
+                {
+                    for (desktop, _is_main, _) in desktops {
+                        if protected_pids.contains(&desktop.pid) {
+                            continue;
+                        }
+                        let key = (desktop.pid, desktop.start_seconds, desktop.start_microseconds);
+                        if !self.auto_adopt_handoff_seen.insert(key) {
+                            continue;
+                        }
+                        if self.auto_adopt_handoff_seen.len() > 128 {
+                            self.auto_adopt_handoff_seen.clear();
+                            self.auto_adopt_handoff_seen.insert(key);
+                        }
+                        let home_dir = self.supervisor.storage.paths.home.clone();
+                        let family_owned = family.clone();
+                        let desktop_copy = desktop.clone();
+                        let _ = thread::Builder::new()
+                            .name("auto-adopt-handoff".into())
+                            .spawn(move || {
+                                let Some(identity) = claude_watch_system::inspect_process_identity(desktop_copy.pid) else {
+                                    return;
+                                };
+                                if identity.start_seconds != desktop_copy.start_seconds
+                                    || identity.start_microseconds != desktop_copy.start_microseconds
+                                {
+                                    return;
+                                }
+                                let target_flag = if family_owned == "claude" {
+                                    "claude-desktop"
+                                } else if identity.executable_path.to_ascii_lowercase().contains("codex.app") {
+                                    "codex-desktop"
+                                } else {
+                                    "chatgpt-desktop"
+                                };
+                                let signal = claude_watch_system::terminate_bound_process(&identity);
+                                if !matches!(
+                                    signal,
+                                    claude_watch_system::BoundSignalResult::Sent
+                                        | claude_watch_system::BoundSignalResult::AlreadyExited
+                                ) {
+                                    return;
+                                }
+                                let wait_until = Instant::now() + Duration::from_secs(3);
+                                while !claude_watch_system::bound_lifetime_exited(&identity) {
+                                    if Instant::now() >= wait_until {
+                                        return;
+                                    }
+                                    thread::sleep(Duration::from_millis(50));
+                                }
+                                if let Ok(engine) = std::env::current_exe() {
+                                    let _ = std::process::Command::new(engine)
+                                        .args([
+                                            "launch",
+                                            "--home",
+                                            &home_dir.to_string_lossy(),
+                                            "--target",
+                                            target_flag,
+                                            "--apply",
+                                        ])
+                                        .status();
+                                }
+                            });
+                    }
+                }
                 let mut unprotected_pids: Vec<u32> = processes.iter()
                     .filter(|t| !protected_pids.contains(&t.pid)).map(|t| t.pid).collect();
                 unprotected_pids.sort_unstable();

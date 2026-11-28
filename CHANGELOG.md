@@ -2,6 +2,15 @@
 
 该摘要根据现有源码和版本发布记录整理。后续版本遵循语义化版本（SemVer）：缺陷修复递增 patch，功能/品牌升级递增 minor，破坏性架构变更递增 major。
 
+## 4.4.3 — 2026-11-29
+
+- **修复 VPN 双模式切换 `observer_boot_id` 互锁与守护通道假不可用**：
+  - `ChannelSupervisor` 在 `PolicyUpdated` 检测到 `vpn_source_mode`（复用本机 VPN / 独立内置 VPN）切换时，清理旧模式的 `latest_vpn_observation` 与 `observer_boot_id` 锁死状态，并由守护线程监听 `channel-update` 通知在切回外部模式时同步将 `managed-vpn-state.json` 置为 `inactive`，消除「保护后台不可用 / unknown」假警。
+- **修复 `api.ipapi.is` TLS 偶发重置导致 RPKI `-10` 误扣分与 `ASN 属性` 未取得**：
+  - 彻底移除硬猜 `/24` 的 `default_prefix_for_ip`，改为并发查询官方 `RIPEstat network-info` 获取真实 BGP 路由前缀（如 `106.178.0.0/16`）与 ASN，还原准确的 `Valid`（100 分）RPKI 校验；在 `ipapi.is` 限流时自动降级使用 `ipinfo.io` 明确 IP 绑定记录 + `RIPEstat RIR` + `DoH PTR` 补全 ASN 分类、路由前缀及滥用率提示。
+- **升级桌面「自动接管官方图标启动 (Opt-in · 默认关闭)」，消除双份 `(Controlled)` 空白图标**：
+  - 通过 `watch-engine entry auto-adopt` 在关闭时保持不生成额外 `.app` 且仅作只读观测；按应用手动开启后自动清理旧版 `~/Applications/* (Controlled).app` 包装器，从 Dock / Spotlight 直接点击官方原版图标即可按当前底座模式自动纳入保护或换轨进沙箱。
+
 ## 4.4.2 — 2026-11-28
 
 - **优化 `Fake-IP` / `独立内置 VPN` 模式下的 DNS 裁决文案与展示层级**：

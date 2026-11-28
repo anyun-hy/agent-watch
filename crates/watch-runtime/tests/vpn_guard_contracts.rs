@@ -2699,3 +2699,140 @@ fn initial_adoption_defers_near_expiry_vpn_lease_and_promotes_without_second_aud
     assert_eq!(expired.families["claude"].permit_state, ChannelPermitState::Revoked);
     assert_eq!(expired.families["claude"].reason_code, "vpn_observation_stale");
 }
+
+#[test]
+fn policy_update_switching_vpn_source_mode_retires_previous_observer_boot_id() {
+    use claude_watch_core::vpn_profile::{ManagedVpnConfig, VpnSourceMode};
+
+    let now = 1_800_120_000.0;
+    let (_tmp, store, mut cfg) = setup_store_with_vpn_expectation(|_, _| {});
+    cfg.vpn_source_mode = Some(VpnSourceMode::Managed);
+    cfg.managed_vpn = Some(ManagedVpnConfig {
+        enabled: true,
+        selected_node_id: None,
+        selected_node_name: String::new(),
+        ..Default::default()
+    });
+    store.atomic_json(&store.paths.config(), &cfg.value().unwrap()).unwrap();
+
+    let enforcer = Arc::new(LocalTunnelEnforcer::new("enforcer-mode-switch"));
+    enforcer.set_local_proxy_ready(true, now).unwrap();
+    enforcer.configure_seatbelt_backend(true, now).unwrap();
+    let mut supervisor =
+        ChannelSupervisor::new_with_config(store.clone(), cfg.clone(), None, Some(enforcer), None)
+            .unwrap();
+
+    // Managed mode observer publishes `managed-boot` with `managed_vpn_node_unselected`.
+    let managed_err = claude_watch_runtime::managed_vpn::build_managed_error_observation(
+        "managed_vpn_node_unselected",
+        now,
+        1,
+        VpnEpoch::new("managed-boot-old", 1),
+    );
+    let snap_managed = supervisor
+        .handle_event(SupervisionEvent::VpnObservationUpdated {
+            observation: managed_err,
+            observed_at: now,
+        })
+        .unwrap();
+    assert_eq!(snap_managed.families["claude"].permit_state, ChannelPermitState::Revoked);
+    assert_eq!(snap_managed.families["claude"].reason_code, "vpn_observation_unknown");
+    assert_eq!(
+        snap_managed.families["claude"].vpn_match,
+        Some(VpnMatch::Unknown {
+            reasons: vec!["managed_vpn_node_unselected".into()]
+        })
+    );
+
+    // Switching back to External mode via PolicyUpdated retires `managed-boot-old` so the
+    // external observer stream (`vpn-obs-boot-1`) is accepted rather than dropped.
+    cfg.vpn_source_mode = Some(VpnSourceMode::External);
+    cfg.managed_vpn = Some(ManagedVpnConfig {
+        enabled: false,
+        ..Default::default()
+    });
+    store.atomic_json(&store.paths.config(), &cfg.value().unwrap()).unwrap();
+    supervisor
+        .handle_event(SupervisionEvent::PolicyUpdated {
+            config: cfg,
+            observed_at: now + 1.0,
+        })
+        .unwrap();
+
+    let external_obs = sample_vpn_observation(now + 1.5, 1);
+    let snap_external = supervisor
+        .handle_event(SupervisionEvent::VpnObservationUpdated {
+            observation: external_obs,
+            observed_at: now + 1.5,
+        })
+        .unwrap();
+    assert_eq!(
+        snap_external.families["claude"].vpn_match,
+        Some(VpnMatch::Matched),
+        "external observer update after mode switch must replace stale managed error"
+    );
+    assert!(
+        supervisor.latest_vpn_match().is_some_and(VpnMatch::is_matched),
+        "external observer boot_id must be accepted after VPN source mode change"
+    );
+}
+
+#[test]
+fn external_desktop_is_unmanaged_by_default_and_adopted_when_opt_in_enabled() {
+    let now = 1_800_130_000.0;
+    let (_tmp, store, mut cfg) = setup_store_with_vpn_expectation(|_, _| {});
+    // Default must remain opt-in disabled (`false`).
+    assert!(!cfg.auto_adopt_desktop_for_family("claude"));
+    assert!(!cfg.auto_adopt_desktop_for_family("openai"));
+
+    cfg.auto_adopt_claude_desktop = Some(true);
+    store.atomic_json(&store.paths.config(), &cfg.value().unwrap()).unwrap();
+
+    let enforcer = Arc::new(LocalTunnelEnforcer::new("enforcer-auto-adopt"));
+    enforcer.set_local_proxy_ready(true, now).unwrap();
+    enforcer.configure_seatbelt_backend(true, now).unwrap();
+    let (tx, rx) = mpsc::channel();
+    let mut supervisor =
+        ChannelSupervisor::new_with_config(store.clone(), cfg.clone(), None, Some(enforcer), Some(tx.into()))
+            .unwrap();
+
+    let obs = sample_vpn_observation(now, 1);
+    supervisor
+        .handle_event(SupervisionEvent::VpnObservationUpdated {
+            observation: obs.clone(),
+            observed_at: now,
+        })
+        .unwrap();
+    let mut eg = controlled_egress(&cfg, now, "1.1.1.1", "US", Some(obs.epoch));
+    eg["policy_version"] = json!(supervisor.saved_policy_version());
+    supervisor
+        .handle_event(SupervisionEvent::EnvironmentUpdated {
+            egress: eg,
+            local_guard: json!({"proxy": "ok", "tun": "disabled", "context_id": "ctx-vpn"}),
+            observed_at: now,
+        })
+        .unwrap();
+
+    let desktop = Desktop {
+        pid: 8810,
+        start_seconds: 1000,
+        start_microseconds: 1,
+    };
+    let token = BoundProcessToken::with_system_identity(8810, 501, 1000, 1, ProcessRole::DesktopMain)
+        .with_audit_token([501, 501, 20, 501, 20, 8810, 0, 1]);
+    // Even if `unmanaged_pids` isn't cleared externally, ChannelSupervisor treats adopted family members as active.
+    supervisor.set_family_unmanaged_pids("claude", vec![8810], now);
+    let snap = supervisor
+        .handle_event(SupervisionEvent::ProcessInventoryUpdated {
+            family: "claude".into(),
+            desktops: vec![(desktop, true, "u501:1000:1".into())],
+            processes: vec![token],
+            observed_at: now,
+        })
+        .unwrap();
+    assert_ne!(snap.families["claude"].reason_code, "unmanaged_existing_processes");
+    assert_eq!(snap.families["claude"].reason_code, "initial_audit_pending");
+    assert!(snap.families["claude"].unmanaged_member_pids.is_empty());
+    assert_eq!(snap.families["claude"].active_member_pids, vec![8810]);
+    assert!(rx.try_recv().is_ok(), "opted-in external desktop launch must trigger automatic supervision audit");
+}

@@ -282,7 +282,7 @@ fn local_command(request: &claude_watch_core::cli::Request, paths: Paths) -> Res
                 .record_guard_diagnostic(&input, claude_watch_runtime::native::now())?;
             Ok(Some(json!({"status":"ok","recorded":recorded})))
         }
-        ("entry", Some("preview" | "activate" | "status" | "deactivate")) =>
+        ("entry", Some("preview" | "activate" | "status" | "deactivate" | "auto-adopt")) =>
             entry_dispatch::dispatch(request, storage).map(Some),
         _ => Ok(None),
     }

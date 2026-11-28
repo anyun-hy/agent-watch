@@ -472,3 +472,56 @@ fn environment_confirm_baseline_updates_baseline_and_cleans_session() {
     assert_eq!(updated_session["state"], "ended");
     assert_eq!(updated_session["baseline"]["ip"], "106.178.129.173");
 }
+
+#[test]
+fn entry_auto_adopt_defaults_off_toggles_and_cleans_legacy_controlled_wrapper() {
+    let home = Home::new();
+    let apps = home.0.join("Applications");
+    let legacy_bundle = apps.join("ChatGPT (Controlled).app");
+    fs::create_dir_all(legacy_bundle.join("Contents/MacOS")).unwrap();
+    fs::write(legacy_bundle.join("Contents/Info.plist"), b"<plist/>").unwrap();
+    fs::write(legacy_bundle.join("Contents/MacOS/ControlledEntry"), b"stub").unwrap();
+    let ownership_dir = home.0.join("Library/Application Support/ClaudeWatch/entry-ownership");
+    fs::create_dir_all(&ownership_dir).unwrap();
+    // Default status must be OFF (`activation_configured == false`).
+    let (code, status) = call(&home, &["entry", "auto-adopt", "--target", "chatgpt-desktop"], None);
+    assert_eq!(code, 0, "{status}");
+    assert_eq!(status["status_report"]["activation_configured"], false);
+    assert_eq!(status["status_report"]["entry_generated"], false);
+
+    // Requires --apply to mutate config.
+    let (code, err) = call(
+        &home,
+        &["entry", "auto-adopt", "--target", "chatgpt-desktop", "--enable"],
+        None,
+    );
+    assert_eq!(code, 4);
+    assert_eq!(err["code"], "explicit_apply_required");
+
+    // Enabling persists config and cleans any owned/existing Controlled wrapper cleanly.
+    let (code, enabled) = call(
+        &home,
+        &["entry", "auto-adopt", "--target", "chatgpt-desktop", "--enable", "--apply"],
+        None,
+    );
+    assert_eq!(code, 0, "{enabled}");
+    assert_eq!(enabled["result"]["status"], "activated");
+    assert_eq!(enabled["result"]["activation_configured"], true);
+
+    let (code, status_on) = call(&home, &["entry", "auto-adopt", "--target", "chatgpt-desktop"], None);
+    assert_eq!(code, 0, "{status_on}");
+    assert_eq!(status_on["status_report"]["activation_configured"], true);
+
+    let (code, disabled) = call(
+        &home,
+        &["entry", "auto-adopt", "--target", "chatgpt-desktop", "--disable", "--apply"],
+        None,
+    );
+    assert_eq!(code, 0, "{disabled}");
+    assert_eq!(disabled["result"]["status"], "deactivated");
+    assert_eq!(disabled["result"]["activation_configured"], false);
+
+    let (code, status_off) = call(&home, &["entry", "auto-adopt", "--target", "chatgpt-desktop"], None);
+    assert_eq!(code, 0, "{status_off}");
+    assert_eq!(status_off["status_report"]["activation_configured"], false);
+}

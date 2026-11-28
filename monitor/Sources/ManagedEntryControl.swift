@@ -83,11 +83,11 @@ final class ManagedEntryControl: ObservableObject {
         if isFixture {
             let enabled = fixtureEnabled.contains(product)
             return State(report: Report(target: target, entry_generated: enabled, activation_configured: enabled,
-                                        status_label: enabled ? "示例入口已生成" : "示例入口未生成", entry_path: ""))
+                                        status_label: enabled ? "已开启：点击官方图标自动接管保护" : "默认关闭：外部点官方图标仅观测", entry_path: ""))
         }
-        let reply = try await request(["entry", "status", "--target", target], timeout: 10)
+        let reply = try await request(["entry", "auto-adopt", "--target", target], timeout: 10)
         guard let report = reply.status_report, report.target == target else {
-            throw InvalidReply("未收到当前应用的入口状态回执。")
+            throw InvalidReply("未收到当前应用的自动接管状态回执。")
         }
         return State(report: report, candidateSources: reply.candidate_sources ?? [])
     }
@@ -129,12 +129,12 @@ final class ManagedEntryControl: ObservableObject {
             if isFixture {
                 if enable { fixtureEnabled.insert(product) } else { fixtureEnabled.remove(product) }
             } else {
-                let action = enable ? "activate" : "deactivate"
-                let reply = try await request(["entry", action, "--target", target, "--apply"], timeout: 25)
+                let flag = enable ? "--enable" : "--disable"
+                let reply = try await request(["entry", "auto-adopt", "--target", target, flag, "--apply"], timeout: 25)
                 guard let result = reply.result, result.target == target,
                       enable ? (result.status == "activated" && result.activation_configured == true)
-                             : (result.was_present != nil && result.removed_path?.isEmpty == false) else {
-                    throw InvalidReply("未收到当前应用的入口操作回执。")
+                             : (result.status == "deactivated" && result.activation_configured == false) else {
+                    throw InvalidReply("未收到当前应用的自动接管操作回执。")
                 }
             }
             let state = try await readStatus(for: product)

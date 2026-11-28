@@ -1331,6 +1331,12 @@ impl ChannelSupervisor {
         &self.config
     }
 
+    pub fn family_adopts_external_desktop(&self, family: &str) -> bool {
+        self.config.auto_adopt_desktop_for_family(family)
+            && self.config.effective_vpn_source_mode()
+                == claude_watch_core::vpn_profile::VpnSourceMode::External
+    }
+
     pub fn config_blocking_reason(&self) -> Option<&str> {
         self.config_blocking_reason.as_deref()
     }
@@ -1914,6 +1920,15 @@ impl ChannelSupervisor {
             }
             SupervisionEvent::PolicyUpdated { config, .. } => {
                 let new_version = Self::compute_policy_version(&config)?;
+                let vpn_mode_changed =
+                    config.effective_vpn_source_mode() != self.config.effective_vpn_source_mode();
+                if vpn_mode_changed {
+                    // Retiring the previous VPN mode clears its `observer_boot_id` so
+                    // switching between External and Managed modes never locks out the
+                    // newly active observer stream.
+                    self.latest_vpn_observation = None;
+                    self.latest_vpn_unavailable_reason = Some("vpn_mode_switching".into());
+                }
                 if let Some(ep) = config
                     .vpn_expectation
                     .as_ref()
@@ -1924,7 +1939,8 @@ impl ChannelSupervisor {
                 } else if !config.proxy_url.trim().is_empty() {
                     self.upstream_endpoint = config.proxy_url.clone();
                 }
-                let version_changed = new_version != self.saved_policy_version;
+                let version_changed =
+                    new_version != self.saved_policy_version || vpn_mode_changed;
                 if version_changed || !config.enabled || !config.guard_enabled {
                     for track in self.tracks.values_mut() {
                         track.end_process_authority();
@@ -2465,15 +2481,21 @@ impl ChannelSupervisor {
                 (ChannelPermitState::Revoked, code)
             }
         } else if self.tracks.get(family).is_none_or(|t| {
+            let adopted = self.family_adopts_external_desktop(family);
             t.processes.is_empty()
-                || t.processes.iter().all(|p| {
-                    self.unmanaged_member_pids
-                        .get(family)
-                        .is_some_and(|unmanaged| unmanaged.contains(&p.pid))
-                })
+                || (!adopted
+                    && t.processes.iter().all(|p| {
+                        self.unmanaged_member_pids
+                            .get(family)
+                            .is_some_and(|unmanaged| unmanaged.contains(&p.pid))
+                    }))
         }) {
             let observed_only = !desktops.is_empty()
-                || self.unmanaged_member_pids.get(family).is_some_and(|pids| !pids.is_empty());
+                || (!self.family_adopts_external_desktop(family)
+                    && self
+                        .unmanaged_member_pids
+                        .get(family)
+                        .is_some_and(|pids| !pids.is_empty()));
             (ChannelPermitState::PendingVerification,
                 if observed_only { "unmanaged_existing_processes" } else { "idle_no_process" }.into())
         } else if let Some(s) = session.as_ref() {
@@ -2571,6 +2593,7 @@ impl ChannelSupervisor {
         now: f64,
     ) {
         let current_vpn_epoch = self.latest_vpn_observation.as_ref().map(|o| o.epoch.clone());
+        let adopted = self.family_adopts_external_desktop(family);
         let Some(track) = self.tracks.get_mut(family) else {
             return;
         };
@@ -2619,14 +2642,18 @@ impl ChannelSupervisor {
         }
 
         let unmanaged = self.unmanaged_member_pids.get(family);
-        let has_managed_desktop = track
-            .desktops
-            .iter()
-            .any(|(d, _, _)| !unmanaged.is_some_and(|pids| pids.contains(&d.pid)));
-        let has_managed_process = track
-            .processes
-            .iter()
-            .any(|p| !unmanaged.is_some_and(|pids| pids.contains(&p.pid)));
+        let has_managed_desktop = adopted
+            && !track.desktops.is_empty()
+            || track
+                .desktops
+                .iter()
+                .any(|(d, _, _)| !unmanaged.is_some_and(|pids| pids.contains(&d.pid)));
+        let has_managed_process = adopted
+            && !track.processes.is_empty()
+            || track
+                .processes
+                .iter()
+                .any(|p| !unmanaged.is_some_and(|pids| pids.contains(&p.pid)));
         self.next_audit_request_id = self.next_audit_request_id.saturating_add(1);
         let req = AsyncAuditRequest {
             request_id: self.next_audit_request_id,
@@ -3528,6 +3555,7 @@ impl ChannelSupervisor {
     }
 
     fn refresh_verdict_and_emit(&mut self, family: &str, now: f64) {
+        let adopted = self.family_adopts_external_desktop(family);
         let Some(track) = self.tracks.get_mut(family) else {
             return;
         };
@@ -3561,11 +3589,20 @@ impl ChannelSupervisor {
         let latest_vpn_epoch = self.latest_vpn_observation.as_ref().map(|o| o.epoch.clone());
         let latest_vpn_match = self.latest_vpn_match.clone();
         let coverage_scope = self.coverage_scopes.get(family).cloned();
-        let unmanaged_pids = self
+        let mut unmanaged_pids = self
             .unmanaged_member_pids
             .get(family)
             .cloned()
             .unwrap_or_default();
+        if adopted {
+            let adopted_desktop_pids: Vec<u32> = track
+                .processes
+                .iter()
+                .filter(|p| p.role.desktop())
+                .map(|p| p.pid)
+                .collect();
+            unmanaged_pids.retain(|pid| !adopted_desktop_pids.contains(pid));
+        }
         let family_state = Self::build_family_monitor_state_from_track(
             &self.producer_boot_id,
             &self.saved_policy_version,
@@ -3603,16 +3640,26 @@ impl ChannelSupervisor {
         track: &FamilyRuntimeTrack,
         now: f64,
     ) -> FamilyChannelMonitorState {
+        let adopted = self.family_adopts_external_desktop(family);
         let local_proxy_port = self.enforcer.as_ref().and_then(|e| e.local_proxy_port());
         let default_backend = self.config.effective_network_backend();
         let latest_vpn_epoch = self.latest_vpn_observation.as_ref().map(|o| o.epoch.clone());
         let latest_vpn_match = self.latest_vpn_match.clone();
         let coverage_scope = self.coverage_scopes.get(family).cloned();
-        let unmanaged_pids = self
+        let mut unmanaged_pids = self
             .unmanaged_member_pids
             .get(family)
             .cloned()
             .unwrap_or_default();
+        if adopted {
+            let adopted_desktop_pids: Vec<u32> = track
+                .processes
+                .iter()
+                .filter(|p| p.role.desktop())
+                .map(|p| p.pid)
+                .collect();
+            unmanaged_pids.retain(|pid| !adopted_desktop_pids.contains(pid));
+        }
         Self::build_family_monitor_state_from_track(
             &self.producer_boot_id,
             &self.saved_policy_version,

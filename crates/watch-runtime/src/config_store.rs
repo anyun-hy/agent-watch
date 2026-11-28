@@ -192,6 +192,26 @@ impl ConfigStore {
         Ok(validated)
     }
 
+    pub fn set_auto_adopt_desktop(&self, family: &str, enabled: bool) -> Result<Config> {
+        let _lock = self.storage.lock("operation", None)?;
+        let mut current = self.load()?;
+        let flag = enabled.then_some(true);
+        match family {
+            "claude" => current.auto_adopt_claude_desktop = flag,
+            "openai" => current.auto_adopt_openai_desktop = flag,
+            _ => {
+                return Err(claude_watch_core::error::CoreError::new(
+                    "invalid_target",
+                    "不支持的应用家族",
+                ))
+            }
+        }
+        let validated = Config::from_value(current.value()?)?;
+        self.storage
+            .atomic_json(&self.storage.paths.config(), &validated.value()?)?;
+        Ok(validated)
+    }
+
     pub fn select_managed_vpn_node(
         &self,
         node: &claude_watch_core::vpn_profile::NormalizedOutboundNode,

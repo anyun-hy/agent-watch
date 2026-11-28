@@ -387,6 +387,7 @@ impl Default for NetworkEventWatcher {
             "com.apple.system.config.network_change",
             "com.apple.system.clock_set",
             "io.local.claudewatch.vpn-observation",
+            "io.local.claudewatch.channel-update",
             "com.apple.powermanagement.systempowerstate",
             "io.local.claudewatch.system-wake",
         ])

@@ -50,26 +50,26 @@ struct ManagedEntryPanel: View {
     var body: some View {
         VStack(spacing: 0) {
             HStack(spacing: 10) {
-                Image(systemName: state.report?.entry_generated == true ? "shield.checkered" : "shield")
-                    .foregroundStyle(state.report?.entry_generated == true ? p.mint : p.secondary)
+                Image(systemName: state.report?.activation_configured == true ? "shield.checkered" : "shield")
+                    .foregroundStyle(state.report?.activation_configured == true ? p.mint : p.secondary)
                 VStack(alignment: .leading, spacing: 2) {
                     HStack(spacing: 6) {
-                        Text("受控桌面入口 (Opt-in)").font(WatchTypography.caption.weight(.medium))
+                        Text("自动接管官方图标启动 (Opt-in)").font(WatchTypography.caption.weight(.medium))
                         if let report = state.report {
-                            Badge(text: report.entry_generated ? "已生成" : "未生成",
-                                  color: report.entry_generated ? p.mint : p.secondary)
+                            Badge(text: report.activation_configured ? "已开启" : "默认关闭",
+                                  color: report.activation_configured ? p.mint : p.secondary)
                         } else {
                             Badge(text: state.busy ? "等待回执" : "状态未知", color: p.secondary)
                         }
                     }
-                    Text(state.errorMessage ?? state.report?.status_label ?? "尚未确认当前应用的入口状态。")
+                    Text(state.errorMessage ?? state.report?.status_label ?? "关闭时不生成额外图标；开启后直接点击官方原版图标即可自动纳入保护（自动清理旧版 Controlled 入口）。")
                         .font(WatchTypography.small).foregroundStyle(state.errorMessage == nil ? p.secondary : p.amber)
                 }
                 Spacer(minLength: 12)
                 if state.busy {
                     ProgressView().controlSize(.small)
                 } else if let report = state.report {
-                    Toggle("受控桌面入口", isOn: Binding(
+                    Toggle("自动接管官方图标启动", isOn: Binding(
                         get: { report.activation_configured },
                         set: { enable in
                             if enable { showingConfirmation = true } else { apply(false) }
@@ -85,12 +85,12 @@ struct ManagedEntryPanel: View {
         }
         .task(id: refreshID) { await control.refresh(for: product) }
         .onDisappear { mutation?.cancel() }
-        .confirmationDialog("启用 \(product.graphDesktopTitle) 受控桌面入口？",
+        .confirmationDialog("开启 \(product.graphDesktopTitle) 官方图标自动接管？",
                             isPresented: $showingConfirmation, titleVisibility: .visible) {
-            Button("确认启用") { apply(true) }
+            Button("确认开启") { apply(true) }
             Button("取消", role: .cancel) {}
         } message: {
-            Text("将在 ~/Applications 请求生成独立入口。实际启动和保护状态需另行核验。")
+            Text("不再生成第二个 Controlled 应用图标。开启后从 Dock 或 Spotlight 直接点击官方原版图标启动时，后台将自动按当前底座模式纳入会话保护（并自动移除旧版遗留包装入口）。")
         }
     }
 

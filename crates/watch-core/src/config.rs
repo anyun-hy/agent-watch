@@ -70,6 +70,10 @@ pub struct Config {
     pub vpn_source_mode: Option<VpnSourceMode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub managed_vpn: Option<ManagedVpnConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_adopt_claude_desktop: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_adopt_openai_desktop: Option<bool>,
     pub update_url: String,
     pub update_public_key: String,
     pub verified_claude_versions: Vec<String>,
@@ -110,6 +114,8 @@ impl Default for Config {
             vpn_expectation: None,
             vpn_source_mode: None,
             managed_vpn: None,
+            auto_adopt_claude_desktop: None,
+            auto_adopt_openai_desktop: None,
             update_url: String::new(),
             update_public_key: String::new(),
             verified_claude_versions: Vec::new(),
@@ -144,6 +150,14 @@ impl Config {
 
     pub fn vpn_is_read_only(&self) -> bool {
         self.effective_vpn_source_mode() == VpnSourceMode::External
+    }
+
+    pub fn auto_adopt_desktop_for_family(&self, family: &str) -> bool {
+        match family {
+            "claude" => self.auto_adopt_claude_desktop.unwrap_or(false),
+            "openai" => self.auto_adopt_openai_desktop.unwrap_or(false),
+            _ => false,
+        }
     }
 
     pub fn is_openai_target(target: crate::processes::LaunchTarget) -> bool {
@@ -205,6 +219,8 @@ impl Config {
             "gpt_require_stun",
             "gpt_require_dns",
             "gpt_require_pinned_rules",
+            "auto_adopt_claude_desktop",
+            "auto_adopt_openai_desktop",
         ] {
             merged.insert(key.into(), Value::Null);
         }
@@ -219,6 +235,8 @@ impl Config {
                     | "gpt_require_stun"
                     | "gpt_require_dns"
                     | "gpt_require_pinned_rules"
+                    | "auto_adopt_claude_desktop"
+                    | "auto_adopt_openai_desktop"
             ) {
                 if !value.is_null() && !value.is_boolean() {
                     return Err(invalid(&format!("{key} 必须是布尔值")));

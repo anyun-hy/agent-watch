@@ -223,6 +223,81 @@ pub(crate) fn dispatch(request: &Request, storage: StateStore) -> Result<Value> 
         }
         manager.set_shell(EntryShell::parse(s)?);
     }
+    if action == "auto-adopt" {
+        if target.cli() {
+            return Err(CoreError::new(
+                "invalid_target",
+                "官方图标自动接管仅适用于桌面端 AI 应用",
+            ));
+        }
+        let family = if target == LaunchTarget::ClaudeDesktop {
+            "claude"
+        } else {
+            "openai"
+        };
+        let config_store = claude_watch_runtime::config_store::ConfigStore {
+            storage: storage.clone(),
+        };
+        let enable_flag = request.flag("enable");
+        let disable_flag = request.flag("disable");
+        if enable_flag && disable_flag {
+            return Err(CoreError::new(
+                "invalid_arguments",
+                "不能同时传入 --enable 与 --disable",
+            ));
+        }
+        if enable_flag || disable_flag {
+            request.require_apply()?;
+            let enabled = enable_flag;
+            config_store.set_auto_adopt_desktop(family, enabled)?;
+            let mut removed_path = String::new();
+            let mut was_present = false;
+            let targets_to_clean: &[LaunchTarget] = if family == "claude" {
+                &[LaunchTarget::ClaudeDesktop]
+            } else {
+                &[LaunchTarget::ChatgptDesktop, LaunchTarget::CodexDesktop]
+            };
+            for legacy_target in targets_to_clean {
+                if let Ok(deact) = manager.deactivate(*legacy_target) {
+                    if deact.was_present {
+                        was_present = true;
+                        removed_path = deact.removed_path.to_string_lossy().into_owned();
+                    }
+                }
+            }
+            native::notify_channel_update();
+            return Ok(json!({
+                "status": "ok",
+                "result": {
+                    "target": target.as_str(),
+                    "status": if enabled { "activated" } else { "deactivated" },
+                    "activation_configured": enabled,
+                    "removed_path": if removed_path.is_empty() { target.as_str().to_string() } else { removed_path },
+                    "was_present": was_present,
+                }
+            }));
+        }
+        let cfg = config_store.load()?;
+        let enabled = cfg.auto_adopt_desktop_for_family(family);
+        let candidate_sources = DiscoveryHandle::for_home(&storage.paths.home)
+            .observation_snapshot(runtime::runner()?.as_ref(), native::now())
+            .candidate_sources(target);
+        return Ok(json!({
+            "status": "ok",
+            "status_report": {
+                "target": target.as_str(),
+                "entry_generated": enabled,
+                "activation_configured": enabled,
+                "status_label": if enabled {
+                    "已开启：从 Dock 或 Spotlight 点击官方原版图标将自动接管保护"
+                } else {
+                    "默认关闭：关闭时不生成额外图标，外部点官方图标仅作只读观测"
+                },
+                "entry_path": "",
+            },
+            "candidate_sources": candidate_sources,
+        }));
+    }
     if action == "deactivate" {
         return Ok(json!({"status":"ok", "result": manager.deactivate(target)?}));
     }

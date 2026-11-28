@@ -58,6 +58,7 @@ pub struct IpIntelInput<'a> {
     pub ipinfo: Option<&'a Value>,
     pub ripe_rpki: Option<&'a Value>,
     pub ripe_country: Option<&'a str>,
+    pub fallback_route: Option<&'a str>,
     pub ptr_domains: &'a [String],
     pub trace: Option<&'a CloudflareTraceInfo>,
     pub system_timezone: Option<&'a str>,
@@ -580,6 +581,8 @@ pub fn evaluate_ip_intelligence(input: &IpIntelInput<'_>) -> Value {
         .or_else(|| company_obj.and_then(|o| o.get("network")))
         .and_then(Value::as_str)
         .map(|s| clip(s, 64))
+        .filter(|s| !s.is_empty())
+        .or_else(|| input.fallback_route.map(|s| clip(s, 64)).filter(|s| !s.is_empty()))
         .unwrap_or_default();
     let rir = asn_obj
         .and_then(|o| o.get("rir"))
@@ -642,16 +645,30 @@ pub fn evaluate_ip_intelligence(input: &IpIntelInput<'_>) -> Value {
         .map(|s| clip(s, 100))
         .unwrap_or_default();
 
-    let company_abuser = parse_abuser_score(
+    let raw_company_abuser = parse_abuser_score(
         company_obj
             .and_then(|o| o.get("abuser_score"))
             .and_then(Value::as_str),
     );
-    let asn_abuser = parse_abuser_score(
+    let raw_asn_abuser = parse_abuser_score(
         asn_obj
             .and_then(|o| o.get("abuser_score"))
             .and_then(Value::as_str),
     );
+    let fill_abuser_if_rate_limited = |m: AbuserMetric| -> AbuserMetric {
+        if m.raw.is_empty() && ipapi.is_none() {
+            AbuserMetric {
+                raw: "主源限流未返回（不影响评分）".into(),
+                ratio: None,
+                tier: "unavailable".into(),
+                tier_zh: "待重试".into(),
+            }
+        } else {
+            m
+        }
+    };
+    let company_abuser = fill_abuser_if_rate_limited(raw_company_abuser);
+    let asn_abuser = fill_abuser_if_rate_limited(raw_asn_abuser);
 
     let datacenter_name = ipapi
         .and_then(|v| v.pointer("/datacenter/datacenter"))
@@ -691,6 +708,19 @@ pub fn evaluate_ip_intelligence(input: &IpIntelInput<'_>) -> Value {
         && !is_bogon
         && !is_anycast
         && (company_type == "isp" || asn_type == "isp" || rdns_class == "residential_dialup");
+    let effective_asn_type = if !asn_type.is_empty() {
+        asn_type.clone()
+    } else if is_hosting {
+        "hosting".into()
+    } else if is_residential {
+        "isp".into()
+    } else if is_mobile {
+        "mobile".into()
+    } else if company_type != "" {
+        company_type.clone()
+    } else {
+        String::new()
+    };
 
     let (usage_kind, usage_label) = if is_bogon {
         ("bogon", "保留 / Bogon 非公网地址")
@@ -1043,7 +1073,7 @@ pub fn evaluate_ip_intelligence(input: &IpIntelInput<'_>) -> Value {
         "rdns_note": rdns_note,
         "asn": asn_number,
         "asOrganization": asn_org,
-        "asn_kind": asn_type,
+        "asn_kind": effective_asn_type,
         "asn_allocated": asn_created,
         "rir": rir,
         "company_name": company_name,
@@ -1173,6 +1203,7 @@ mod tests {
             ipinfo: Some(&ipinfo),
             ripe_rpki: Some(&rpki),
             ripe_country: Some("JP"),
+            fallback_route: Some("106.178.0.0/16"),
             ptr_domains: &ptr,
             trace: Some(&trace),
             system_timezone: Some("Asia/Tokyo"),
@@ -1212,6 +1243,7 @@ mod tests {
             ipinfo: None,
             ripe_rpki: None,
             ripe_country: Some("GB"),
+            fallback_route: None,
             ptr_domains: &[],
             trace: None,
             system_timezone: Some("Asia/Shanghai"),

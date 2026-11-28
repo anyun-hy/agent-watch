@@ -127,8 +127,8 @@ impl Request {
             "dns-check" => (&[], &["online"], &[]),
             "launch-desktop" => (&[], &["apply"], &[]),
             "entry" => (
-                &["preview", "activate", "status", "deactivate"],
-                &["apply"],
+                &["preview", "activate", "status", "deactivate", "auto-adopt"],
+                &["apply", "enable", "disable"],
                 &["target", "target-bundle", "shims-dir", "applications-dir", "shell"],
             ),
             "uninstall" => (

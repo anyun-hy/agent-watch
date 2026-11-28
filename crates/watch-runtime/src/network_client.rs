@@ -903,6 +903,15 @@ impl<T: Transport> NetworkClient<T> {
             format!("https://stat.ripe.net/data/rir-stats-country/data.json?resource=AS{asn}"),
         )
     }
+
+    /// Official RIPEstat BGP routing prefix & origin ASN lookup for an egress IP.
+    pub fn ripe_network_info(&self, address: &str) -> Receipt {
+        let Some(ip) = public_unicast(address) else {
+            return Receipt::error("ripe-netinfo", address, "", now(), "invalid_ip", "仅允许公网出口 IP");
+        };
+        let url = format!("https://stat.ripe.net/data/network-info/data.json?resource={ip}");
+        self.cached(format!("ripe-netinfo:{ip}"), "ripe-netinfo", &ip, url)
+    }
     pub fn trace(&self, url: &str) -> Receipt {
         if !matches!(
             url,
@@ -1031,6 +1040,71 @@ pub fn ripe_registered_country(receipt: &Receipt, asn: u32) -> Option<String> {
         }
     }
     (countries.len() == 1).then(|| countries.into_iter().next().unwrap())
+}
+
+/// Extract authoritative origin ASN and announced BGP CIDR prefix from RIPEstat
+/// `network-info` receipt (`https://stat.ripe.net/data/network-info/data.json`).
+pub fn extract_ripe_network_info(receipt: &Receipt) -> (Option<u32>, Option<String>) {
+    if receipt.status != "complete" || receipt.http_status != Some(200) {
+        return (None, None);
+    }
+    let Some(data) = receipt.data.as_ref() else {
+        return (None, None);
+    };
+    let prefix = data
+        .pointer("/data/prefix")
+        .and_then(Value::as_str)
+        .and_then(valid_cidr_prefix);
+    let asn = data
+        .pointer("/data/asns")
+        .and_then(Value::as_array)
+        .and_then(|arr| arr.first())
+        .and_then(|v| {
+            v.as_u64()
+                .and_then(|n| u32::try_from(n).ok())
+                .or_else(|| {
+                    v.as_str().and_then(|s| {
+                        let t = s.trim();
+                        let digits = t
+                            .get(..2)
+                            .filter(|p| p.eq_ignore_ascii_case("as"))
+                            .map_or(t, |_| &t[2..]);
+                        (!digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+                            .then_some(digits)
+                            .and_then(|d| d.parse::<u32>().ok())
+                    })
+                })
+        })
+        .filter(|n| *n > 0);
+    (asn, prefix)
+}
+
+/// Extract the operator organization name from an `ipapi.is` or `ipinfo.io` receipt.
+pub fn lookup_organization(receipt: &Receipt) -> String {
+    let Some(data) = receipt.data.as_ref() else {
+        return String::new();
+    };
+    if let Some(org) = data
+        .get("asOrganization")
+        .or_else(|| data.pointer("/asn/org"))
+        .or_else(|| data.get("asn_org"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        return org.to_owned();
+    }
+    if let Some(org) = data.get("org").and_then(Value::as_str).map(str::trim) {
+        if let Some(rest) = org.strip_prefix("AS") {
+            let mut parts = rest.splitn(2, char::is_whitespace);
+            let digits = parts.next().unwrap_or("");
+            if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) {
+                return parts.next().unwrap_or("").trim().to_owned();
+            }
+        }
+        return org.to_owned();
+    }
+    String::new()
 }
 
 /// Extract an explicit `AS<number>` prefix only; organization text is not an
